@@ -1,0 +1,91 @@
+# Namespaced TOML configuration for stereo training
+
+[common]
+seed = 42
+
+[train]
+output_dir = "outputs/run_debug"   # logs/checkpoints and a copy of this config are saved here
+epochs = 500
+batch_size = 1
+lr = 2e-5
+weight_decay = 1e-5
+amp = false
+grad_clip = 1.0
+log_interval = 100
+model_path = ""        # ".pth" へのパス（空なら何もしない）
+load_mode = "auto"      # "resume" | "weights" | "auto"
+strict = false          # state_dictのstrictロード
+
+[data]
+height = 256
+width = 256
+num_workers = 8
+max_disp = 128
+
+[lr_scheduler]
+type = "cosine"        # "cosine" | "onecycle" | "plateau" | "multistep" | "none"
+warmup_steps = 500
+# warmup_ratio = 0.01    # あるいは warmup_steps = 2000 のように絶対ステップで指定
+min_lr = 1e-6
+
+[[data.train_datasets]]
+name   = "LASyntheticDataset3PerObj"
+use_camera_list = ["D415", "ZED2", "ZEDmini"]
+target_scene_list = ['01000001', '01000002', ]
+
+
+[[data.val_datasets]]
+name   = "LASyntheticDataset3PerObj"
+use_camera_list = ["D415", "ZED2", "ZEDmini"]
+target_scene_list = ['01000003']
+
+[model]
+# 特徴抽出・更新は既存通り
+use_ctx_aspp = true
+l2_normalize_feature = true
+rot_repr = "r6d"   # "r6d" か "rotvec"（既定は "r6d"）
+
+# correlation lookup のアブレーション指定
+lookup_mode = "1d"        # "1d" | "2d" | "a2d"
+levels = 4
+
+# 2D / Anisotropic 2D 用
+radius_w = 4              # 右方向半径
+radius_h = 1              # 縦方向半径（2D は radius_w をコピーして使う想定、a2d は個別指定）
+
+hidden_ch = 128      # 隠れ層次元
+context_ch = 128     # コンテキスト次元
+
+topk=50
+nms_radius=4
+center_thresh=0.3
+
+# render settings
+faces_per_pixel = 8
+blur_sigma = 1e-4
+blur_gamma = 1e-4
+
+shape_constraint_ema=0.4
+
+use_gate = false
+use_so3_log_xyz = true         #: 回転=so3ログ, 並進=Δx,Δy,Δz
+use_so3_log_ratio_normal= true #: 回転=so3ログ, 並進=[dz_ratio, dn_x, dn_y]
+
+n_iter = 4
+raft_like_updater = true
+
+
+[loss]
+w_disp = 10.0
+w_ctr = 1.0
+w_mask = 1.0
+w_pos = 1.0
+w_rot = 1.0
+w_cls = 1.0
+w_adds = 0.0
+w_rot_update=1.0
+w_pos_update=1.0
+w_adds_update=0.0
+w_flow=10.0
+update_gamma=0.8
+update_warmup_steps=5000
