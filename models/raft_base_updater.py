@@ -1,3 +1,5 @@
+"""RAFT-like pose updater blocks with TorchScript-friendly utilities."""
+
 # raftlike_pose_.py
 import torch
 import torch.nn as nn
@@ -7,11 +9,13 @@ from typing import Tuple
 
 # ----------------- small utils -----------------
 def conv3x3(ci: int, co: int, s: int = 1, g: int = 1, bias: bool = False) -> nn.Conv2d:
+    """Create a 3x3 convolution layer."""
     return nn.Conv2d(ci, co, kernel_size=3, stride=s, padding=1, groups=g, bias=bias)
 
 
 @torch.jit.script
 def l2norm(f: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """L2-normalize features along channel dimension."""
     n = torch.linalg.norm(f, dim=1, keepdim=True)
     n = torch.clamp(n, min=eps)
     return f / n

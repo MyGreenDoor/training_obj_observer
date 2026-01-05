@@ -1,3 +1,4 @@
+"""Heads and utility functions for multi-task instance pose estimation."""
 
 import typing
 
@@ -8,21 +9,36 @@ import torch.nn.functional as F
 from utils import rot_utils
 
 
-def conv3x3(in_ch, out_ch, s=1): 
+def conv3x3(in_ch: int, out_ch: int, s: int = 1) -> nn.Conv2d:
+    """3x3 convolution with optional stride and padding.
+
+    Args:
+        in_ch: Input channel size.
+        out_ch: Output channel size.
+        s: Stride to apply.
+
+    Returns:
+        nn.Conv2d: Convolution layer without bias.
+    """
     return nn.Conv2d(in_ch, out_ch, 3, stride=s, padding=1, bias=False)
 
 
 class ConvBlock(nn.Module):
+    """Two-layer convolutional block with normalization and SiLU."""
+
     def __init__(self, in_ch, out_ch, norm_layer):
         super().__init__()
         self.net = nn.Sequential(
             conv3x3(in_ch, out_ch), norm_layer(out_ch), nn.SiLU(True),
             conv3x3(out_ch, out_ch), norm_layer(out_ch), nn.SiLU(True),
         )
+
     def forward(self, x): return self.net(x)
 
 
 class Bottleneck(nn.Module):
+    """Residual bottleneck supporting downsampling."""
+
     def __init__(self, in_ch, mid_ch, out_ch, norm_layer, s=1):
         super().__init__()
         self.down = (s!=1) or (in_ch!=out_ch)
@@ -35,6 +51,7 @@ class Bottleneck(nn.Module):
             nn.Conv2d(in_ch, out_ch, 1, stride=s, bias=False), norm_layer(out_ch)
         ) if self.down else nn.Identity()
         self.act = nn.SiLU(True)
+
     def forward(self, x):
         y = self.conv(x) + self.skip(x)
         return self.act(y)
@@ -44,6 +61,17 @@ class Bottleneck(nn.Module):
 def peaks_to_uv_1_4(idxs_yx: torch.Tensor,  # (B,K,2) int64, yx on H/4 grid
                      down: int,
                      W: int, H: int) -> torch.Tensor:
+    """Convert peak indices on quarter resolution to full-res pixel centers.
+
+    Args:
+        idxs_yx: Peak indices on H/4 grid ``(B, K, 2)`` as ``(y, x)``.
+        down: Downsample factor between feature map and image.
+        W: Full-resolution width.
+        H: Full-resolution height.
+
+    Returns:
+        torch.Tensor: Pixel coordinates ``(B, K, 2)`` ordered as ``(u, v)``.
+    """
     # 画素中心系に合わせて +0.5 を入れて、元解像度に戻す
     # u = x + 0.5, v = y + 0.5
     u = (idxs_yx[..., 1].to(torch.float32) + 0.5) * float(down)
@@ -56,6 +84,15 @@ def peaks_to_uv_1_4(idxs_yx: torch.Tensor,  # (B,K,2) int64, yx on H/4 grid
 
 @torch.jit.script
 def rotvec_to_rotmat_map(rvec: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Convert Rodrigues rotation vectors to rotation matrices per pixel.
+
+    Args:
+        rvec: Rotation vectors shaped ``(B, 3, H, W)``.
+        eps: Small clamp to avoid division by zero.
+
+    Returns:
+        torch.Tensor: Rotation matrices shaped ``(B, 3, 3, H, W)``.
+    """
     # rvec: (B,3,H,W) → R: (B,3,3,H,W)
     B, _, H, W = rvec.shape
     rx, ry, rz = rvec[:, 0:1], rvec[:, 1:2], rvec[:, 2:3]     # (B,1,H,W)
@@ -93,7 +130,8 @@ def rotvec_to_rotmat_map(rvec: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 class ASPPLite(nn.Module):
-    """並列率: 1,2,4,8の軽量ASPP"""
+    """Lightweight ASPP with dilation rates 1, 2, 4, 8 and global context."""
+
     def __init__(self, ch, norm_layer):
         super().__init__()
         br = []
@@ -125,6 +163,8 @@ class ASPPLite(nn.Module):
 
 
 class ConvBlock(nn.Module):
+    """Single convolution + normalization + SiLU."""
+
     def __init__(self, in_ch: int, out_ch: int, norm_layer, k: int = 3, s: int = 1, p: int = 1):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False)
@@ -136,6 +176,8 @@ class ConvBlock(nn.Module):
 
 
 class MLP(nn.Module):
+    """Two-layer feed-forward block used in transformer heads."""
+
     def __init__(self, dim: int, mlp_ratio: float = 2.0, drop: float = 0.0):
         super().__init__()
         hidden = int(dim * mlp_ratio)
@@ -154,13 +196,25 @@ class MLP(nn.Module):
 
 
 class PositionalEncoding2D(nn.Module):
-    """Sine-cos 2D 位置埋め込み（ViT 互換・動的形状）"""
+    """Dynamic 2D sine-cosine positional encoding (ViT compatible)."""
+
     def __init__(self, dim: int):
         super().__init__()
         assert dim % 4 == 0, "dim must be divisible by 4"
         self.dim = dim
 
     def forward(self, H: int, W: int, device=None, dtype=None):
+        """Create positional encodings for a given spatial size.
+
+        Args:
+            H: Height of the grid.
+            W: Width of the grid.
+            device: Optional device for the output.
+            dtype: Optional dtype for the output.
+
+        Returns:
+            torch.Tensor: Positional encodings shaped ``(1, H * W, dim)``.
+        """
         d = self.dim // 2
         d2 = d // 2
 
@@ -185,7 +239,8 @@ class PositionalEncoding2D(nn.Module):
 
 
 class CrossAttnBlock(nn.Module):
-    """標準 MultiheadAttention ベースのクロス注意 + 残差 + FFN"""
+    """Cross-attention block with residual connection and MLP."""
+
     def __init__(self, dim_q: int, dim_kv: int, num_heads: int, mlp_ratio: float = 2.0, drop: float = 0.0):
         super().__init__()
         self.ln_q = nn.LayerNorm(dim_q)
@@ -196,6 +251,15 @@ class CrossAttnBlock(nn.Module):
         self.ln2 = nn.LayerNorm(dim_q)
 
     def forward(self, q, kv):
+        """Apply cross attention followed by feed-forward network.
+
+        Args:
+            q: Query tensor shaped ``(B, Lq, Dq)``.
+            kv: Key/value tensor shaped ``(B, Lkv, Dkv)``.
+
+        Returns:
+            torch.Tensor: Updated queries.
+        """
         # q: (B, Lq, Dq), kv: (B, Lkv, Dkv)
         h = self.ln_q(q)
         kvn = self.ln_kv(kv)
@@ -206,6 +270,8 @@ class CrossAttnBlock(nn.Module):
 
 
 class SelfAttnBlock(nn.Module):
+    """Self-attention block with residual MLP."""
+
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 2.0, drop: float = 0.0):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
@@ -215,6 +281,14 @@ class SelfAttnBlock(nn.Module):
         self.ln2 = nn.LayerNorm(dim)
 
     def forward(self, x):
+        """Apply self attention and MLP.
+
+        Args:
+            x: Token tensor shaped ``(B, L, D)``.
+
+        Returns:
+            torch.Tensor: Updated tokens.
+        """
         # x: (B, L, D)
         h = self.ln1(x)
         out, _ = self.attn(h, h, h, need_weights=False)
@@ -224,13 +298,7 @@ class SelfAttnBlock(nn.Module):
 
 
 class TransformerMultiTaskHead(nn.Module):
-    """
-    LiteFPNMultiTaskHead を Transformer（Perceiver 風）に置換:
-      - H/4 トークン + 2D 位置埋め込み
-      - tokens -> latents (cross-attn) -> self-attn on latents (repeat)
-      - latents -> tokens (cross-attn decode)
-      - 128ch に集約して各ヘッドを予測
-    """
+    """Perceiver-style transformer head for mask/pose/class predictions."""
     def __init__(
         self,
         norm_layer,
@@ -305,7 +373,8 @@ class TransformerMultiTaskHead(nn.Module):
                     nn.init.constant_(l.bias, bias_neg)
     
     
-    def make_neck(self, in_ch: nn.Module, mid_ch: nn.Module, norm_layer: nn.Module) -> nn.Module:
+    def make_neck(self, in_ch: int, mid_ch: int, norm_layer: typing.Callable[[int], nn.Module]) -> nn.Module:
+        """Create lightweight neck with depthwise and pointwise convolutions."""
         return nn.Sequential(
             nn.Conv2d(in_ch, in_ch, 3, padding=1, groups=in_ch, bias=False),  # depthwise
             norm_layer(in_ch), nn.SiLU(True),
@@ -319,6 +388,17 @@ class TransformerMultiTaskHead(nn.Module):
         mask_14: torch.Tensor,      # (B,1,H4,W4)
         point_map_14: torch.Tensor  # (B,3,H4,W4)
     ) -> typing.Dict[str, torch.Tensor]:
+        """Run transformer head to produce geometry and semantic predictions.
+
+        Args:
+            ctx_14: Context features ``(B, Cc, H/4, W/4)``.
+            hidden_14: Hidden state features ``(B, Ch, H/4, W/4)``.
+            mask_14: Foreground mask logits ``(B, 1, H/4, W/4)``.
+            point_map_14: Point map ``(B, 3, H/4, W/4)``.
+
+        Returns:
+            Dict[str, torch.Tensor]: Predicted maps including mask, center, position, rotation, and class logits.
+        """
 
         B, _, H4, W4 = ctx_14.shape
         x_in = torch.cat((ctx_14, hidden_14, mask_14, point_map_14), dim=1)  # (B,in_ch,H4,W4)
@@ -382,6 +462,8 @@ class TransformerMultiTaskHead(nn.Module):
         
         
 class LiteFPNMultiTaskHead(nn.Module):
+    """Lightweight FPN-style multi-task head for mask/pose/class outputs."""
+
     def __init__(self, 
                  norm_layer, 
                  num_classes: int,
@@ -432,7 +514,8 @@ class LiteFPNMultiTaskHead(nn.Module):
         self._init_head(self.head_mask)
 
     
-    def make_neck(self, in_ch: nn.Module, mid_ch: nn.Module, norm_layer: nn.Module) -> nn.Module:
+    def make_neck(self, in_ch: int, mid_ch: int, norm_layer: typing.Callable[[int], nn.Module]) -> nn.Module:
+        """Create lightweight convolutional neck for head branches."""
         return nn.Sequential(
             nn.Conv2d(in_ch, in_ch, 3, padding=1, groups=in_ch, bias=False),  # depthwise
             norm_layer(in_ch), nn.SiLU(True),
@@ -451,6 +534,17 @@ class LiteFPNMultiTaskHead(nn.Module):
                 hidden_14: torch.Tensor, 
                 mask_14: torch.Tensor, 
                 point_map_14: torch.Tensor) -> typing.Dict[str, torch.Tensor]:
+        """Run FPN-style head on 1/4 resolution features.
+
+        Args:
+            ctx_14: Context features ``(B, Cc, H/4, W/4)``.
+            hidden_14: Hidden state features ``(B, Ch, H/4, W/4)``.
+            mask_14: Foreground mask logits ``(B, 1, H/4, W/4)``.
+            point_map_14: Point map ``(B, 3, H/4, W/4)``.
+
+        Returns:
+            Dict[str, torch.Tensor]: Predicted logits and pose outputs.
+        """
         # 入力はすべて H/4 解像で、mask:1ch, point_map:3ch と固定
         x4_in = torch.cat((ctx_14, hidden_14, mask_14, point_map_14), dim=1)
         x4 = self.enc4(x4_in)
@@ -490,6 +584,15 @@ class LiteFPNMultiTaskHead(nn.Module):
 
 @torch.jit.script
 def r6d_to_rotmat(r6d: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Convert 6D rotation representation to rotation matrices.
+
+    Args:
+        r6d: Rotation representation shaped ``(B, 6, H, W)``.
+        eps: Clamp for numerical stability.
+
+    Returns:
+        torch.Tensor: Rotation matrices ``(B, 3, 3, H, W)``.
+    """
     # r6d: (B,6,H,W) -> R: (B,3,3,H,W)
     a1 = r6d[:, 0:3]
     a2 = r6d[:, 3:6]
@@ -533,7 +636,14 @@ def r6d_to_rotmat(r6d: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 @torch.jit.script
 def _sign_det_from_cols(A: torch.Tensor) -> torch.Tensor:
-    # A: (N,3,3), 列ベクトル a0,a1,a2 の三重積 sign(det(A)) を返す（float32/halfどれでもOK）
+    """Compute sign of determinant from column vectors.
+
+    Args:
+        A: Matrices shaped ``(N, 3, 3)``.
+
+    Returns:
+        torch.Tensor: Sign of determinant per matrix.
+    """
     a0 = A[:, :, 0]                            # (N,3)
     a1 = A[:, :, 1]                            # (N,3)
     a2 = A[:, :, 2]                            # (N,3)
@@ -545,10 +655,7 @@ def _sign_det_from_cols(A: torch.Tensor) -> torch.Tensor:
 
 @torch.jit.script
 def nearest_so3_batched(M: torch.Tensor) -> torch.Tensor:
-    """
-    SVDで最も近いSO(3)へ射影（バッチ対応・in-place無し・TorchScript可）。
-    入力 M: (..., 3, 3)  出力 R: 同形状
-    """
+    """Project matrices onto SO(3) using SVD in a batched manner."""
     M2 = M.reshape(-1, 3, 3).to(torch.float32)               # flatten して f32
     U, S, Vh = torch.linalg.svd(M2, full_matrices=False)     # (N,3,3)
     UV = U @ Vh                                              # (N,3,3)
@@ -569,7 +676,7 @@ def nearest_so3_batched(M: torch.Tensor) -> torch.Tensor:
 def _gaussian_disk_batched(H: int, W: int, idxs: torch.Tensor,
                            sigma: float, radius: int,
                            dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    # idxs: (B,K,2) [y,x] -> (B,K,1,H,W)
+    """Generate batched Gaussian disks around peak indices."""
     B, K = idxs.shape[0], idxs.shape[1]
     y = torch.arange(0, H, device=device, dtype=dtype).view(1,1,H,1)
     x = torch.arange(0, W, device=device, dtype=dtype).view(1,1,1,W)
@@ -588,6 +695,7 @@ def _gaussian_disk_batched(H: int, W: int, idxs: torch.Tensor,
 def xy_from_uvZ(K: torch.Tensor,   # (B,3,3)
                 uv: torch.Tensor,  # (B,K,2) [px]
                 Z: torch.Tensor) -> torch.Tensor:  # (B,K) [m]
+    """Lift pixel coordinates with depth to XY in camera frame."""
     # X = (u - cx)*Z/fx - (s/fx)*(v - cy)*Z/fy  （一般形; 実務では s≈0が多い）
     fx = K[:, 0, 0].unsqueeze(1)   # (B,1)
     fy = K[:, 1, 1].unsqueeze(1)
@@ -609,6 +717,7 @@ def compose_t_from_Z_uvK(mu_z_map: torch.Tensor,      # (B,1,H/4,W/4)
                          peaks_yx: torch.Tensor,      # (B,K,2) on H/4 grid
                          K_left_1x: torch.Tensor,     # (B,3,3)
                          H: int, W: int, down: int) -> torch.Tensor:
+    """Back-project peak points and depths into camera translation vectors."""
     # 1) ピクセル座標へ
     uv = peaks_to_uv_1_4(peaks_yx, down, W, H)  # (B,K,2) @ 1/1解像
     # 2) Z をサンプル（nearestでOK）
@@ -626,9 +735,14 @@ def compose_t_from_Z_uvK(mu_z_map: torch.Tensor,      # (B,1,H/4,W/4)
 
 @torch.jit.script
 def _greedy_match_yx(pred_yx: torch.Tensor, gt_yx: torch.Tensor) -> torch.Tensor:
-    """
-    pred_yx: (B,K,2), gt_yx: (B,K,2)  -> 返り値 perm: (B,K)
-    各バッチごとに、GTそれぞれに最も近い未使用のpredを貪欲に割当てる。
+    """Greedily match predicted peaks to ground truth peaks.
+
+    Args:
+        pred_yx: Predicted peak coordinates ``(B, K, 2)``.
+        gt_yx: Ground-truth peak coordinates ``(B, K, 2)``.
+
+    Returns:
+        torch.Tensor: Permutation indices ``(B, K)`` aligning preds to GT order.
     """
     B, K, _ = pred_yx.shape
     perm = torch.zeros((B, K), dtype=torch.long, device=pred_yx.device)
@@ -675,6 +789,31 @@ def extract_instances_from_head_vec(
     gauss_radius: int,
     class_from_logits: bool
 ) -> typing.Dict[str, torch.Tensor]:
+    """Extract per-instance pose and classification from network heads.
+
+    Args:
+        center_logits: Center heatmap logits ``(B, 1, H/4, W/4)``.
+        mask_logits: Optional mask logits ``(B, 1, H/4, W/4)``.
+        posz_mu: Depth or position map.
+        rot_mat: Rotation matrices ``(B, 3, 3, H/4, W/4)``.
+        cls_logits: Optional class logits ``(B, C, H/4, W/4)``.
+        k_left_1x: Camera intrinsics at full resolution.
+        use_gt_peaks: Whether to use GT peaks for extraction.
+        gt_center_1_4: Optional GT center map ``(B, 1, H/4, W/4)``.
+        gt_Wk: Optional GT weights ``(B, K, 1, H/4, W/4)``.
+        topk: Max number of instances to return.
+        nms_radius: NMS radius on the heatmap.
+        center_thresh: Threshold for peaks when not using GT.
+        use_uncertainty: Whether uncertainty maps are provided.
+        pos_logvar: Optional log-variance for position map.
+        rot_logvar_theta: Optional log-variance for rotation.
+        gauss_sigma: Gaussian sigma for peak weighting.
+        gauss_radius: Radius for Gaussian disk.
+        class_from_logits: If ``True``, apply softmax; otherwise sigmoid for classes.
+
+    Returns:
+        Dict[str, torch.Tensor]: Instance predictions and auxiliary weights.
+    """
 
     B, _, H, W = center_logits.shape
     device = center_logits.device

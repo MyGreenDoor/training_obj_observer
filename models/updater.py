@@ -1,3 +1,4 @@
+"""Pose updater modules and utilities designed for TorchScript."""
 
 import typing
 
@@ -6,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 def conv3x3(c_in, c_out, s=1): 
+    """3x3 convolution without bias."""
     return nn.Conv2d(c_in, c_out, 3, stride=s, padding=1, bias=False)
 
 class DSBlock(nn.Module):

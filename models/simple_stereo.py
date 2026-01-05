@@ -1,16 +1,24 @@
+"""Lightweight stereo network for disparity and optional pose estimation."""
+
+from typing import Dict
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 
 class SimpleStereoNet(nn.Module):
+    """Small CNN that estimates disparity and optionally a 6D pose.
+
+    Args:
+        in_channels: Number of input channels (expects concatenated left/right RGB).
+        features: Base channel width for the encoder/decoder.
+        predict_pose: If ``True``, also outputs a pose vector ``(rx, ry, rz, tx, ty, tz, conf)``.
     """
-    A tiny CNN that predicts a disparity map (1xHxW) and, optionally, a 6D pose vector per image (rx, ry, rz, tx, ty, tz).
-    Inputs: (B, 6, H, W) concatenated left/right RGB
-    """
-    def __init__(self, in_channels=6, features=32, predict_pose=True):
+
+    def __init__(self, in_channels: int = 6, features: int = 32, predict_pose: bool = True):
         super().__init__()
-        self.predict_pose = predict_pose
-        c = features
+        self.predict_pose: bool = bool(predict_pose)
+        c: int = int(features)
 
         self.encoder = nn.Sequential(
             nn.Conv2d(in_channels, c, 3, padding=1),
@@ -33,21 +41,29 @@ class SimpleStereoNet(nn.Module):
         )
         if self.predict_pose:
             # Global pooling + MLP head for pose
-            self.pose_head = nn.Sequential(
+            self.pose_head: nn.Module = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
                 nn.Linear(4*c, 2*c),
                 nn.ReLU(inplace=True),
                 nn.Linear(2*c, 7),
             )
+        else:
+            self.pose_head = nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Run forward pass.
+
+        Args:
+            x: Stereo pair tensor shaped ``(B, 6, H, W)`` with left/right RGB stacked.
+
+        Returns:
+            Dict[str, torch.Tensor]: ``{"disp": disp}`` and, if enabled, ``{"pose": pose}``.
+        """
         feat = self.encoder(x)
         disp = self.decoder_disp(feat)
-        # Non-negative disparity
-        # disp = F.relu(disp)
 
-        out = {"disp": disp}
+        out = torch.jit.annotate(Dict[str, torch.Tensor], {"disp": disp})
         if self.predict_pose:
             pose = self.pose_head(feat)
             out["pose"] = pose

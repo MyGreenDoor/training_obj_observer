@@ -12,7 +12,7 @@ weight_decay = 1e-5
 amp = false
 grad_clip = 1.0
 log_interval = 200
-model_path = "/home/ytake/Documents/GitHub/sscflow2/stereo_ddp_toml_project/outputs/run_debug/20251228_194254/checkpoint_007.pth"         # ".pth" へのパス（空なら何もしない）
+model_path = "/home/ytake/Documents/GitHub/training_obj_observer/outputs/run_debug/20251229_225751/checkpoint_019.pth"         # ".pth" へのパス（空なら何もしない）
 load_mode = "auto"      # "resume" | "weights" | "auto"
 strict = false          # state_dictのstrictロード
 

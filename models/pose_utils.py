@@ -1,16 +1,20 @@
+"""Pose estimation helpers compatible with TorchScript."""
+
 import torch
-import torch.nn.functional as F
 from typing import Optional, Tuple
 
 def _weighted_mean_and_cov(points: torch.Tensor,
                            weights: Optional[torch.Tensor],
                            eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    points:  (B,N,3)
-    weights: (B,N) or None
-    return:
-      mu: (B,3)
-      C:  (B,3,3)  （重み付き共分散の “分母はΣw” 版、N-1 ではない）
+    """Compute weighted mean and covariance for batched 3D points.
+
+    Args:
+        points: Batched 3D points shaped ``(B, N, 3)``.
+        weights: Optional weights shaped ``(B, N)``. If ``None``, uniform weights are used.
+        eps: Small constant to avoid division by zero.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Mean ``(B, 3)`` and covariance ``(B, 3, 3)``.
     """
     B, N, _ = points.shape
     if weights is None:
@@ -26,12 +30,13 @@ def _weighted_mean_and_cov(points: torch.Tensor,
     return mu, C
 
 def _pca_eig(C: torch.Tensor):
-    """
-    batched eigendecomposition
-    C: (B,3,3)
-    return:
-      evals_desc: (B,3)  降順
-      evecs_desc: (B,3,3) 列が主成分
+    """Compute eigenvalues/vectors in descending order for covariance matrices.
+
+    Args:
+        C: Covariance matrices shaped ``(B, 3, 3)``.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Eigenvalues ``(B, 3)`` and eigenvectors ``(B, 3, 3)`` in descending order.
     """
     evals, evecs = torch.linalg.eigh(C)                 # 昇順
     idx = torch.argsort(evals, dim=-1, descending=True) # (B,3)
@@ -52,11 +57,15 @@ def estimate_pose_pca6d(
     mesh_verts_obj: torch.Tensor,        # (B,M,3)  モデル3D（物体座標）
     weights: Optional[torch.Tensor] = None  # (B,N) or None
 ) -> dict:
-    """
-    どのバッチでも 6DoF を返す（R: (B,3,3), t: (B,3)）。
-    - 非対称物体に対して主成分軸を一致（符号は4候補から最適化）、det>0に補正。
-    - weights=None でも動作（等重み）。
-    - 数値退化/全ゼロ重みなどのケースは (R=I, t=0) にフォールバック。
+    """Estimate pose via PCA alignment for each batch.
+
+    Args:
+        obs_points_cam: Observed 3D points in camera frame shaped ``(B, N, 3)``.
+        mesh_verts_obj: Mesh vertices in object frame shaped ``(B, M, 3)``.
+        weights: Optional weights for observations shaped ``(B, N)``.
+
+    Returns:
+        dict: Keys ``\"R\"`` (rotation ``(B, 3, 3)``) and ``\"t\"`` (translation ``(B, 3)``), with fallback to identity/zero on degeneracy.
     """
     B, N, _ = obs_points_cam.shape
     device, dtype = obs_points_cam.device, obs_points_cam.dtype
