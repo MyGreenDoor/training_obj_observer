@@ -1,2 +1,6 @@
-tomlkit
-tensorboard
+torch>=2.1.0
+torchvision>=0.16.0
+tomlkit>=0.12.0
+tensorboard>=2.14.0
+numpy>=1.24.0
+pillow>=9.5.0

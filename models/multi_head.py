@@ -359,7 +359,7 @@ class TransformerMultiTaskHead(nn.Module):
         # heads
         self.head_mask = nn.Conv2d(160, 1, 3, padding=1)
         self.head_ctr  = nn.Conv2d(160, 1, 3, padding=1)
-        self.head_posz = nn.Conv2d(160, 2, 3, padding=1)
+        self.head_posz = nn.Conv2d(160, 6, 3, padding=1)
         self.head_rot  = nn.Conv2d(160, rot_ch + 1, 3, padding=1)
         self.head_cls  = nn.Conv2d(128, num_classes, 1)
         self._init_head(self.head_ctr)
@@ -436,8 +436,11 @@ class TransformerMultiTaskHead(nn.Module):
         out_rot    = self.head_rot(x_geo)
         cls_logits  = self.head_cls(x_sem)
 
-        mu_z     = out_posz[:, 0:1] * 1000.0
-        lv_z     = out_posz[:, 1:2].clamp(-8.0, 4.0)
+        mu_raw = out_posz[:, 0:3]
+        lv_raw = out_posz[:, 3:6]
+        mu_z = mu_raw[:, 2:3] * 1000.0 * self.out_pos_scale
+        mu_pos = torch.cat([mu_raw[:, 0:2], mu_z], dim=1)
+        lv_pos = lv_raw.clamp(-8.0, 4.0)
         
         if self.rot_repr == "r6d":
             r6d          = out_rot[:, :6]
@@ -453,8 +456,8 @@ class TransformerMultiTaskHead(nn.Module):
         return {
             "mask_logits":        mask_logits,
             "center_logits":      ctr_logits,
-            "pos_mu":             mu_z * self.out_pos_scale,  # [mm]
-            "pos_logvar":         lv_z,
+            "pos_mu":             mu_pos,  # [dx, dy, Z(mm)]
+            "pos_logvar":         lv_pos,
             "rot_mat":            rot_R,
             "rot_logvar_theta":   logvar_theta,
             "cls_logits":         cls_logits,
@@ -505,7 +508,7 @@ class LiteFPNMultiTaskHead(nn.Module):
         # heads
         self.head_mask = nn.Conv2d(160, 1, 3, padding=1)
         self.head_ctr  = nn.Conv2d(160, 1, 3, padding=1)
-        self.head_posz = nn.Conv2d(160, 2, 3, padding=1)
+        self.head_posz = nn.Conv2d(160, 6, 3, padding=1)
         self.head_rot  = nn.Conv2d(160, rot_ch + 1, 3, padding=1)
         self.head_cls  = nn.Conv2d(128, num_classes, 1)
         self.out_pos_scale = out_pos_scale
@@ -560,8 +563,11 @@ class LiteFPNMultiTaskHead(nn.Module):
         out_rot    = self.head_rot(x_geo)
         cls_logits  = self.head_cls(x_sem)
 
-        mu_z     = out_posz[:, 0:1] * 1000.0            # (B,1,H/4,W/4), [m] 推奨
-        lv_z     = out_posz[:, 1:2].clamp(-8.0, 4.0)
+        mu_raw = out_posz[:, 0:3]
+        lv_raw = out_posz[:, 3:6]
+        mu_z = mu_raw[:, 2:3] * 1000.0 * self.out_pos_scale
+        mu_pos = torch.cat([mu_raw[:, 0:2], mu_z], dim=1)
+        lv_pos = lv_raw.clamp(-8.0, 4.0)
         if self.rot_repr == "r6d":
             r6d          = out_rot[:, :6]
             rot_R        = r6d_to_rotmat(r6d)                   # (B,3,3,H,W)
@@ -574,8 +580,8 @@ class LiteFPNMultiTaskHead(nn.Module):
         return {
             "mask_logits":  mask_logits,              # ← ロジットで返す
             "center_logits": ctr_logits,              # ← ロジットで返す
-            "pos_mu":       mu_z * self.out_pos_scale,  # (B,1,H/4,W/4) [mm]
-            "pos_logvar":   lv_z,
+            "pos_mu":       mu_pos,                   # (B,3,H/4,W/4) [dx, dy, Z(mm)]
+            "pos_logvar":   lv_pos,
             "rot_mat":      rot_R,                    # これは行列
             "rot_logvar_theta": logvar_theta,
             "cls_logits":   cls_logits,               # ← ロジットで返す
@@ -731,6 +737,53 @@ def compose_t_from_Z_uvK(mu_z_map: torch.Tensor,      # (B,1,H/4,W/4)
     xy = xy_from_uvZ(K_left_1x, uv, z_at)  # (B,K,2)
     t = torch.cat([xy, z_at.unsqueeze(-1)], dim=-1)  # (B,K,3) [m]
     return t
+
+
+def pos_mu_to_pointmap(
+    pos_mu: torch.Tensor,       # (B,1 or 3,H/4,W/4)
+    K_left_1x: torch.Tensor,    # (B,3,3) full-res intrinsics
+    downsample: int = 4,
+) -> torch.Tensor:
+    """Convert pos_mu map to XYZ point map at 1/4 resolution.
+
+    For 1-channel pos_mu, treat it as Z and use scaled intrinsics.
+    For 3-channel pos_mu, interpret as (dx_px, dy_px, Z_mm).
+    """
+    if pos_mu.size(1) == 1:
+        K14 = K_left_1x.clone()
+        K14[:, 0, 0] /= downsample
+        K14[:, 1, 1] /= downsample
+        K14[:, 0, 2] /= downsample
+        K14[:, 1, 2] /= downsample
+        return rot_utils.depth_to_pointmap_from_K(pos_mu, K14)
+
+    if pos_mu.size(1) != 3:
+        raise ValueError(f"pos_mu must have 1 or 3 channels, got {pos_mu.size(1)}")
+
+    B, _, H4, W4 = pos_mu.shape
+    device = pos_mu.device
+    dtype = pos_mu.dtype
+
+    dx = pos_mu[:, 0:1]
+    dy = pos_mu[:, 1:2]
+    z = pos_mu[:, 2:3]
+
+    u = (torch.arange(W4, device=device, dtype=dtype) + 0.5) * float(downsample)
+    v = (torch.arange(H4, device=device, dtype=dtype) + 0.5) * float(downsample)
+    u = u.view(1, 1, 1, W4).expand(B, 1, H4, W4)
+    v = v.view(1, 1, H4, 1).expand(B, 1, H4, W4)
+
+    u_c = u + dx
+    v_c = v + dy
+
+    fx = K_left_1x[:, 0, 0].view(B, 1, 1, 1)
+    fy = K_left_1x[:, 1, 1].view(B, 1, 1, 1)
+    cx = K_left_1x[:, 0, 2].view(B, 1, 1, 1)
+    cy = K_left_1x[:, 1, 2].view(B, 1, 1, 1)
+
+    X = (u_c - cx) / fx * z
+    Y = (v_c - cy) / fy * z
+    return torch.cat([X, Y, z], dim=1)
 
 
 @torch.jit.script
@@ -901,20 +954,9 @@ def extract_instances_from_head_vec(
     K = Wk.shape[1]
 
     # =========================
-    # 2) Z → (X,Y,Z) point map（Kを1/4へスケール）
+    # 2) pos_mu → (X,Y,Z) point map
     # =========================
-    K14 = k_left_1x.clone()
-    K14[:, 0, 0] /= 4.0; K14[:, 1, 1] /= 4.0
-    K14[:, 0, 2] /= 4.0; K14[:, 1, 2] /= 4.0
-
-    if posz_mu.size(1) == 1:
-        depth_14 = posz_mu
-    elif posz_mu.size(1) == 3:
-        depth_14 = posz_mu[:, 2:3]   # Z
-    else:
-        raise ValueError(f"posz_mu must have 1 or 3 channels, got {posz_mu.size(1)}")
-
-    pos_map_14 = rot_utils.depth_to_pointmap_from_K(depth_14, K14)       # (B,3,H/4,W/4) [m]
+    pos_map_14 = pos_mu_to_pointmap(posz_mu, k_left_1x, downsample=4)
 
     # 前景重み（pose_from_maps_auto の wfg）
     wfg = msk_p                                                 # (B,1,H/4,W/4)

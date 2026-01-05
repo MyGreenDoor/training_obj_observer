@@ -6,7 +6,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.multi_head import LiteFPNMultiTaskHead, extract_instances_from_head_vec, compose_t_from_Z_uvK, TransformerMultiTaskHead
+from models.multi_head import (
+    LiteFPNMultiTaskHead,
+    TransformerMultiTaskHead,
+    extract_instances_from_head_vec,
+    pos_mu_to_pointmap,
+)
 from utils.projection import SilhouetteDepthRenderer
 from utils import rot_utils
 from utils.logging_utils import section_timer
@@ -757,7 +762,9 @@ class SSCFlow2(nn.Module):
         rot_mat            = head_out["rot_mat"]
         rot_logvar_theta   = head_out["rot_logvar_theta"]
         cls_logits         = head_out["cls_logits"]
-        current_pos_map = rot_utils.depth_to_pointmap_from_K(head_out["pos_mu"], K_pair_14[:, 0])
+        assert head_out["pos_mu"].shape[1] == 3
+        assert head_out["pos_logvar"].shape[1] == 3
+        current_pos_map = pos_mu_to_pointmap(head_out["pos_mu"], K_pair_1x[:, 0], downsample=4)
         current_rot_map = rot_mat
         with torch.no_grad():
             render_out = _render_t0_outputs(

@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.multi_head import nearest_so3_batched
+from models.multi_head import nearest_so3_batched, pos_mu_to_pointmap
 from models.ssscflow2 import scale_intrinsics_pair_for_feature
 from utils import rot_utils
 
@@ -57,9 +57,9 @@ def pos_loss_hetero(mu_pos: torch.Tensor,   # (B,K, 3) [mm]
 
 @torch.jit.script
 def pos_loss_hetero_map(
-    mu_pos_map: torch.Tensor,           # (B, 1, H, W)  [mm]
-    lv_pos_map: typing.Optional[torch.Tensor], # (B, 1, H, W)  (log-variance) or None
-    pos_gt_map: torch.Tensor,           # (B, 1, H, W)  [mm]
+    mu_pos_map: torch.Tensor,           # (B, C, H, W)
+    lv_pos_map: typing.Optional[torch.Tensor], # (B, C, H, W)  (log-variance) or None
+    pos_gt_map: torch.Tensor,           # (B, C, H, W)
     valid_map: torch.Tensor             # (B, 1, H, W)  (0/1 or float mask)
 ) -> torch.Tensor:
     """
@@ -73,7 +73,7 @@ def pos_loss_hetero_map(
     where rho = charbonnier(mu_pos - pos_gt)
     """
     # robust error per-pixel per-channel
-    rho = charbonnier1(mu_pos_map - pos_gt_map)  # (B,1,H,W)
+    rho = charbonnier1(mu_pos_map - pos_gt_map)  # (B,C,H,W)
 
     # ensure valid is float and broadcastable; keep denominator counting spatial valid only
     valid_f = valid_map.float()                  # (B,1,H,W)
@@ -86,18 +86,51 @@ def pos_loss_hetero_map(
 
     # ----- ここからヘテロスケ版 -----
 
-    # inverse-variance weight (B,1,H,W)
-    inv = torch.exp(-lv_pos_map).clamp_min(1e-8)  # (B,1,H,W)
+    lv_pos_map = lv_pos_map.clamp(-10.0, 10.0)
+    # inverse-variance weight (B,C,H,W)
+    inv = torch.exp(-lv_pos_map).clamp_min(1e-8)  # (B,C,H,W)
 
     # per-pixel per-channel hetero loss
-    loss = inv * rho + lv_pos_map                 # (B,1,H,W)
+    loss = inv * rho + lv_pos_map                 # (B,C,H,W)
 
     weighted = loss * valid_f
 
     # normalize by number of valid spatial locations (not multiplied by channels)
-    denom = valid_f.sum().clamp_min(1.0)          # scalar
+    denom = valid_f.sum().clamp_min(1.0) * mu_pos_map.size(1)
 
     return weighted.sum() / denom
+
+
+def _pos_mu_gt_from_t_map(
+    t_map: torch.Tensor,  # (B,3,H/4,W/4)
+    K_left_1x: torch.Tensor,
+    downsample: int = 4,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    B, _, H4, W4 = t_map.shape
+    device = t_map.device
+    dtype = t_map.dtype
+
+    X = t_map[:, 0:1]
+    Y = t_map[:, 1:2]
+    Z = t_map[:, 2:3].clamp_min(eps)
+
+    fx = K_left_1x[:, 0, 0].view(B, 1, 1, 1)
+    fy = K_left_1x[:, 1, 1].view(B, 1, 1, 1)
+    cx = K_left_1x[:, 0, 2].view(B, 1, 1, 1)
+    cy = K_left_1x[:, 1, 2].view(B, 1, 1, 1)
+
+    u_c = fx * (X / Z) + cx
+    v_c = fy * (Y / Z) + cy
+
+    u = (torch.arange(W4, device=device, dtype=dtype) + 0.5) * float(downsample)
+    v = (torch.arange(H4, device=device, dtype=dtype) + 0.5) * float(downsample)
+    u = u.view(1, 1, 1, W4).expand(B, 1, H4, W4)
+    v = v.view(1, 1, H4, 1).expand(B, 1, H4, W4)
+
+    dx = u_c - u
+    dy = v_c - v
+    return torch.cat([dx, dy, t_map[:, 2:3]], dim=1)
 
 
 # ----- 4) geodesic θ (f32) -----
@@ -581,6 +614,8 @@ def pos_logvar_from_depth_logvar_peaks(
     eps: float = 1e-9,
 ) -> torch.Tensor:
     B, K, _ = peaks_yx.shape
+    if logvar_z_bk1.size(-1) == 3:
+        logvar_z_bk1 = logvar_z_bk1[..., 2:3]
     assert logvar_z_bk1.shape == (B, K, 1)
 
     fx = K_left_14[:, 0, 0].view(B, 1)
@@ -621,7 +656,9 @@ def loss_step_iter0(out, gt, global_steps,
     L_mask = dice_loss
 
     K_left_14 = _scale_K(gt["K_left_1x"])
-    pos_map_pred = rot_utils.depth_to_pointmap_from_K(out["pos_mu"], K_left_14)  # (B,3,H/4,W/4)
+    assert out["pos_mu"].shape[1] == 3
+    assert out["pos_logvar"].shape[1] == 3
+    pos_map_pred = pos_mu_to_pointmap(out["pos_mu"], gt["K_left_1x"], downsample=4)
     wfg = torch.ones_like(gt["mask_1_4"])
     R_pred, t_pred, valid, z_log_var, rot_log_theta = rot_utils.pose_from_maps_auto(
         rot_map=out["rot_mat"], pos_map=pos_map_pred,
@@ -647,8 +684,16 @@ def loss_step_iter0(out, gt, global_steps,
     # 3) Position
     L_pos = pos_loss_hetero(t_pred/10.0, pos_log_var/10.0, t_gt/10.0, valid) # 10cm
     # z only
-    L_pos_map = pos_loss_hetero_map(pos_map_pred[:, -1:]/10.0, out["pos_logvar"][:, -1:] - 2.0 * math.log(10.0),
-                                    gt["pos_1_4"][:, -1:]/10.0, gt["pos_1_4"][:, -1:] > 0)
+    gt_pos_mu_map = _pos_mu_gt_from_t_map(gt["pos_1_4"], gt["K_left_1x"], downsample=4)
+    valid_mask = gt["pos_1_4"][:, -1:] > 0
+    pos_scale = out["pos_mu"].new_tensor([1.0, 1.0, 10.0]).view(1, 3, 1, 1)
+    log_scale = torch.log(pos_scale)
+    L_pos_map = pos_loss_hetero_map(
+        out["pos_mu"] / pos_scale,
+        out["pos_logvar"] - 2.0 * log_scale,
+        gt_pos_mu_map / pos_scale,
+        valid_mask,
+    )
 
     # 4) Rotation
     L_rot = rotation_loss_hetero(
@@ -735,5 +780,22 @@ def loss_step_iter0(out, gt, global_steps,
         "L_adds": L_adds.detach(),        
         "L_add": L_add.detach(),        
     }
+    if out["pos_mu"].shape[1] == 3 and valid_mask.any():
+        dx = out["pos_mu"][:, 0:1][valid_mask]
+        dy = out["pos_mu"][:, 1:2][valid_mask]
+        # logs.update(
+        #     {
+        #         "pos_dx_mean": dx.mean().detach(),
+        #         "pos_dx_std": dx.std().detach(),
+        #         "pos_dx_min": dx.min().detach(),
+        #         "pos_dx_max": dx.max().detach(),
+        #         "pos_dy_mean": dy.mean().detach(),
+        #         "pos_dy_std": dy.std().detach(),
+        #         "pos_dy_min": dy.min().detach(),
+        #         "pos_dy_max": dy.max().detach(),
+        #         "pos_logvar_min": out["pos_logvar"].min().detach(),
+        #         "pos_logvar_max": out["pos_logvar"].max().detach(),
+        #     }
+        # )
     logs.update({k: (v.detach() if torch.is_tensor(v) else v) for k, v in map_logs.items()})
     return L, logs
