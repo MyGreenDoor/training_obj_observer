@@ -621,7 +621,7 @@ class SSCFlow2(nn.Module):
             # blur_sigma=blur_sigma,
             # blur_gamma=blur_gamma,
         )
-        c_in = 1
+        c_in = 3 + 1
         if use_so3_log_xyz:
             c_in += 3
         if use_so3_log_ratio_normal:
@@ -789,6 +789,7 @@ class SSCFlow2(nn.Module):
             extra   = stuff["hidden0"].detach()
             depth_conf =  torch.exp(-0.5 * depth_log_var).detach()
             ctx_in = [
+                point_map_cur.detach(),
                 mask_14,
                 depth_conf,
             ]
