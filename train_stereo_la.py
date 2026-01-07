@@ -33,7 +33,7 @@ import torchvision.utils as vutils
 from la_loader.synthetic_data_loader import LASyntheticDataset3PerObj
 from la_loader import la_transforms
 
-from models.ssscflow2 import SSCFlow2, make_gn
+from models.sscflow2 import SSCFlow2, make_gn
 from utils import dist_utils, flow_utils, rot_utils
 from utils.logging_utils import (
     draw_axes_on_images_bk,

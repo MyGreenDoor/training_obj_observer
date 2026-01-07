@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.multi_head import nearest_so3_batched, pos_mu_to_pointmap
-from models.ssscflow2 import scale_intrinsics_pair_for_feature
+from models.sscflow2 import scale_intrinsics_pair_for_feature
 from utils import rot_utils
 
 # ----- 1) Center heatmap: focal (logit版, f32固定) -----
@@ -513,7 +513,9 @@ def loss_pose_sequence(
         L_rot_t = rotation_loss_hetero_map(R_pred_map, R_gt_map, None, t_gt_map[:, -1:] > 0)
 
         # ----- translation loss (pixel-weighted) -----
-        L_pos_t = pos_loss_hetero_map(t_pred_map/10.0, None, t_gt_map/10.0, t_gt_map[:, -1:] > 0)
+        
+        pos_scale = t_pred_map.new_tensor([1.0, 1.0, 10.0]).view(1, 3, 1, 1)
+        L_pos_t = pos_loss_hetero_map(t_pred_map / pos_scale, None, t_gt_map / pos_scale, t_gt_map[:, -1:] > 0)
         
         # ----- ADD/ADD-S（任意; 安全化付き）-----
         R_t, t_t, _, _, _ = rot_utils.pose_from_maps_auto(
@@ -682,8 +684,15 @@ def loss_step_iter0(out, gt, global_steps,
     ) # (B,K,3,3), (B,K,3), (B,K)
 
     # 3) Position
-    L_pos = pos_loss_hetero(t_pred/10.0, pos_log_var/10.0, t_gt/10.0, valid) # 10cm
-    # z only
+    pos_scale = t_pred.new_tensor([1.0, 1.0, 10.0]).view(1, 3, 1, 1)
+    log_scale = torch.log(pos_scale)
+    L_pos = pos_loss_hetero(
+        t_pred / pos_scale, 
+        pos_log_var - 2.0 * log_scale, 
+        t_gt / pos_scale, 
+        valid
+        ) # 1mm, 1mm, 10mm
+    # position map
     gt_pos_mu_map = _pos_mu_gt_from_t_map(gt["pos_1_4"], gt["K_left_1x"], downsample=4)
     valid_mask = gt["pos_1_4"][:, -1:] > 0
     pos_scale = out["pos_mu"].new_tensor([1.0, 1.0, 10.0]).view(1, 3, 1, 1)
@@ -693,7 +702,7 @@ def loss_step_iter0(out, gt, global_steps,
         out["pos_logvar"] - 2.0 * log_scale,
         gt_pos_mu_map / pos_scale,
         valid_mask,
-    )
+    ) # 1mm, 1mm, 10mm
 
     # 4) Rotation
     L_rot = rotation_loss_hetero(
