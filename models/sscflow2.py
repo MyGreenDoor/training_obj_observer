@@ -700,6 +700,8 @@ class SSCFlow2(nn.Module):
         depth_1_4 = None
         rot_maps: List[torch.Tensor] = []
         pos_maps: List[torch.Tensor] = []
+        pos_logvar_maps: List[torch.Tensor] = []
+        rot_logvar_theta_maps: List[torch.Tensor] = []
         Z_mm_list: List[torch.Tensor] = []  # 各iterの深度マップを保存
         Rk_list: List[torch.Tensor] = []
         tk_list: List[torch.Tensor] = []
@@ -806,14 +808,14 @@ class SSCFlow2(nn.Module):
             else:
                 add_feats = None
             if self.raft_like_updater:
-                delta_pose_map, flow_pred = self.delta_pose_updater(
+                delta_pose_map, flow_pred, pos_logvar_map, rot_logvar_theta_map = self.delta_pose_updater(
                     point_map_cur.detach(), point_map_rend_cur.detach(), 
                     current_pos_map.detach(), R_log.detach(),
                     torch.cat(ctx_in, dim=1),
                 )
                 flow_pred_list.append(flow_pred)   
             else:
-                delta_pose_map = self.delta_pose_updater(
+                delta_pose_map, pos_logvar_map, rot_logvar_theta_map = self.delta_pose_updater(
                     point_map_cur.detach(), point_map_rend_cur.detach(), current_pos_map.detach(), R_cur_log=R_log,
                     context=context0.detach(), mask=mask_14, extra_feats=extra,
                     add_feats=add_feats
@@ -833,6 +835,8 @@ class SSCFlow2(nn.Module):
             )
             rot_maps.append(current_rot_map)
             pos_maps.append(current_pos_map)
+            pos_logvar_maps.append(pos_logvar_map)
+            rot_logvar_theta_maps.append(rot_logvar_theta_map)
             
                         
             # ==== ここから各 iter で「レンダ側 point map」を“インスタンス単位”に更新 ====
@@ -904,7 +908,9 @@ class SSCFlow2(nn.Module):
             "instances": inst,
             "Z_mm_list": Z_mm_list,
             "Rk_list": Rk_list,
-            "tk_list": tk_list
+            "tk_list": tk_list,
+            "pos_logvar_maps": pos_logvar_maps,
+            "rot_logvar_theta_maps": rot_logvar_theta_maps,
         }
         if self.raft_like_updater:
             flow_preds = torch.cat(flow_pred_list, dim=1)

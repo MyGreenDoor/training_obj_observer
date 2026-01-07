@@ -1685,7 +1685,6 @@ def train_one_epoch(
             loss_mh, logs = loss_functions.loss_step_iter0(
                 pred,
                 gt_iter0,
-                global_step,
                 cfg["loss"]["w_ctr"],
                 cfg["loss"]["w_mask"],
                 cfg["loss"]["w_pos"],
@@ -1696,7 +1695,6 @@ def train_one_epoch(
                 cfg["loss"]['w_pos_update'],
                 cfg["loss"]['w_adds_update'],
                 cfg["loss"]['update_gamma'],
-                cfg["loss"]['update_warmup_steps'],
             )
             loss = cfg["loss"]["w_disp"] * loss_disp + loss_mh
             if 'flow_preds' in pred:
@@ -1805,7 +1803,6 @@ def validate(
         loss_mh, logs = loss_functions.loss_step_iter0(
             pred,
             gt_iter0,
-            cfg["loss"]['update_warmup_steps'],
             cfg["loss"]["w_ctr"],
             cfg["loss"]["w_mask"],
             cfg["loss"]["w_pos"],
@@ -1816,7 +1813,6 @@ def validate(
             cfg["loss"]['w_pos_update'],
             cfg["loss"]['w_adds_update'],
             cfg["loss"]['update_gamma'],
-            cfg["loss"]['update_warmup_steps'],
         )
         _ensure_avg_meters(meters, logs)              # ★追加：未知の L_* をメータに生やす
         for loss_str, v in logs.items():

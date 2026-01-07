@@ -128,12 +128,16 @@ class DeltaPoseRegressorMapHourglass4L(nn.Module):
 class DeltaPoseRegressor(DeltaPoseRegressorMapHourglass4L):
     def __init__(self, c_in, base_ch=128, groups=16,
                  out_scale_rot=0.5, out_scale_trans=0.01,
-                 use_gate=False, use_posenc=False):
+                 use_gate=False, use_posenc=False,
+                 logvar_min: float = -10.0, logvar_max: float = 5.0,
+                 logvar_init: float = -4.0):
         super().__init__(c_in=c_in, base_ch=base_ch, groups=groups, out_scale_rot=out_scale_rot, out_scale_trans=out_scale_trans)
         self.use_gate = use_gate
         if use_posenc:
             raise NotImplementedError()
         self.use_pose_enc=use_posenc
+        self.logvar_min = float(logvar_min)
+        self.logvar_max = float(logvar_max)
 
         # 追加の小ヘッド（ゲート）
         if use_gate:
@@ -142,6 +146,19 @@ class DeltaPoseRegressor(DeltaPoseRegressorMapHourglass4L):
                 nn.Conv2d(base_ch, 1, 1, bias=True)
             )
             nn.init.zeros_(self.gate_head[-1].weight); nn.init.zeros_(self.gate_head[-1].bias)
+
+        self.pos_logvar_head = nn.Sequential(
+            conv3x3(base_ch, base_ch), nn.GroupNorm(groups, base_ch), nn.SiLU(True),
+            nn.Conv2d(base_ch, 3, 1, bias=True)
+        )
+        self.rot_logvar_head = nn.Sequential(
+            conv3x3(base_ch, base_ch), nn.GroupNorm(groups, base_ch), nn.SiLU(True),
+            nn.Conv2d(base_ch, 1, 1, bias=True)
+        )
+        nn.init.zeros_(self.pos_logvar_head[-1].weight)
+        nn.init.zeros_(self.rot_logvar_head[-1].weight)
+        nn.init.constant_(self.pos_logvar_head[-1].bias, float(logvar_init))
+        nn.init.constant_(self.rot_logvar_head[-1].bias, float(logvar_init))
 
         # 出力ゼロ初期化
         # nn.init.zeros_(self.head[-1].weight); nn.init.zeros_(self.head[-1].bias)
@@ -175,7 +192,10 @@ class DeltaPoseRegressor(DeltaPoseRegressorMapHourglass4L):
             d_omega_raw = gate * d_omega_raw
             dt = gate * dt
 
-        return torch.cat([d_omega_raw, dt], dim=1)
+        pos_logvar = self.pos_logvar_head(y).clamp(self.logvar_min, self.logvar_max)
+        rot_logvar_theta = self.rot_logvar_head(y).clamp(self.logvar_min, self.logvar_max)
+
+        return torch.cat([d_omega_raw, dt], dim=1), pos_logvar, rot_logvar_theta
 
 
 def conv3x3(ci, co, s=1, g=1): return nn.Conv2d(ci, co, 3, stride=s, padding=1, groups=g, bias=False)

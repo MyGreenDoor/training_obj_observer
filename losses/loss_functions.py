@@ -491,6 +491,8 @@ def loss_pose_sequence(
     wfg: torch.Tensor,
     weight_map_inst: torch.Tensor,
     peak_yx: torch.Tensor,
+    pos_logvar_list: typing.Optional[typing.List[torch.Tensor]] = None,
+    rot_logvar_theta_list: typing.Optional[typing.List[torch.Tensor]] = None,
     w_rot: float = 1.0, 
     w_pos: float = 1.0,
     w_adds_per_t: float = 1.0,
@@ -510,12 +512,18 @@ def loss_pose_sequence(
         wt = (gamma ** t)
 
         # ----- rotation loss (pixel-weighted) -----
-        L_rot_t = rotation_loss_hetero_map(R_pred_map, R_gt_map, None, t_gt_map[:, -1:] > 0)
+        rot_lv = None
+        if rot_logvar_theta_list is not None and t < len(rot_logvar_theta_list):
+            rot_lv = rot_logvar_theta_list[t]
+        L_rot_t = rotation_loss_hetero_map(R_pred_map, R_gt_map, rot_lv, t_gt_map[:, -1:] > 0)
 
         # ----- translation loss (pixel-weighted) -----
         
         pos_scale = t_pred_map.new_tensor([1.0, 1.0, 10.0]).view(1, 3, 1, 1)
-        L_pos_t = pos_loss_hetero_map(t_pred_map / pos_scale, None, t_gt_map / pos_scale, t_gt_map[:, -1:] > 0)
+        pos_lv = None
+        if pos_logvar_list is not None and t < len(pos_logvar_list):
+            pos_lv = pos_logvar_list[t]
+        L_pos_t = pos_loss_hetero_map(t_pred_map / pos_scale, pos_lv, t_gt_map / pos_scale, t_gt_map[:, -1:] > 0)
         
         # ----- ADD/ADD-S（任意; 安全化付き）-----
         R_t, t_t, _, _, _ = rot_utils.pose_from_maps_auto(
@@ -566,16 +574,6 @@ def loss_pose_sequence(
         logs["L_pos_seqs"] = torch.stack([logs[k] for k in logs if k.startswith("L_pos_seq_t")]).mean()
 
     return {"loss": total, "logs": logs}
-
-
-
-# 例: 余熱ステップ数を cfg["loss"]["maps_warmup_steps"] で管理
-def _rampup_weight(global_step: int, warmup_steps: int) -> float:
-    if warmup_steps <= 0:
-        return 1.0
-    # 線形 or コサインでもOK
-    x = min(max(global_step / float(warmup_steps), 0.0), 1.0)
-    return x
 
 
 def gather_gt_at_peaks(
@@ -640,11 +638,11 @@ def pos_logvar_from_depth_logvar_peaks(
     return logvar_xyz
 
 
-def loss_step_iter0(out, gt, global_steps,
+def loss_step_iter0(out, gt, 
                     w_ctr=1.0, w_mask=1.0, w_pos=1.0, w_rot=1.0, w_cls=0.5,
                     w_adds: float = 1.0, w_rot_update=1.0, w_pos_update=1.0,
                     w_adds_update: float = 1.0,
-                    update_gamma=0.8, update_warmup_steps=5000,
+                    update_gamma=0.8,
                     use_adds_symmetric: bool = True,    # ← True: ADD-S
                     adds_max_points: int = 4096,        # ← 安全上限
                     # w_mask_bootstrap=0.2
@@ -684,7 +682,7 @@ def loss_step_iter0(out, gt, global_steps,
     ) # (B,K,3,3), (B,K,3), (B,K)
 
     # 3) Position
-    pos_scale = t_pred.new_tensor([1.0, 1.0, 10.0]).view(1, 3, 1, 1)
+    pos_scale = t_pred.new_tensor([1.0, 1.0, 10.0]).view(1, 1, 3)
     log_scale = torch.log(pos_scale)
     L_pos = pos_loss_hetero(
         t_pred / pos_scale, 
@@ -756,6 +754,8 @@ def loss_step_iter0(out, gt, global_steps,
         t_gt_map   = gt["pos_1_4"],
         R_gt=R_gt,
         t_gt=t_gt,
+        pos_logvar_list=out.get("pos_logvar_maps", None),
+        rot_logvar_theta_list=out.get("rot_logvar_theta_maps", None),
         wfg = wfg,
         weight_map_inst=gt["weight_map_inst"],
         peak_yx=out["instances"]["gt_yx"],
@@ -773,7 +773,6 @@ def loss_step_iter0(out, gt, global_steps,
     L_maps   = maps_out["loss"]            # Tensor
     map_logs = maps_out.get("logs", {})    # dict
     # 合成
-    w_warm   = _rampup_weight(global_steps, update_warmup_steps)
     L = w_ctr*L_ctr + w_mask*L_mask# + w_pos*L_pos + w_rot*L_rot
     L = L + w_cls*L_cls# + w_adds*L_adds + w_adds * L_add
     L = L + w_pos*L_pos_map + w_rot*L_rot_map + L_maps
