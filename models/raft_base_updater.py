@@ -378,7 +378,7 @@ class RAFTCore32(nn.Module):
 # ----------------- Delta regressor (64->4->64 UNet) -----------------
 class DeltaRegressorUNet64(nn.Module):
     """
-    Input:  concat(point_map_cur(3), flow64(2)) -> (B,5,64,64)
+    Input:  concat(point_map_cur(3), flow64(2), pos_map(3), rot_map(3), pos_logvar(3), rot_logvar_theta(1)) -> (B,15,64,64)
     Output: delta_map (B,6,64,64) with tanh on rot
     """
     def __init__(
@@ -390,7 +390,6 @@ class DeltaRegressorUNet64(nn.Module):
         in_ch: int = 5,
         logvar_min: float = -10.0,
         logvar_max: float = 5.0,
-        logvar_init: float = -4.0,
     ):
         super().__init__()
         self.out_scale_rot = float(out_scale_rot)
@@ -447,11 +446,19 @@ class DeltaRegressorUNet64(nn.Module):
         )
         nn.init.zeros_(self.pos_logvar_head[-1].weight)
         nn.init.zeros_(self.rot_logvar_head[-1].weight)
-        nn.init.constant_(self.pos_logvar_head[-1].bias, float(logvar_init))
-        nn.init.constant_(self.rot_logvar_head[-1].bias, float(logvar_init))
+        # nn.init.constant_(self.pos_logvar_head[-1].bias, float(logvar_init))
+        # nn.init.constant_(self.rot_logvar_head[-1].bias, float(logvar_init))
 
-    def forward(self, point_map_cur: torch.Tensor, flow64: torch.Tensor, pos_map: torch.Tensor, rot_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x = torch.cat((point_map_cur, flow64, pos_map, rot_map), dim=1)  # (B,5,64,64)
+    def forward(
+        self,
+        point_map_cur: torch.Tensor,
+        flow64: torch.Tensor,
+        pos_map: torch.Tensor,
+        rot_map: torch.Tensor,
+        pos_logvar: torch.Tensor,
+        rot_logvar_theta: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = torch.cat((point_map_cur, flow64, pos_map, rot_map, pos_logvar, rot_logvar_theta), dim=1)
 
         s0 = self.stem(x)  # 64
         s1 = self.d1(s0)   # 32
@@ -485,7 +492,9 @@ class DeltaPoseRegressorRAFTLike(nn.Module):
       - point_map_cur : (B,3,64,64)
       - point_map_rend: (B,3,64,64)
       - pos_map       : (B,3,64,64)
-      - rot_map       : (B,3,3,64,64)
+      - rot_map       : (B,3,64,64)
+      - pos_logvar    : (B,3,64,64)
+      - rot_logvar_theta: (B,1,64,64)
       - ctx_in        : (B,ctx_ch,64,64)  # already concatenated outside
 
     outputs are fixed:
@@ -517,7 +526,7 @@ class DeltaPoseRegressorRAFTLike(nn.Module):
             groups=groups,
             out_scale_rot=out_scale_rot,
             out_scale_trans=out_scale_trans,
-            in_ch=11,
+            in_ch=15,
         )
 
     def forward(
@@ -526,11 +535,15 @@ class DeltaPoseRegressorRAFTLike(nn.Module):
         point_map_rend: torch.Tensor,
         pos_map: torch.Tensor,
         rot_map: torch.Tensor,
+        pos_logvar: torch.Tensor,
+        rot_logvar_theta: torch.Tensor,
         ctx_in: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         flows64, _flow32_last = self.core(point_map_cur, point_map_rend, ctx_in)  # (B,T,2,64,64)
         flow64_last = flows64[:, -1]                                              # (B,2,64,64)
-        delta_map, pos_logvar, rot_logvar_theta = self.delta(point_map_cur, flow64_last, pos_map, rot_map)
+        delta_map, pos_logvar, rot_logvar_theta = self.delta(
+            point_map_cur, flow64_last, pos_map, rot_map, pos_logvar, rot_logvar_theta
+        )
         return delta_map, flows64, pos_logvar, rot_logvar_theta
 
 
@@ -556,11 +569,15 @@ def _script_check() -> None:
     point_map_cur = torch.randn(B, 3, 64, 64, device=device, dtype=dtype)
     point_map_rend = torch.randn(B, 3, 64, 64, device=device, dtype=dtype)
     pos_map = torch.randn(B, 3, 64, 64, device=device, dtype=dtype)
-    rot_map = torch.randn(B, 3, 3, 64, 64, device=device, dtype=dtype)
+    rot_map = torch.randn(B, 3, 64, 64, device=device, dtype=dtype)
+    pos_logvar = torch.randn(B, 3, 64, 64, device=device, dtype=dtype)
+    rot_logvar_theta = torch.randn(B, 1, 64, 64, device=device, dtype=dtype)
     ctx_in = torch.randn(B, ctx_in_ch, 64, 64, device=device, dtype=dtype)
 
     # eager
-    delta_map, flows64, pos_logvar, rot_logvar_theta = model(point_map_cur, point_map_rend, pos_map, rot_map, ctx_in)
+    delta_map, flows64, pos_logvar, rot_logvar_theta = model(
+        point_map_cur, point_map_rend, pos_map, rot_map, pos_logvar, rot_logvar_theta, ctx_in
+    )
     assert delta_map.shape == (B, 6, 64, 64)
     assert flows64.shape == (B, 6, 2, 64, 64)
     assert pos_logvar.shape == (B, 3, 64, 64)
@@ -568,7 +585,7 @@ def _script_check() -> None:
 
     # script
     sm = torch.jit.script(model)
-    d2, f2, lv2, rv2 = sm(point_map_cur, point_map_rend, pos_map, rot_map, ctx_in)
+    d2, f2, lv2, rv2 = sm(point_map_cur, point_map_rend, pos_map, rot_map, pos_logvar, rot_logvar_theta, ctx_in)
     assert d2.shape == (B, 6, 64, 64)
     assert f2.shape == (B, 6, 2, 64, 64)
     assert lv2.shape == (B, 3, 64, 64)

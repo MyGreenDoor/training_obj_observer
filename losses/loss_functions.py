@@ -519,10 +519,11 @@ def loss_pose_sequence(
 
         # ----- translation loss (pixel-weighted) -----
         
-        pos_scale = t_pred_map.new_tensor([1.0, 1.0, 10.0]).view(1, 3, 1, 1)
+        pos_scale = t_pred_map.new_tensor([1.0, 1.0, 1.0]).view(1, 3, 1, 1)
         pos_lv = None
         if pos_logvar_list is not None and t < len(pos_logvar_list):
-            pos_lv = pos_logvar_list[t]
+            log_scale = - 2.0 * torch.log(pos_scale)
+            pos_lv = pos_logvar_list[t] -log_scale
         L_pos_t = pos_loss_hetero_map(t_pred_map / pos_scale, pos_lv, t_gt_map / pos_scale, t_gt_map[:, -1:] > 0)
         
         # ----- ADD/ADD-S（任意; 安全化付き）-----
@@ -607,37 +608,6 @@ def gather_gt_at_peaks(
     return R, t
 
 
-def pos_logvar_from_depth_logvar_peaks(
-    logvar_z_bk1: torch.Tensor,   # (B,K,1)  = log σ_z^2
-    peaks_yx: torch.Tensor,       # (B,K,2)  on H/4 grid, [y,x]
-    K_left_14: torch.Tensor,      # (B,3,3)  1/4スケール済み
-    eps: float = 1e-9,
-) -> torch.Tensor:
-    B, K, _ = peaks_yx.shape
-    if logvar_z_bk1.size(-1) == 3:
-        logvar_z_bk1 = logvar_z_bk1[..., 2:3]
-    assert logvar_z_bk1.shape == (B, K, 1)
-
-    fx = K_left_14[:, 0, 0].view(B, 1)
-    fy = K_left_14[:, 1, 1].view(B, 1)
-    cx = K_left_14[:, 0, 2].view(B, 1)
-    cy = K_left_14[:, 1, 2].view(B, 1)
-
-    u = peaks_yx[..., 1].float()  # x
-    v = peaks_yx[..., 0].float()  # y
-
-    ax = (u - cx) / (fx + eps)    # (B,K)
-    ay = (v - cy) / (fy + eps)    # (B,K)
-
-    log_ax2 = (2.0 * torch.log(ax.abs() + eps)).unsqueeze(-1)  # (B,K,1)
-    log_ay2 = (2.0 * torch.log(ay.abs() + eps)).unsqueeze(-1)  # (B,K,1)
-
-    logvar_x = logvar_z_bk1 + log_ax2
-    logvar_y = logvar_z_bk1 + log_ay2
-    logvar_xyz = torch.cat([logvar_x, logvar_y, logvar_z_bk1], dim=-1)  # (B,K,3)
-    return logvar_xyz
-
-
 def loss_step_iter0(out, gt, 
                     w_ctr=1.0, w_mask=1.0, w_pos=1.0, w_rot=1.0, w_cls=0.5,
                     w_adds: float = 1.0, w_rot_update=1.0, w_pos_update=1.0,
@@ -660,18 +630,13 @@ def loss_step_iter0(out, gt,
     assert out["pos_logvar"].shape[1] == 3
     pos_map_pred = pos_mu_to_pointmap(out["pos_mu"], gt["K_left_1x"], downsample=4)
     wfg = torch.ones_like(gt["mask_1_4"])
-    R_pred, t_pred, valid, z_log_var, rot_log_theta = rot_utils.pose_from_maps_auto(
+    R_pred, t_pred, valid, pos_log_var, rot_log_theta = rot_utils.pose_from_maps_auto(
         rot_map=out["rot_mat"], pos_map=pos_map_pred,
         Wk_1_4=gt["weight_map_inst"], wfg=wfg,
         peaks_yx=out["instances"]["gt_yx"],
         pos_logvar=out["pos_logvar"],
         rot_logvar_theta=out["rot_logvar_theta"]
     ) # (B,K,3,3), (B,K,3), (B,K)
-    pos_log_var = pos_logvar_from_depth_logvar_peaks(
-        logvar_z_bk1=z_log_var,    # (B,K,1)
-        peaks_yx=out["instances"]["gt_yx"], # (B,K,2)
-        K_left_14=K_left_14,                 # (B,3,3)
-    )  # (B,K,3)
     
     idx_yx, t_gt, R_gt = pick_representatives_mask_only(
         inst_mask=gt["pos_1_4"][:, -1:] > 0,
@@ -682,7 +647,7 @@ def loss_step_iter0(out, gt,
     ) # (B,K,3,3), (B,K,3), (B,K)
 
     # 3) Position
-    pos_scale = t_pred.new_tensor([1.0, 1.0, 10.0]).view(1, 1, 3)
+    pos_scale = t_pred.new_tensor([1.0, 1.0, 1.0]).view(1, 1, 3)
     log_scale = torch.log(pos_scale)
     L_pos = pos_loss_hetero(
         t_pred / pos_scale, 
@@ -693,7 +658,7 @@ def loss_step_iter0(out, gt,
     # position map
     gt_pos_mu_map = _pos_mu_gt_from_t_map(gt["pos_1_4"], gt["K_left_1x"], downsample=4)
     valid_mask = gt["pos_1_4"][:, -1:] > 0
-    pos_scale = out["pos_mu"].new_tensor([1.0, 1.0, 10.0]).view(1, 3, 1, 1)
+    pos_scale = out["pos_mu"].new_tensor([1.0, 1.0, 1.0]).view(1, 3, 1, 1)
     log_scale = torch.log(pos_scale)
     L_pos_map = pos_loss_hetero_map(
         out["pos_mu"] / pos_scale,

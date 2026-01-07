@@ -621,12 +621,13 @@ class SSCFlow2(nn.Module):
             # blur_sigma=blur_sigma,
             # blur_gamma=blur_gamma,
         )
-        c_in = 3 + 3 + 1
+        c_in = 1
         if use_so3_log_xyz:
             c_in += 3
         if use_so3_log_ratio_normal:
             c_in += 3
         if not raft_like_updater:
+            c_in += 3 + 1
             c_in += 6 + context_ch + hidden_ch
             self.delta_pose_updater = DeltaPoseRegressor(
                 c_in=c_in, base_ch=delta_base_ch, use_gate=use_gate
@@ -780,18 +781,27 @@ class SSCFlow2(nn.Module):
         depth_rend = render_out["depth_pred"]
         point_map_rend_cur = rot_utils.depth_to_pointmap_from_K(depth_rend, K_pair_14[:, 0])
         flow_pred_list = []
+        cur_pos_logvar_map = pos_logvar
+        cur_rot_logvar_theta_map = rot_logvar_theta
         for i in range(2):
             # --- ここから全iterで Δpose を推定して合成 ---
             mask_14 = mask_logits.detach()
             extra   = stuff["hidden0"].detach()
             depth_conf =  torch.exp(-0.5 * depth_log_var).detach()
-            ctx_in = [point_map_cur.detach(), current_pos_map.detach(), mask_14, depth_conf]
+            ctx_in = [
+                mask_14,
+                depth_conf,
+            ]
             if self.use_so3_log_xyz:
                 R_log = rot_utils.so3_log_map(current_rot_map.detach())            # (B,3,H,W)
                 ctx_in.append(R_log)
             else:
                 R_log = None
             
+            add_feats = [
+                cur_pos_logvar_map.detach(),
+                cur_rot_logvar_theta_map.detach(),
+            ]
             if self.use_so3_log_ratio_normal:
                 Zc = point_map_cur[:, 2:3].clamp_min(1e-6)
                 Zr = point_map_rend_cur[:, 2:3].clamp_min(1e-6)
@@ -803,14 +813,13 @@ class SSCFlow2(nn.Module):
                 yz_r = point_map_rend_cur[:, 1:2] / Zr
                 dn_x = xz_c - xz_r
                 dn_y = yz_c - yz_r
-                add_feats = [dz_ratio.detach(), dn_x.detach(), dn_y.detach()]   # 必要に応じて posenc も
-                ctx_in.extend(add_feats)
-            else:
-                add_feats = None
+                add_feats.extend([dz_ratio.detach(), dn_x.detach(), dn_y.detach()])
+                ctx_in.extend([dz_ratio.detach(), dn_x.detach(), dn_y.detach()])
             if self.raft_like_updater:
                 delta_pose_map, flow_pred, pos_logvar_map, rot_logvar_theta_map = self.delta_pose_updater(
                     point_map_cur.detach(), point_map_rend_cur.detach(), 
                     current_pos_map.detach(), R_log.detach(),
+                    cur_pos_logvar_map.detach(), cur_rot_logvar_theta_map.detach(),
                     torch.cat(ctx_in, dim=1),
                 )
                 flow_pred_list.append(flow_pred)   
@@ -837,6 +846,8 @@ class SSCFlow2(nn.Module):
             pos_maps.append(current_pos_map)
             pos_logvar_maps.append(pos_logvar_map)
             rot_logvar_theta_maps.append(rot_logvar_theta_map)
+            cur_pos_logvar_map = pos_logvar_map
+            cur_rot_logvar_theta_map = rot_logvar_theta_map
             
                         
             # ==== ここから各 iter で「レンダ側 point map」を“インスタンス単位”に更新 ====
