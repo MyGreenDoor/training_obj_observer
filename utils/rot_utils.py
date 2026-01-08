@@ -517,108 +517,21 @@ def _avg_optional_map(m: torch.Tensor, wn: torch.Tensor) -> torch.Tensor:
 
 
 
-def pose_from_maps_auto(
-    rot_map: torch.Tensor,      # (B,3,3,H,W)
-    pos_map: torch.Tensor,      # (B,3,H,W)
-    Wk_1_4: torch.Tensor,       # (B,K,1,H,W)
-    wfg: torch.Tensor,          # (B,1,H,W)
-    peaks_yx: torch.Tensor = None,  # (B,K,2) or None, yx
-    min_px: int = 10,
-    min_wsum: float = 1e-6,
-    tau_peak: float = 0.0,          # 例: 0.2（peak信頼ゲート）
-    pos_logvar: torch.Tensor = None,        # (B,Cp,H,W) 例: Cp=1 or 3
-    rot_logvar_theta: torch.Tensor = None,  # (B,Cr,H,W) 例: Cr=1
-):
-    """
-    Always pick R, t (and logvars if provided) at peak.
-
-    return:
-      R_hat: (B,K,3,3)
-      t_hat: (B,K,3)
-      valid: (B,K)  <- 面積/総和の有効判定 + ピーク信頼ゲート
-      pos_logvar_k: (B,K,Cp) or None
-      rot_logvar_k: (B,K,Cr) or None
-    """
-    B = rot_map.size(0)
-    H, W = pos_map.shape[-2:]
-    device, dtype = rot_map.device, rot_map.dtype
-
-    # K==0 なら即返し
-    if Wk_1_4.numel() == 0:
-        zR = rot_map.new_zeros(B, 0, 3, 3)
-        zt = pos_map.new_zeros(B, 0, 3)
-        zv = torch.zeros(B, 0, dtype=torch.bool, device=device)
-        return zR, zt, zv, None, None
-
-    B_, K = Wk_1_4.shape[:2]
-    assert B_ == B, "Batch size mismatch."
-
-    # --- 重み前処理 ---
-    Wk = Wk_1_4.clamp_min(0).to(torch.float32)    # (B,K,1,H,W)
-    wfg = wfg.clamp_min(0).to(torch.float32)      # (B,1,H,W)
-    w = Wk * wfg.unsqueeze(1)                     # (B,K,1,H,W)
-
-    # 面積・総和（valid 判定用のみ）
-    px = (w > 0).sum(dim=(2,3,4))                 # (B,K)
-    wsum = w.sum(dim=(2,3,4))                     # (B,K)
-
-    # --- peak 取得 ---
-    if (peaks_yx is None) or (peaks_yx.numel() == 0):
-        w2d = w.squeeze(2)                        # (B,K,H,W)
-        wflat = w2d.reshape(B, K, -1)             # (B,K,HW)
-        idx = wflat.argmax(dim=-1)                # (B,K)
-        y_pk = (idx // W).clamp_(0, H-1)
-        x_pk = (idx %  W).clamp_(0, W-1)
-    else:
-        y_pk = peaks_yx[..., 0].to(torch.long).clamp_(0, H-1)
-        x_pk = peaks_yx[..., 1].to(torch.long).clamp_(0, W-1)
-
-    # --- peak 上の前景信頼 ---
-    b_ix = torch.arange(B, device=device).view(B,1).expand(B,K)  # (B,K)
-    lin = (y_pk * W + x_pk).clamp_(0, H*W - 1)                   # (B,K)
-    wfg_flat = wfg[:, 0].reshape(B, H*W)                         # (B,HW)
-    wfg_at_peak = wfg_flat[b_ix, lin]                            # (B,K)
-
-    # --- peak で R, t を gather（常に peak 由来） ---
-    # rot_map: (B,3,3,H,W) -> (B,HW,3,3)
-    R_hw = rot_map.permute(0,3,4,1,2).reshape(B, H*W, 3, 3)
-    # pos_map: (B,3,H,W) -> (B,HW,3)
-    t_hw = pos_map.permute(0,2,3,1).reshape(B, H*W, 3)
-
-    R_hat = R_hw[b_ix, lin].to(dtype)            # (B,K,3,3)
-    t_hat = t_hw[b_ix, lin].to(dtype)            # (B,K,3)
-
-    # --- logvar も peak で gather ---
-    def _gather_peak_map(m: torch.Tensor):
-        # m: (B,C,H,W) -> (B,K,C)
-        C = m.size(1)
-        m_flat = m.permute(0,2,3,1).reshape(B, H*W, C)   # (B,HW,C)
-        return m_flat[b_ix, lin].to(dtype)               # (B,K,C)
-
-    pos_logvar_k = _gather_peak_map(pos_logvar) if (pos_logvar is not None) else None
-    rot_logvar_k = _gather_peak_map(rot_logvar_theta) if (rot_logvar_theta is not None) else None
-
-    # --- valid 判定（R/t は常に peak だが、品質フラグは返す） ---
-    valid_area = (px >= min_px) & (wsum >= min_wsum)     # (B,K)
-    valid_peak = (wfg_at_peak > tau_peak)                # (B,K)
-    valid = valid_area & valid_peak                      # (B,K)
-
-    return R_hat, t_hat, valid, pos_logvar_k, rot_logvar_k
-
-
 # def pose_from_maps_auto(
 #     rot_map: torch.Tensor,      # (B,3,3,H,W)
 #     pos_map: torch.Tensor,      # (B,3,H,W)
 #     Wk_1_4: torch.Tensor,       # (B,K,1,H,W)
 #     wfg: torch.Tensor,          # (B,1,H,W)
-#     peaks_yx: torch.Tensor = None,  # (B,K,2) or None
+#     peaks_yx: torch.Tensor = None,  # (B,K,2) or None, yx
 #     min_px: int = 10,
 #     min_wsum: float = 1e-6,
-#     tau_peak: float = 0.0,          # 例: 0.2 など（peak信頼の閾値）
-#     pos_logvar: torch.Tensor = None,        # (B,Cp,H,W) 例: Cp=1(Zのみ) or 3(XYZ)
-#     rot_logvar_theta: torch.Tensor = None,  # (B,Cr,H,W) 例: Cr=1（角度分散など）
+#     tau_peak: float = 0.0,          # 例: 0.2（peak信頼ゲート）
+#     pos_logvar: torch.Tensor = None,        # (B,Cp,H,W) 例: Cp=1 or 3
+#     rot_logvar_theta: torch.Tensor = None,  # (B,Cr,H,W) 例: Cr=1
 # ):
 #     """
+#     Always pick R, t (and logvars if provided) at peak.
+
 #     return:
 #       R_hat: (B,K,3,3)
 #       t_hat: (B,K,3)
@@ -626,97 +539,184 @@ def pose_from_maps_auto(
 #       pos_logvar_k: (B,K,Cp) or None
 #       rot_logvar_k: (B,K,Cr) or None
 #     """
-#     B, K = Wk_1_4.shape[:2]
-#     device, dtype = rot_map.device, rot_map.dtype
+#     B = rot_map.size(0)
 #     H, W = pos_map.shape[-2:]
+#     device, dtype = rot_map.device, rot_map.dtype
 
 #     # K==0 なら即返し
-#     if K == 0:
+#     if Wk_1_4.numel() == 0:
 #         zR = rot_map.new_zeros(B, 0, 3, 3)
 #         zt = pos_map.new_zeros(B, 0, 3)
 #         zv = torch.zeros(B, 0, dtype=torch.bool, device=device)
 #         return zR, zt, zv, None, None
 
-#     # --- 重みの前処理 ---
-#     Wk = Wk_1_4.clamp_min(0).to(torch.float32)           # (B,K,1,H,W)
-#     wfg = wfg.clamp_min(0).to(torch.float32)             # (B,1,H,W)
-#     w = (Wk * wfg.unsqueeze(1))                          # (B,K,1,H,W)
+#     B_, K = Wk_1_4.shape[:2]
+#     assert B_ == B, "Batch size mismatch."
 
-#     # 有効判定
-#     px = (w > 0).sum(dim=(2,3,4))                        # (B,K)
-#     wsum = w.sum(dim=(2,3,4))                            # (B,K)
-#     valid = (px >= min_px) & (wsum >= min_wsum)          # (B,K)
+#     # --- 重み前処理 ---
+#     Wk = Wk_1_4.clamp_min(0).to(torch.float32)    # (B,K,1,H,W)
+#     wfg = wfg.clamp_min(0).to(torch.float32)      # (B,1,H,W)
+#     w = Wk * wfg.unsqueeze(1)                     # (B,K,1,H,W)
 
-#     # 正規化（ゼロ割り防止）
-#     denom = wsum.view(B, K, 1, 1, 1).clamp_min(min_wsum)
-#     wn = (w / denom)                                     # (B,K,1,H,W)
+#     # 面積・総和（valid 判定用のみ）
+#     px = (w > 0).sum(dim=(2,3,4))                 # (B,K)
+#     wsum = w.sum(dim=(2,3,4))                     # (B,K)
 
-#     # --- t: 加重平均 ---
-#     t_hat = (pos_map.to(torch.float32).unsqueeze(1) * wn).sum(dim=(3,4))  # (B,K,3)
+#     # --- peak 取得 ---
+#     if (peaks_yx is None) or (peaks_yx.numel() == 0):
+#         w2d = w.squeeze(2)                        # (B,K,H,W)
+#         wflat = w2d.reshape(B, K, -1)             # (B,K,HW)
+#         idx = wflat.argmax(dim=-1)                # (B,K)
+#         y_pk = (idx // W).clamp_(0, H-1)
+#         x_pk = (idx %  W).clamp_(0, W-1)
+#     else:
+#         y_pk = peaks_yx[..., 0].to(torch.long).clamp_(0, H-1)
+#         x_pk = peaks_yx[..., 1].to(torch.long).clamp_(0, W-1)
 
-#     # --- R: Lie 平均（log -> 平均 -> exp） ---
-#     r_map = so3_log_map(rot_map.to(torch.float32))                # (B,3,H,W)
-#     r_hat = (r_map.unsqueeze(1) * wn).sum(dim=(3,4))              # (B,K,3)
-#     R_hat = so3_exp_vec(r_hat).to(dtype)                          # (B,K,3,3)
-#     t_hat = t_hat.to(dtype)
-#     pos_logvar_k = None
-#     rot_logvar_k = None
-#     if pos_logvar is not None:
-#         pos_logvar_k = _avg_optional_map(pos_logvar, wn)               # (B,K,Cp)
-#     if rot_logvar_theta is not None:
-#         rot_logvar_k = _avg_optional_map(rot_logvar_theta, wn)         # (B,K,Cr)
+#     # --- peak 上の前景信頼 ---
+#     b_ix = torch.arange(B, device=device).view(B,1).expand(B,K)  # (B,K)
+#     lin = (y_pk * W + x_pk).clamp_(0, H*W - 1)                   # (B,K)
+#     wfg_flat = wfg[:, 0].reshape(B, H*W)                         # (B,HW)
+#     wfg_at_peak = wfg_flat[b_ix, lin]                            # (B,K)
 
-#     # --- フォールバックが必要か？（ピーク抽出） ---
-#     use_pk = ~valid
-#     need_pk = bool(use_pk.any().item())
+#     # --- peak で R, t を gather（常に peak 由来） ---
+#     # rot_map: (B,3,3,H,W) -> (B,HW,3,3)
+#     R_hw = rot_map.permute(0,3,4,1,2).reshape(B, H*W, 3, 3)
+#     # pos_map: (B,3,H,W) -> (B,HW,3)
+#     t_hw = pos_map.permute(0,2,3,1).reshape(B, H*W, 3)
 
-#     if need_pk:
-#         # peaks が無ければ「最大重み画素」で代用
-#         if (peaks_yx is None) or (peaks_yx.numel() == 0):
-#             w2d = w.squeeze(2)                               # (B,K,H,W)
-#             wflat = w2d.reshape(B, K, -1)                    # (B,K,HW)
-#             idx = wflat.argmax(dim=-1)                       # (B,K)
-#             y_pk = (idx // W).clamp_(0, H-1)
-#             x_pk = (idx %  W).clamp_(0, W-1)
-#         else:
-#             y_pk = peaks_yx[..., 0].to(torch.long).clamp_(0, H-1)
-#             x_pk = peaks_yx[..., 1].to(torch.long).clamp_(0, W-1)
+#     R_hat = R_hw[b_ix, lin].to(dtype)            # (B,K,3,3)
+#     t_hat = t_hw[b_ix, lin].to(dtype)            # (B,K,3)
 
-#         # ピーク位置の前景信頼（wfg）による gate
-#         wfg_pk = wfg[:, 0]                                   # (B,H,W)
-#         b_ix = torch.arange(B, device=device).view(B,1).expand(B,K)
-#         lin = (y_pk * W + x_pk).clamp_(0, H*W - 1)
-#         wfg_flat = wfg_pk.reshape(B, H*W)
-#         wfg_at_peak = wfg_flat[b_ix, lin]                    # (B,K)
-#         valid = (valid | use_pk) & (wfg_at_peak > tau_peak)
+#     # --- logvar も peak で gather ---
+#     def _gather_peak_map(m: torch.Tensor):
+#         # m: (B,C,H,W) -> (B,K,C)
+#         C = m.size(1)
+#         m_flat = m.permute(0,2,3,1).reshape(B, H*W, C)   # (B,HW,C)
+#         return m_flat[b_ix, lin].to(dtype)               # (B,K,C)
 
-#         # ピークから R,t を抽出（全件計算→ where で混ぜる）
-#         R_hw = rot_map.permute(0,3,4,1,2).reshape(B, H*W, 3, 3)  # (B,HW,3,3)
-#         t_hw = pos_map.permute(0,2,3,1).reshape(B, H*W, 3)       # (B,HW,3)
-#         R_pk = R_hw[b_ix, lin]                                   # (B,K,3,3)
-#         t_pk = t_hw[b_ix, lin]                                   # (B,K,3)
+#     pos_logvar_k = _gather_peak_map(pos_logvar) if (pos_logvar is not None) else None
+#     rot_logvar_k = _gather_peak_map(rot_logvar_theta) if (rot_logvar_theta is not None) else None
 
-#         mR = use_pk.unsqueeze(-1).unsqueeze(-1)
-#         mT = use_pk.unsqueeze(-1)
-#         R_hat = torch.where(mR, R_pk.to(R_hat.dtype), R_hat)
-#         t_hat = torch.where(mT, t_pk.to(t_hat.dtype), t_hat)
-
-#         # ▼ 追加：logvar 系もピーク値でフォールバックして整合
-#         def _gather_peak_map(m: torch.Tensor):
-#             # m: (B,C,H,W) -> (B,K,C) at (y_pk,x_pk)
-#             if m is None:
-#                 return None
-#             C = m.size(1)
-#             m_flat = m.permute(0,2,3,1).reshape(B, H*W, C)       # (B,HW,C)
-#             m_pk = m_flat[b_ix, lin]                              # (B,K,C)
-#             return m_pk.to(dtype)
-#         if pos_logvar_k is not None:
-#             pos_logvar_pk = _gather_peak_map(pos_logvar)         # (B,K,Cp)
-#             m = use_pk.unsqueeze(-1)                              # (B,K,1)
-#             pos_logvar_k = torch.where(m, pos_logvar_pk, pos_logvar_k)
-#         if rot_logvar_k is not None:
-#             rot_logvar_pk = _gather_peak_map(rot_logvar_theta)   # (B,K,Cr)
-#             m = use_pk.unsqueeze(-1)
-#             rot_logvar_k = torch.where(m, rot_logvar_pk, rot_logvar_k)
+#     # --- valid 判定（R/t は常に peak だが、品質フラグは返す） ---
+#     valid_area = (px >= min_px) & (wsum >= min_wsum)     # (B,K)
+#     valid_peak = (wfg_at_peak > tau_peak)                # (B,K)
+#     valid = valid_area & valid_peak                      # (B,K)
 
 #     return R_hat, t_hat, valid, pos_logvar_k, rot_logvar_k
+
+
+def pose_from_maps_auto(
+    rot_map: torch.Tensor,      # (B,3,3,H,W)
+    pos_map: torch.Tensor,      # (B,3,H,W)
+    Wk_1_4: torch.Tensor,       # (B,K,1,H,W)
+    wfg: torch.Tensor,          # (B,1,H,W)
+    peaks_yx: torch.Tensor = None,  # (B,K,2) or None
+    min_px: int = 10,
+    min_wsum: float = 1e-6,
+    tau_peak: float = 0.0,          # 例: 0.2 など（peak信頼の閾値）
+    pos_logvar: torch.Tensor = None,        # (B,Cp,H,W) 例: Cp=1(Zのみ) or 3(XYZ)
+    rot_logvar_theta: torch.Tensor = None,  # (B,Cr,H,W) 例: Cr=1（角度分散など）
+):
+    """
+    return:
+      R_hat: (B,K,3,3)
+      t_hat: (B,K,3)
+      valid: (B,K)  <- 面積/総和の有効判定 + ピーク信頼ゲート
+      pos_logvar_k: (B,K,Cp) or None
+      rot_logvar_k: (B,K,Cr) or None
+    """
+    B, K = Wk_1_4.shape[:2]
+    device, dtype = rot_map.device, rot_map.dtype
+    H, W = pos_map.shape[-2:]
+
+    # K==0 なら即返し
+    if K == 0:
+        zR = rot_map.new_zeros(B, 0, 3, 3)
+        zt = pos_map.new_zeros(B, 0, 3)
+        zv = torch.zeros(B, 0, dtype=torch.bool, device=device)
+        return zR, zt, zv, None, None
+
+    # --- 重みの前処理 ---
+    Wk = Wk_1_4.clamp_min(0).to(torch.float32)           # (B,K,1,H,W)
+    wfg = wfg.clamp_min(0).to(torch.float32)             # (B,1,H,W)
+    w = (Wk * wfg.unsqueeze(1))                          # (B,K,1,H,W)
+
+    # 有効判定
+    px = (w > 0).sum(dim=(2,3,4))                        # (B,K)
+    wsum = w.sum(dim=(2,3,4))                            # (B,K)
+    valid = (px >= min_px) & (wsum >= min_wsum)          # (B,K)
+
+    # 正規化（ゼロ割り防止）
+    denom = wsum.view(B, K, 1, 1, 1).clamp_min(min_wsum)
+    wn = (w / denom)                                     # (B,K,1,H,W)
+
+    # --- t: 加重平均 ---
+    t_hat = (pos_map.to(torch.float32).unsqueeze(1) * wn).sum(dim=(3,4))  # (B,K,3)
+
+    # --- R: Lie 平均（log -> 平均 -> exp） ---
+    r_map = so3_log_map(rot_map.to(torch.float32))                # (B,3,H,W)
+    r_hat = (r_map.unsqueeze(1) * wn).sum(dim=(3,4))              # (B,K,3)
+    R_hat = so3_exp_vec(r_hat).to(dtype)                          # (B,K,3,3)
+    t_hat = t_hat.to(dtype)
+    pos_logvar_k = None
+    rot_logvar_k = None
+    if pos_logvar is not None:
+        pos_logvar_k = _avg_optional_map(pos_logvar, wn)               # (B,K,Cp)
+    if rot_logvar_theta is not None:
+        rot_logvar_k = _avg_optional_map(rot_logvar_theta, wn)         # (B,K,Cr)
+
+    # --- フォールバックが必要か？（ピーク抽出） ---
+    use_pk = ~valid
+    need_pk = bool(use_pk.any().item())
+
+    if need_pk:
+        # peaks が無ければ「最大重み画素」で代用
+        if (peaks_yx is None) or (peaks_yx.numel() == 0):
+            w2d = w.squeeze(2)                               # (B,K,H,W)
+            wflat = w2d.reshape(B, K, -1)                    # (B,K,HW)
+            idx = wflat.argmax(dim=-1)                       # (B,K)
+            y_pk = (idx // W).clamp_(0, H-1)
+            x_pk = (idx %  W).clamp_(0, W-1)
+        else:
+            y_pk = peaks_yx[..., 0].to(torch.long).clamp_(0, H-1)
+            x_pk = peaks_yx[..., 1].to(torch.long).clamp_(0, W-1)
+
+        # ピーク位置の前景信頼（wfg）による gate
+        wfg_pk = wfg[:, 0]                                   # (B,H,W)
+        b_ix = torch.arange(B, device=device).view(B,1).expand(B,K)
+        lin = (y_pk * W + x_pk).clamp_(0, H*W - 1)
+        wfg_flat = wfg_pk.reshape(B, H*W)
+        wfg_at_peak = wfg_flat[b_ix, lin]                    # (B,K)
+        valid = (valid | use_pk) & (wfg_at_peak > tau_peak)
+
+        # ピークから R,t を抽出（全件計算→ where で混ぜる）
+        R_hw = rot_map.permute(0,3,4,1,2).reshape(B, H*W, 3, 3)  # (B,HW,3,3)
+        t_hw = pos_map.permute(0,2,3,1).reshape(B, H*W, 3)       # (B,HW,3)
+        R_pk = R_hw[b_ix, lin]                                   # (B,K,3,3)
+        t_pk = t_hw[b_ix, lin]                                   # (B,K,3)
+
+        mR = use_pk.unsqueeze(-1).unsqueeze(-1)
+        mT = use_pk.unsqueeze(-1)
+        R_hat = torch.where(mR, R_pk.to(R_hat.dtype), R_hat)
+        t_hat = torch.where(mT, t_pk.to(t_hat.dtype), t_hat)
+
+        # ▼ 追加：logvar 系もピーク値でフォールバックして整合
+        def _gather_peak_map(m: torch.Tensor):
+            # m: (B,C,H,W) -> (B,K,C) at (y_pk,x_pk)
+            if m is None:
+                return None
+            C = m.size(1)
+            m_flat = m.permute(0,2,3,1).reshape(B, H*W, C)       # (B,HW,C)
+            m_pk = m_flat[b_ix, lin]                              # (B,K,C)
+            return m_pk.to(dtype)
+        if pos_logvar_k is not None:
+            pos_logvar_pk = _gather_peak_map(pos_logvar)         # (B,K,Cp)
+            m = use_pk.unsqueeze(-1)                              # (B,K,1)
+            pos_logvar_k = torch.where(m, pos_logvar_pk, pos_logvar_k)
+        if rot_logvar_k is not None:
+            rot_logvar_pk = _gather_peak_map(rot_logvar_theta)   # (B,K,Cr)
+            m = use_pk.unsqueeze(-1)
+            rot_logvar_k = torch.where(m, rot_logvar_pk, rot_logvar_k)
+
+    return R_hat, t_hat, valid, pos_logvar_k, rot_logvar_k

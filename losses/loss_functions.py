@@ -47,11 +47,11 @@ def pos_loss_hetero(mu_pos: torch.Tensor,   # (B,K, 3) [mm]
                        pos_gt: torch.Tensor,   # (B,K, 3) [mm]
                        valid: torch.Tensor     # (B,K) [mm]
                 ) -> torch.Tensor:
- 
-
     rho = charbonnier1(mu_pos - pos_gt)                 # (B,K,3)
     inv = torch.exp(-lv_pos).clamp_min(1e-8)       # (B,K,3)
     loss = inv * rho + lv_pos                  # (B,K,3)
+    if valid.dim() == 2:
+        valid = valid.unsqueeze(-1)                            # (.., .., 1)
     return (loss * valid).sum() / valid.sum().clamp_min(1.0)
 
 
@@ -63,7 +63,7 @@ def pos_loss_hetero_map(
     valid_map: torch.Tensor             # (B, 1, H, W)  (0/1 or float mask)
 ) -> torch.Tensor:
     """
-    Heteroscedastic position loss with lv as a single-channel map.
+    Heteroscedastic position loss with lv.
 
     if lv_pos_map is not None:
         loss = sum valid * ( exp(-lv) * rho + lv ) / max(1.0, sum(valid))
@@ -95,8 +95,8 @@ def pos_loss_hetero_map(
 
     weighted = loss * valid_f
 
-    # normalize by number of valid spatial locations (not multiplied by channels)
-    denom = valid_f.sum().clamp_min(1.0) * mu_pos_map.size(1)
+    # normalize by number of valid spatial locations
+    denom = valid_f.sum().clamp_min(1.0) 
 
     return weighted.sum() / denom
 
@@ -647,14 +647,12 @@ def loss_step_iter0(out, gt,
     ) # (B,K,3,3), (B,K,3), (B,K)
 
     # 3) Position
-    pos_scale = t_pred.new_tensor([1.0, 1.0, 1.0]).view(1, 1, 3)
-    log_scale = torch.log(pos_scale)
     L_pos = pos_loss_hetero(
-        t_pred / pos_scale, 
-        pos_log_var - 2.0 * log_scale, 
-        t_gt / pos_scale, 
+        t_pred, 
+        pos_log_var, 
+        t_gt, 
         valid
-        ) # 1mm, 1mm, 10mm
+        ) # 1mm, 1mm, 1mm
     # position map
     gt_pos_mu_map = _pos_mu_gt_from_t_map(gt["pos_1_4"], gt["K_left_1x"], downsample=4)
     valid_mask = gt["pos_1_4"][:, -1:] > 0
@@ -665,7 +663,7 @@ def loss_step_iter0(out, gt,
         out["pos_logvar"] - 2.0 * log_scale,
         gt_pos_mu_map / pos_scale,
         valid_mask,
-    ) # 1mm, 1mm, 10mm
+    ) # 1mm, 1mm, 1mm
 
     # 4) Rotation
     L_rot = rotation_loss_hetero(
