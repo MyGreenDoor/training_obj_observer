@@ -52,7 +52,7 @@ def pos_loss_hetero(mu_pos: torch.Tensor,   # (B,K, 3) [mm]
     loss = inv * rho + lv_pos                  # (B,K,3)
     if valid.dim() == 2:
         valid = valid.unsqueeze(-1)                            # (.., .., 1)
-    return (loss * valid).sum() / valid.sum().clamp_min(1.0)
+    return (loss * valid).sum() / (valid.sum().clamp_min(1.0)  * mu_pos.size(-1))
 
 
 @torch.jit.script
@@ -95,8 +95,8 @@ def pos_loss_hetero_map(
 
     weighted = loss * valid_f
 
-    # normalize by number of valid spatial locations
-    denom = valid_f.sum().clamp_min(1.0) 
+    # normalize by number of valid spatial locations (not multiplied by channels)
+    denom = valid_f.sum().clamp_min(1.0)  * mu_pos_map.size(1)
 
     return weighted.sum() / denom
 
