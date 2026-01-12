@@ -231,16 +231,11 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         self.neck_sem = self.make_neck(fuse_ch, sem_ch, norm_layer)
         self.neck_inst = self.make_neck(fuse_ch, inst_ch, norm_layer)
 
-        self.head_mask = nn.Conv2d(geo_ch, 1, 3, padding=1)
-        self.head_ctr = nn.Conv2d(geo_ch, 1, 3, padding=1)
         self.head_posz = nn.Conv2d(geo_ch, 6, 3, padding=1)
         self.head_rot = nn.Conv2d(geo_ch, rot_ch + 1, 3, padding=1)
         self.head_cls = nn.Conv2d(sem_ch, num_classes, 1)
         self.affemb_head = AffEmbHead(inst_ch, emb_dim, norm_layer)
         self.out_pos_scale = out_pos_scale
-
-        self._init_head(self.head_ctr)
-        self._init_head(self.head_mask)
 
     def make_neck(self, in_ch: int, mid_ch: int, norm_layer: Callable[[int], nn.Module]) -> nn.Module:
         """Create lightweight convolutional neck for head branches."""
@@ -277,8 +272,6 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         x_sem = self.neck_sem(x)
         x_inst = self.neck_inst(x)
 
-        mask_logits = self.head_mask(x_geo)
-        ctr_logits = self.head_ctr(x_geo)
         out_posz = self.head_posz(x_geo)
         out_rot = self.head_rot(x_geo)
         cls_logits = self.head_cls(x_sem)
@@ -300,8 +293,6 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         affemb_out = self.affemb_head(x_inst)
 
         return {
-            "mask_logits": mask_logits,
-            "center_logits": ctr_logits,
             "pos_mu": mu_pos,
             "pos_logvar": lv_pos,
             "rot_mat": rot_R,
