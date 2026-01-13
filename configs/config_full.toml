@@ -12,7 +12,7 @@ weight_decay = 1e-5
 amp = false
 grad_clip = 1.0
 log_interval = 200
-model_path = ""         # ".pth" へのパス（空なら何もしない）
+model_path = "/home/ytake/Documents/GitHub/training_obj_observer/outputs/run_debug/20260113_061304/checkpoint_008.pth"         # ".pth" へのパス（空なら何もしない）
 load_mode = "auto"      # "resume" | "weights" | "auto"
 strict = false          # state_dictのstrictロード
 

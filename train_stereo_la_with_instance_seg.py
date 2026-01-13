@@ -387,6 +387,7 @@ def _colorize_instance_ids(inst: np.ndarray, seed: int = 999) -> torch.Tensor:
     return torch.from_numpy(color).permute(2, 0, 1)
 
 
+
 def _infer_instance_from_heads(
     sem_logits: torch.Tensor,
     aff_logits: torch.Tensor,
@@ -397,138 +398,189 @@ def _infer_instance_from_heads(
     use_gt_semantic: bool,
     semantic_gt_1_4: Optional[torch.Tensor] = None,
 ) -> List[np.ndarray]:
-    """Infer instance IDs from semantic, affinity, and embeddings.
-
-    Steps:
-    1) Build a things mask from semantic prediction (or GT for debug).
-    2) Conservative union on affinity edges above tau_high.
-    3) Merge adjacent components using embedding distance.
-    4) Keep background as ID=0.
     """
+    Infer instance IDs from semantic, affinity, and embeddings.
+
+    Changes vs original:
+      - Much faster: no per-pixel double for-loop for union; we enumerate only True edges.
+      - Mutual check for affinity:
+          (y,x)-(y,x+1): aff[0,y,x] AND aff[1,y,x+1]
+          (y,x)-(y+1,x): aff[2,y,x] AND aff[3,y+1,x]
+      - Only uses right+down edges (no redundant left/up passes).
+      - Embedding-merge loop runs only if emb_merge_iters > 0 (0 means disabled).
+    """
+    # semantic prediction
     sem_pred = sem_logits.argmax(dim=1)
     if use_gt_semantic and semantic_gt_1_4 is not None:
         sem_pred = semantic_gt_1_4
 
-    aff_prob = torch.sigmoid(aff_logits).detach().cpu().numpy()
-    emb_np = emb.detach().cpu().permute(0, 2, 3, 1).numpy()
-    sem_np = sem_pred.detach().cpu().numpy()
+    # move once to CPU numpy (still per-batch processing for union-find)
+    sem_np = sem_pred.detach().cpu().numpy()                        # (B,H,W) int
+    aff_np = torch.sigmoid(aff_logits).detach().cpu().numpy()       # (B,4,H,W) float
+    emb_np = emb.detach().cpu().permute(0, 2, 3, 1).numpy()         # (B,H,W,D) float
 
-    out = []
+    out: List[np.ndarray] = []
+
     for b in range(sem_np.shape[0]):
-        sem_mask = sem_np[b] != 0
+        sem_b = sem_np[b]               # (H,W)
+        sem_mask = (sem_b != 0)         # "things" mask
         H, W = sem_mask.shape
         n_pix = H * W
+
         parent = np.arange(n_pix, dtype=np.int32)
 
-        def find(x):
+        def find(x: int) -> int:
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
                 x = parent[x]
             return x
 
-        def union(a, c):
+        def union(a: int, c: int) -> None:
             ra, rb = find(a), find(c)
             if ra != rb:
                 parent[rb] = ra
 
-        def idx(y, x):
+        def idx(y: int, x: int) -> int:
             return y * W + x
 
-        for y in range(H):
-            for x in range(W):
-                if not sem_mask[y, x]:
-                    continue
-                if x + 1 < W and sem_mask[y, x + 1]:
-                    if aff_prob[b, 0, y, x] > tau_high:
-                        union(idx(y, x), idx(y, x + 1))
-                if x - 1 >= 0 and sem_mask[y, x - 1]:
-                    if aff_prob[b, 1, y, x] > tau_high:
-                        union(idx(y, x), idx(y, x - 1))
-                if y + 1 < H and sem_mask[y + 1, x]:
-                    if aff_prob[b, 2, y, x] > tau_high:
-                        union(idx(y, x), idx(y + 1, x))
-                if y - 1 >= 0 and sem_mask[y - 1, x]:
-                    if aff_prob[b, 3, y, x] > tau_high:
-                        union(idx(y, x), idx(y - 1, x))
+        # --- build mutual-checked edges (right & down only) ---
+        # Right edges: between (y,x) and (y,x+1) for x in [0..W-2]
+        # condition: both sem_mask True AND aff0(y,x) > tau AND aff1(y,x+1) > tau
+        if W > 1:
+            right_ok = (
+                sem_mask[:, :-1] & sem_mask[:, 1:]
+                & (aff_np[b, 0, :, :-1] > tau_high)
+                & (aff_np[b, 1, :, 1:] > tau_high)
+            )
+            ry, rx = np.where(right_ok)
+        else:
+            ry, rx = np.empty((0,), np.int64), np.empty((0,), np.int64)
 
+        # Down edges: between (y,x) and (y+1,x) for y in [0..H-2]
+        # condition: both sem_mask True AND aff2(y,x) > tau AND aff3(y+1,x) > tau
+        if H > 1:
+            down_ok = (
+                sem_mask[:-1, :] & sem_mask[1:, :]
+                & (aff_np[b, 2, :-1, :] > tau_high)
+                & (aff_np[b, 3, 1:, :] > tau_high)
+            )
+            dy, dx = np.where(down_ok)
+        else:
+            dy, dx = np.empty((0,), np.int64), np.empty((0,), np.int64)
+
+        # union only the selected edges
+        # (loop count = number of true edges, typically far smaller than H*W)
+        for y, x in zip(ry.tolist(), rx.tolist()):
+            union(idx(y, x), idx(y, x + 1))
+        for y, x in zip(dy.tolist(), dx.tolist()):
+            union(idx(y, x), idx(y + 1, x))
+
+        # --- assign compact instance IDs from union-find roots ---
         inst = np.zeros((H, W), dtype=np.int32)
         root_to_id = {}
         next_id = 1
-        for y in range(H):
-            for x in range(W):
-                if not sem_mask[y, x]:
-                    continue
-                r = find(idx(y, x))
-                if r not in root_to_id:
-                    root_to_id[r] = next_id
-                    next_id += 1
-                inst[y, x] = root_to_id[r]
 
-        for _ in range(max(1, emb_merge_iters)):
-            num_comp = int(inst.max())
-            if num_comp <= 1:
-                break
-            mu = np.zeros((num_comp + 1, emb_np.shape[-1]), dtype=np.float32)
-            cnt = np.zeros((num_comp + 1, 1), dtype=np.float32)
-            ys, xs = np.nonzero(inst > 0)
-            for y, x in zip(ys, xs):
-                k = inst[y, x]
-                mu[k] += emb_np[b, y, x]
-                cnt[k] += 1.0
-            mu = mu / np.clip(cnt, 1.0, None)
+        ys, xs = np.where(sem_mask)
+        for y, x in zip(ys.tolist(), xs.tolist()):
+            r = find(idx(y, x))
+            if r not in root_to_id:
+                root_to_id[r] = next_id
+                next_id += 1
+            inst[y, x] = root_to_id[r]
 
-            adj = set()
-            for y in range(H):
-                for x in range(W - 1):
-                    a, c = inst[y, x], inst[y, x + 1]
-                    if a > 0 and c > 0 and a != c:
-                        adj.add((min(a, c), max(a, c)))
-            for y in range(H - 1):
-                for x in range(W):
-                    a, c = inst[y, x], inst[y + 1, x]
-                    if a > 0 and c > 0 and a != c:
-                        adj.add((min(a, c), max(a, c)))
+        # --- optional embedding-based merge (only if enabled) ---
+        if emb_merge_iters > 0:
+            D = emb_np.shape[-1]
+            for _ in range(emb_merge_iters):
+                num_comp = int(inst.max())
+                if num_comp <= 1:
+                    break
 
-            comp_parent = np.arange(num_comp + 1, dtype=np.int32)
+                # component means mu[k] via bincount / add.at (fast)
+                mu = np.zeros((num_comp + 1, D), dtype=np.float32)
+                cnt = np.bincount(inst.ravel(), minlength=num_comp + 1).astype(np.float32).reshape(-1, 1)
 
-            def cfind(x):
-                while comp_parent[x] != x:
-                    comp_parent[x] = comp_parent[comp_parent[x]]
-                    x = comp_parent[x]
-                return x
+                # sum embeddings per component
+                flat_inst = inst.ravel()
+                flat_emb = emb_np[b].reshape(-1, D)
+                # ignore background id=0 in summation (still fine if included; we'll keep it, it won't be used)
+                np.add.at(mu, flat_inst, flat_emb)
+                mu = mu / np.clip(cnt, 1.0, None)
 
-            def cunion(a, c):
-                ra, rb = cfind(a), cfind(c)
-                if ra != rb:
-                    comp_parent[rb] = ra
+                # adjacency pairs from current inst (vectorized)
+                pairs = []
 
-            for a, c in adj:
-                dist = np.linalg.norm(mu[a] - mu[c])
-                if dist < tau_emb_merge:
-                    cunion(a, c)
+                if W > 1:
+                    a = inst[:, :-1]
+                    c = inst[:, 1:]
+                    m = (a > 0) & (c > 0) & (a != c)
+                    if np.any(m):
+                        aa = a[m].astype(np.int32)
+                        cc = c[m].astype(np.int32)
+                        lo = np.minimum(aa, cc)
+                        hi = np.maximum(aa, cc)
+                        pairs.append(np.stack([lo, hi], axis=1))
 
-            new_inst = np.zeros_like(inst)
-            root_to_id = {}
-            next_id = 1
-            changed = False
-            for y in range(H):
-                for x in range(W):
-                    if inst[y, x] == 0:
-                        continue
-                    r = cfind(inst[y, x])
+                if H > 1:
+                    a = inst[:-1, :]
+                    c = inst[1:, :]
+                    m = (a > 0) & (c > 0) & (a != c)
+                    if np.any(m):
+                        aa = a[m].astype(np.int32)
+                        cc = c[m].astype(np.int32)
+                        lo = np.minimum(aa, cc)
+                        hi = np.maximum(aa, cc)
+                        pairs.append(np.stack([lo, hi], axis=1))
+
+                if not pairs:
+                    break
+
+                adj = np.unique(np.concatenate(pairs, axis=0), axis=0)  # (E,2)
+
+                comp_parent = np.arange(num_comp + 1, dtype=np.int32)
+
+                def cfind(x: int) -> int:
+                    while comp_parent[x] != x:
+                        comp_parent[x] = comp_parent[comp_parent[x]]
+                        x = comp_parent[x]
+                    return x
+
+                def cunion(a: int, c: int) -> None:
+                    ra, rb = cfind(a), cfind(c)
+                    if ra != rb:
+                        comp_parent[rb] = ra
+
+                # merge adjacent components if embedding distance is small
+                for a, c in adj.tolist():
+                    if np.linalg.norm(mu[a] - mu[c]) < tau_emb_merge:
+                        cunion(a, c)
+
+                # relabel components to compact ids
+                new_inst = np.zeros_like(inst)
+                root_to_id = {}
+                next_id = 1
+                changed = False
+
+                ys, xs = np.where(inst > 0)
+                for y, x in zip(ys.tolist(), xs.tolist()):
+                    r = cfind(int(inst[y, x]))
                     if r not in root_to_id:
                         root_to_id[r] = next_id
                         next_id += 1
-                    new_inst[y, x] = root_to_id[r]
-                    if new_inst[y, x] != inst[y, x]:
+                    nid = root_to_id[r]
+                    new_inst[y, x] = nid
+                    if nid != inst[y, x]:
                         changed = True
-            inst = new_inst
-            if not changed:
-                break
 
-        inst[sem_mask == 0] = 0
+                inst = new_inst
+                if not changed:
+                    break
+
+        inst[~sem_mask] = 0
         out.append(inst)
+
     return out
+
 
 
 def _log_segmentation_visuals(
@@ -559,9 +611,9 @@ def _log_segmentation_visuals(
         sem_logits,
         aff_logits,
         emb,
-        tau_high=float(cfg.get("instance", {}).get("tau_aff", 0.85)),
+        tau_high=float(cfg.get("instance", {}).get("tau_aff", 0.95)),
         tau_emb_merge=float(cfg.get("instance", {}).get("tau_emb_merge", 0.6)),
-        emb_merge_iters=int(cfg.get("instance", {}).get("emb_merge_iters", 2)),
+        emb_merge_iters=int(cfg.get("instance", {}).get("emb_merge_iters", 1)),
         use_gt_semantic=bool(cfg.get("instance", {}).get("use_gt_semantic", False)),
         semantic_gt_1_4=sem_gt_1_4,
     )
