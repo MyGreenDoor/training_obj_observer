@@ -19,7 +19,7 @@ strict = false          # state_dictのstrictロード
 [data]
 height = 256
 width = 256
-num_workers = 8
+num_workers = 6
 max_disp = 128
 
 [lr_scheduler]

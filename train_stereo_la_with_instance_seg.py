@@ -320,45 +320,192 @@ def _affinity_loss(
     return loss, aff_valid.sum()
 
 
-def _embedding_loss_local_pairs(
-    emb: torch.Tensor,
-    inst_1_4: torch.Tensor,
-    margin: float,
-    neg_weight: float,
+@torch.no_grad()
+def _sample_indices_per_instance(
+    inst_flat: torch.Tensor,           # (N,) int64, bg=0
+    max_per_inst: int = 64,
+    min_pixels_per_inst: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build sampled foreground indices per instance.
+
+    Returns:
+      fg_idx: (N_fg,) indices into flattened image where inst>0
+      inv:    (N_fg,) instance-id mapped to [0..K-1] for each fg pixel
+      sel:    (M,)   indices into fg_idx (and inv/emb_fg) selected by sampling
+    """
+    fg_idx = torch.nonzero(inst_flat > 0, as_tuple=False).squeeze(1)
+    inst_fg = inst_flat[fg_idx]  # (N_fg,)
+
+    uniq_ids, inv = torch.unique(inst_fg, sorted=True, return_inverse=True)  # inv in [0..K-1]
+    K = int(uniq_ids.numel())
+
+    if K == 0:
+        return fg_idx, inv, fg_idx.new_empty((0,), dtype=torch.long)
+
+    # count per instance in fg
+    cnt = torch.bincount(inv, minlength=K)
+
+    # sample up to max_per_inst per instance
+    sel_chunks = []
+    for k in range(K):
+        if cnt[k].item() < min_pixels_per_inst:
+            continue
+        idx_k = torch.nonzero(inv == k, as_tuple=False).squeeze(1)  # indices into fg arrays
+        if idx_k.numel() > max_per_inst:
+            perm = torch.randperm(idx_k.numel(), device=inst_flat.device)[:max_per_inst]
+            idx_k = idx_k[perm]
+        sel_chunks.append(idx_k)
+
+    if not sel_chunks:
+        return fg_idx, inv, fg_idx.new_empty((0,), dtype=torch.long)
+
+    sel = torch.cat(sel_chunks, dim=0)
+    return fg_idx, inv, sel
+
+
+def embedding_cosface_sampled(
+    emb: torch.Tensor,                 # (B,C,H,W)
+    inst_1_4: torch.Tensor,            # (B,H,W) int, bg=0
+    max_per_inst: int = 64,
+    margin: float = 0.25,              # CosFace m
+    scale: float = 32.0,               # CosFace s
+    min_pixels_per_inst: int = 4,
+    detach_proto: bool = True,
+    topk_neg: Optional[int] = None,    # optional: restrict negatives to top-k most similar
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Contrastive loss using local neighbor pairs inside foreground."""
-    B, _, _, _ = emb.shape
-    total_loss = emb.new_tensor(0.0)
-    total_pairs = emb.new_tensor(0.0)
+    """
+    Dynamic-proxy CosFace for instance embeddings with random sampling.
+    - Samples up to `max_per_inst` pixels per instance (foreground only).
+    - Prototypes are computed from ALL fg pixels (more stable).
+    - If topk_neg is set (e.g., 16), softmax is computed over {positive + top-k negatives}.
+
+    Returns: (loss, num_samples)
+    """
+    assert emb.dim() == 4 and inst_1_4.dim() == 3
+    B, C, H, W = emb.shape
+    assert inst_1_4.shape[0] == B and inst_1_4.shape[1] == H and inst_1_4.shape[2] == W
+
+    emb_n = F.normalize(emb, dim=1, eps=1e-6)
+    loss_sum = emb.new_tensor(0.0)
+    n_sum = emb.new_tensor(0.0)
 
     for b in range(B):
         inst = inst_1_4[b]
-        emb_b = emb[b]
+        inst_flat = inst.reshape(-1).long()
 
-        mask_r = (inst[:, :-1] > 0) & (inst[:, 1:] > 0)
-        if mask_r.any():
-            diff = emb_b[:, :, :-1] - emb_b[:, :, 1:]
-            dist = torch.norm(diff, dim=0)
-            same = inst[:, :-1] == inst[:, 1:]
-            pos = dist.pow(2)
-            neg = F.relu(margin - dist).pow(2)
-            loss_r = torch.where(same, pos, neg * neg_weight)
-            total_loss = total_loss + (loss_r * mask_r).sum()
-            total_pairs = total_pairs + mask_r.sum()
+        # fg indices & per-instance mapping (inv)
+        fg_idx = torch.nonzero(inst_flat > 0, as_tuple=False).squeeze(1)
+        if fg_idx.numel() == 0:
+            continue
 
-        mask_d = (inst[:-1, :] > 0) & (inst[1:, :] > 0)
-        if mask_d.any():
-            diff = emb_b[:, :-1, :] - emb_b[:, 1:, :]
-            dist = torch.norm(diff, dim=0)
-            same = inst[:-1, :] == inst[1:, :]
-            pos = dist.pow(2)
-            neg = F.relu(margin - dist).pow(2)
-            loss_d = torch.where(same, pos, neg * neg_weight)
-            total_loss = total_loss + (loss_d * mask_d).sum()
-            total_pairs = total_pairs + mask_d.sum()
+        # flattened normalized embeddings for fg pixels
+        emb_flat = emb_n[b].permute(1, 2, 0).reshape(-1, C)      # (HW,C)
+        emb_fg_all = emb_flat[fg_idx]                            # (N_fg,C)
+        inst_fg = inst_flat[fg_idx]                              # (N_fg,)
 
-    loss = total_loss / total_pairs.clamp_min(1.0)
-    return loss, total_pairs
+        uniq_ids, inv = torch.unique(inst_fg, sorted=True, return_inverse=True)
+        K = int(uniq_ids.numel())
+        if K <= 1:
+            continue
+
+        # filter tiny instances (for this loss)
+        cnt = torch.bincount(inv, minlength=K)
+        keep = cnt >= min_pixels_per_inst
+        if keep.sum().item() <= 1:
+            continue
+
+        # remap to compact [0..K2-1]
+        keep_ids = torch.nonzero(keep, as_tuple=False).squeeze(1)
+        remap = torch.full((K,), -1, device=emb.device, dtype=torch.long)
+        remap[keep_ids] = torch.arange(keep_ids.numel(), device=emb.device)
+        y_all = remap[inv]
+        valid = y_all >= 0
+
+        emb_fg_all = emb_fg_all[valid]
+        y_all = y_all[valid]
+        K2 = int(keep_ids.numel())
+        if K2 <= 1:
+            continue
+
+        # sample up to max_per_inst per instance
+        sel_chunks = []
+        for k in range(K2):
+            idx_k = torch.nonzero(y_all == k, as_tuple=False).squeeze(1)
+            if idx_k.numel() == 0:
+                continue
+            if idx_k.numel() > max_per_inst:
+                perm = torch.randperm(idx_k.numel(), device=emb.device)[:max_per_inst]
+                idx_k = idx_k[perm]
+            sel_chunks.append(idx_k)
+        if not sel_chunks:
+            continue
+        sel = torch.cat(sel_chunks, dim=0)
+
+        emb_s = emb_fg_all[sel]   # (M,C)
+        y_s = y_all[sel]          # (M,)
+        M = int(emb_s.shape[0])
+        if M == 0:
+            continue
+
+        # prototypes from ALL pixels (stable)
+        mu = torch.zeros((K2, C), device=emb.device, dtype=emb.dtype)
+        cnt2 = torch.zeros((K2, 1), device=emb.device, dtype=emb.dtype)
+        mu.index_add_(0, y_all, emb_fg_all)
+        cnt2.index_add_(0, y_all, torch.ones((emb_fg_all.shape[0], 1), device=emb.device, dtype=emb.dtype))
+        mu = mu / cnt2.clamp_min(1.0)
+        mu = F.normalize(mu, dim=1, eps=1e-6)
+        if detach_proto:
+            mu = mu.detach()
+
+        # cosine logits (M,K2)
+        logits = scale * (emb_s @ mu.t())
+
+        # restrict negatives to top-k (optional)
+        if topk_neg is not None and 0 < topk_neg < K2:
+            # keep: positive + topk most similar (excluding positive)
+            with torch.no_grad():
+                # topk over all classes, then ensure positive included
+                vals, idxs = torch.topk(logits, k=topk_neg + 1, dim=1, largest=True, sorted=False)  # (M,topk+1)
+                # add positive index explicitly then unique per row
+                pos = y_s.view(-1, 1)
+                idxs = torch.cat([idxs, pos], dim=1)  # (M, topk+2)
+                # unique per-row (small k so brute force ok)
+                new_logits = []
+                new_targets = []
+                for i in range(M):
+                    row = idxs[i]
+                    row = row.unique()
+                    # build reduced logits
+                    l = logits[i, row]
+                    # target is position of positive class within row
+                    t = (row == y_s[i]).nonzero(as_tuple=False).squeeze(1)
+                    # should exist
+                    new_logits.append(l)
+                    new_targets.append(t)
+                # pad to max length in batch
+                maxL = max(l.numel() for l in new_logits)
+                logits_red = logits.new_full((M, maxL), -1e4)  # very negative for padding
+                target_red = torch.zeros((M,), device=emb.device, dtype=torch.long)
+                for i in range(M):
+                    l = new_logits[i]
+                    logits_red[i, : l.numel()] = l
+                    target_red[i] = new_targets[i].item()
+            logits_use = logits_red
+            y_use = target_red
+        else:
+            logits_use = logits
+            y_use = y_s
+
+        # CosFace margin: subtract from correct logit
+        logits_use[torch.arange(M, device=emb.device), y_use] -= scale * margin
+
+        loss = F.cross_entropy(logits_use, y_use, reduction="mean")
+        loss_sum = loss_sum + loss * M
+        n_sum = n_sum + M
+
+    loss_out = loss_sum / n_sum.clamp_min(1.0)
+    return loss_out, n_sum
 
 
 def _colorize_semantic(seg: torch.Tensor, num_classes: int, seed: int = 123) -> torch.Tensor:
@@ -835,13 +982,16 @@ def train_one_epoch(
                 aff_valid,
                 neg_weight=float(cfg.get("loss", {}).get("aff_neg_weight", 8.0)),
             )
-            loss_emb, emb_pairs = _embedding_loss_local_pairs(
+            loss_emb, emb_pairs = embedding_cosface_sampled(
                 pred["emb"],
-                inst_gt_1_4,
-                margin=float(cfg.get("loss", {}).get("emb_margin", 2.0)),
-                neg_weight=float(cfg.get("loss", {}).get("emb_neg_weight", 2.0)),
+                inst_gt_1_4,    
+                max_per_inst=int(cfg.get("loss", {}).get("emb_max_per_inst", 64)),
+                margin=float(cfg.get("loss", {}).get("emb_margin", 0.25)),
+                scale=32.0,
+                min_pixels_per_inst=4,
+                detach_proto=True,
+                topk_neg=None,           # 重いなら 16 とかに
             )
-
             logs = {
                 "L_sem": loss_sem.detach(),
                 "L_cls": loss_cls.detach(),
@@ -991,11 +1141,15 @@ def validate(
             aff_valid,
             neg_weight=float(cfg.get("loss", {}).get("aff_neg_weight", 4.0)),
         )
-        loss_emb, _ = _embedding_loss_local_pairs(
+        loss_emb, emb_pairs = embedding_cosface_sampled(
             pred["emb"],
-            inst_gt_1_4,
-            margin=float(cfg.get("loss", {}).get("emb_margin", 1.0)),
-            neg_weight=float(cfg.get("loss", {}).get("emb_neg_weight", 2.0)),
+            inst_gt_1_4,    
+            max_per_inst=int(cfg.get("loss", {}).get("emb_max_per_inst", 64)),
+            margin=float(cfg.get("loss", {}).get("emb_margin", 0.25)),
+            scale=32.0,
+            min_pixels_per_inst=4,
+            detach_proto=True,
+            topk_neg=None,           # 重いなら 16 とかに
         )
 
         meters.update_avg("L", float(loss_disp.item()), n=stereo.size(0))
