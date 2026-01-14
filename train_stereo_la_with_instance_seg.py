@@ -10,7 +10,7 @@ import platform
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import numpy as np
 import tomlkit
@@ -540,40 +540,55 @@ def _infer_instance_from_heads(
     aff_logits: torch.Tensor,
     emb: torch.Tensor,
     tau_high: float,
-    tau_emb_merge: float,
-    emb_merge_iters: int,
-    use_gt_semantic: bool,
+    # embedding merge
+    tau_emb_merge: float = 0.85,  # NOTE: emb_merge_metric="cos" のときは cosine類似度しきい値（大きいほど厳しい）
+    emb_merge_iters: int = 1,
+    emb_merge_metric: Literal["cos", "l2"] = "cos",
+    emb_merge_small_area: Optional[int] = None,  # 例: 4 or 9; Noneならサイズ制限なし
+    # semantic
+    use_gt_semantic: bool = False,
     semantic_gt_1_4: Optional[torch.Tensor] = None,
-    # NEW:
     union_same_semantic_only: bool = True,
+    eps: float = 1e-6,
 ) -> List[np.ndarray]:
     """
     Infer instance IDs from semantic, affinity, and embeddings.
 
     Steps:
-      1) Build a things mask from semantic prediction (or GT for debug).
-      2) Conservative union on affinity edges above tau_high (mutual check).
-      3) (Optional) Merge adjacent components using embedding distance.
-      4) Keep background as ID=0.
+      1) things mask from semantic prediction (or GT for debug)
+      2) Conservative union-find with mutual-check affinity (right/down edges only)
+      3) Optional component merge using embedding prototypes (CosFace-aligned: cosine)
+      4) background is ID=0
 
-    Options:
-      union_same_semantic_only:
-        If True, union edges only when the two pixels share the same semantic class (>0).
-        This prevents cross-class instance merging.
+    Args:
+      tau_high:
+        affinity sigmoid prob threshold for mutual-check union
+      tau_emb_merge:
+        - emb_merge_metric="cos": merge if cos_sim(mu_a, mu_c) >= tau_emb_merge
+        - emb_merge_metric="l2" : merge if ||mu_a - mu_c|| <= tau_emb_merge
+      emb_merge_small_area:
+        if set, only allow merges when (area[a] <= th) or (area[c] <= th).
+        Useful to remove tiny 1px islands without causing big merges.
     """
+    # semantic prediction
     sem_pred = sem_logits.argmax(dim=1)
     if use_gt_semantic and semantic_gt_1_4 is not None:
         sem_pred = semantic_gt_1_4
 
-    sem_np = sem_pred.detach().cpu().numpy()                        # (B,H,W) int
-    aff_np = torch.sigmoid(aff_logits).detach().cpu().numpy()       # (B,4,H,W) float
-    emb_np = emb.detach().cpu().permute(0, 2, 3, 1).numpy()         # (B,H,W,D) float
+    # CPU numpy once
+    sem_np = sem_pred.detach().cpu().numpy()                       # (B,H,W) int
+    aff_np = torch.sigmoid(aff_logits).detach().cpu().numpy()      # (B,4,H,W) float
+
+    # CosFace前提: inferenceでも normalize して cosine を扱いやすくする
+    emb_t = emb.detach()
+    emb_t = emb_t / (torch.linalg.norm(emb_t, dim=1, keepdim=True) + eps)
+    emb_np = emb_t.cpu().permute(0, 2, 3, 1).numpy()               # (B,H,W,D) float (unit)
 
     out: List[np.ndarray] = []
 
     for b in range(sem_np.shape[0]):
         sem_b = sem_np[b]                   # (H,W)
-        sem_mask = (sem_b != 0)             # things
+        sem_mask = (sem_b != 0)             # things mask
         H, W = sem_mask.shape
         n_pix = H * W
 
@@ -593,31 +608,27 @@ def _infer_instance_from_heads(
         def idx(y: int, x: int) -> int:
             return y * W + x
 
-        # --- build mutual-checked edges (right & down only) ---
-        # Right: (y,x)-(y,x+1)
+        # --- mutual-check edges (right & down only) ---
         if W > 1:
             right_ok = (
                 sem_mask[:, :-1] & sem_mask[:, 1:]
-                & (aff_np[b, 0, :, :-1] > tau_high)
-                & (aff_np[b, 1, :, 1:] > tau_high)
+                & (aff_np[b, 0, :, :-1] > tau_high)     # →
+                & (aff_np[b, 1, :, 1:] > tau_high)      # ← (at neighbor)
             )
             if union_same_semantic_only:
                 right_ok &= (sem_b[:, :-1] == sem_b[:, 1:])
-
             ry, rx = np.where(right_ok)
         else:
             ry, rx = np.empty((0,), np.int64), np.empty((0,), np.int64)
 
-        # Down: (y,x)-(y+1,x)
         if H > 1:
             down_ok = (
                 sem_mask[:-1, :] & sem_mask[1:, :]
-                & (aff_np[b, 2, :-1, :] > tau_high)
-                & (aff_np[b, 3, 1:, :] > tau_high)
+                & (aff_np[b, 2, :-1, :] > tau_high)     # ↓
+                & (aff_np[b, 3, 1:, :] > tau_high)      # ↑ (at neighbor)
             )
             if union_same_semantic_only:
                 down_ok &= (sem_b[:-1, :] == sem_b[1:, :])
-
             dy, dx = np.where(down_ok)
         else:
             dy, dx = np.empty((0,), np.int64), np.empty((0,), np.int64)
@@ -628,11 +639,10 @@ def _infer_instance_from_heads(
         for y, x in zip(dy.tolist(), dx.tolist()):
             union(idx(y, x), idx(y + 1, x))
 
-        # --- assign compact instance IDs ---
+        # --- label components (pixel UF -> compact IDs) ---
         inst = np.zeros((H, W), dtype=np.int32)
         root_to_id = {}
         next_id = 1
-
         ys, xs = np.where(sem_mask)
         for y, x in zip(ys.tolist(), xs.tolist()):
             r = find(idx(y, x))
@@ -641,24 +651,30 @@ def _infer_instance_from_heads(
                 next_id += 1
             inst[y, x] = root_to_id[r]
 
-        # --- optional embedding-based merge ---
+        # --- optional embedding-based merge (CosFace-aligned) ---
         if emb_merge_iters > 0:
             D = emb_np.shape[-1]
+            flat_emb = emb_np[b].reshape(-1, D)
+
             for _ in range(emb_merge_iters):
                 num_comp = int(inst.max())
                 if num_comp <= 1:
                     break
 
-                # component means
-                mu = np.zeros((num_comp + 1, D), dtype=np.float32)
-                cnt = np.bincount(inst.ravel(), minlength=num_comp + 1).astype(np.float32).reshape(-1, 1)
-
+                # component counts
                 flat_inst = inst.ravel()
-                flat_emb = emb_np[b].reshape(-1, D)
+                cnt = np.bincount(flat_inst, minlength=num_comp + 1).astype(np.float32).reshape(-1, 1)
+
+                # component prototype sums (emb is already unit per pixel)
+                mu = np.zeros((num_comp + 1, D), dtype=np.float32)
                 np.add.at(mu, flat_inst, flat_emb)
                 mu = mu / np.clip(cnt, 1.0, None)
 
-                # adjacency pairs
+                # normalize prototypes (CosFace-like)
+                mu_norm = np.linalg.norm(mu, axis=1, keepdims=True) + 1e-12
+                mu = mu / mu_norm
+
+                # adjacency pairs (right/down)
                 pairs = []
 
                 if W > 1:
@@ -688,6 +704,7 @@ def _infer_instance_from_heads(
 
                 adj = np.unique(np.concatenate(pairs, axis=0), axis=0)  # (E,2)
 
+                # component-level union-find
                 comp_parent = np.arange(num_comp + 1, dtype=np.int32)
 
                 def cfind(x: int) -> int:
@@ -696,35 +713,40 @@ def _infer_instance_from_heads(
                         x = comp_parent[x]
                     return x
 
-                def cunion(a: int, c: int) -> None:
-                    ra, rb = cfind(a), cfind(c)
+                def cunion(a_: int, c_: int) -> None:
+                    ra, rb = cfind(a_), cfind(c_)
                     if ra != rb:
                         comp_parent[rb] = ra
 
-                for a, c in adj.tolist():
-                    # (optional safety) do not merge across semantic classes
-                    # already guaranteed by adj construction above if union_same_semantic_only is True
-                    dist = np.linalg.norm(mu[a] - mu[c])
-                    if dist < tau_emb_merge:
-                        cunion(a, c)
+                # merge decision
+                for a_, c_ in adj.tolist():
+                    if emb_merge_small_area is not None:
+                        if (cnt[a_, 0] > emb_merge_small_area) and (cnt[c_, 0] > emb_merge_small_area):
+                            continue  # only merge if at least one is small
 
-                # relabel
-                new_inst = np.zeros_like(inst)
-                root_to_id = {}
-                next_id = 1
-                changed = False
+                    if emb_merge_metric == "cos":
+                        # cos similarity since mu is normalized
+                        sim = float(np.dot(mu[a_], mu[c_]))
+                        if sim >= tau_emb_merge:
+                            cunion(a_, c_)
+                    elif emb_merge_metric == "l2":
+                        dist = float(np.linalg.norm(mu[a_] - mu[c_]))
+                        if dist <= tau_emb_merge:
+                            cunion(a_, c_)
+                    else:
+                        raise ValueError(f"Unknown emb_merge_metric={emb_merge_metric}")
 
-                ys, xs = np.where(inst > 0)
-                for y, x in zip(ys.tolist(), xs.tolist()):
-                    r = cfind(int(inst[y, x]))
-                    if r not in root_to_id:
-                        root_to_id[r] = next_id
-                        next_id += 1
-                    nid = root_to_id[r]
-                    new_inst[y, x] = nid
-                    if nid != inst[y, x]:
-                        changed = True
+                # vectorized relabel using component roots
+                roots = np.arange(num_comp + 1, dtype=np.int32)
+                for k in range(1, num_comp + 1):
+                    roots[k] = cfind(k)
 
+                uniq_roots = np.unique(roots[1:])  # exclude 0
+                root_to_new = np.zeros((num_comp + 1,), dtype=np.int32)
+                root_to_new[uniq_roots] = np.arange(1, uniq_roots.size + 1, dtype=np.int32)
+
+                new_inst = root_to_new[roots[inst]]
+                changed = np.any(new_inst != inst)
                 inst = new_inst
                 if not changed:
                     break
