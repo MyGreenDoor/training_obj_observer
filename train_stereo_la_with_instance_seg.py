@@ -397,24 +397,27 @@ def _infer_instance_from_heads(
     emb_merge_iters: int,
     use_gt_semantic: bool,
     semantic_gt_1_4: Optional[torch.Tensor] = None,
+    # NEW:
+    union_same_semantic_only: bool = True,
 ) -> List[np.ndarray]:
     """
     Infer instance IDs from semantic, affinity, and embeddings.
 
-    Changes vs original:
-      - Much faster: no per-pixel double for-loop for union; we enumerate only True edges.
-      - Mutual check for affinity:
-          (y,x)-(y,x+1): aff[0,y,x] AND aff[1,y,x+1]
-          (y,x)-(y+1,x): aff[2,y,x] AND aff[3,y+1,x]
-      - Only uses right+down edges (no redundant left/up passes).
-      - Embedding-merge loop runs only if emb_merge_iters > 0 (0 means disabled).
+    Steps:
+      1) Build a things mask from semantic prediction (or GT for debug).
+      2) Conservative union on affinity edges above tau_high (mutual check).
+      3) (Optional) Merge adjacent components using embedding distance.
+      4) Keep background as ID=0.
+
+    Options:
+      union_same_semantic_only:
+        If True, union edges only when the two pixels share the same semantic class (>0).
+        This prevents cross-class instance merging.
     """
-    # semantic prediction
     sem_pred = sem_logits.argmax(dim=1)
     if use_gt_semantic and semantic_gt_1_4 is not None:
         sem_pred = semantic_gt_1_4
 
-    # move once to CPU numpy (still per-batch processing for union-find)
     sem_np = sem_pred.detach().cpu().numpy()                        # (B,H,W) int
     aff_np = torch.sigmoid(aff_logits).detach().cpu().numpy()       # (B,4,H,W) float
     emb_np = emb.detach().cpu().permute(0, 2, 3, 1).numpy()         # (B,H,W,D) float
@@ -422,8 +425,8 @@ def _infer_instance_from_heads(
     out: List[np.ndarray] = []
 
     for b in range(sem_np.shape[0]):
-        sem_b = sem_np[b]               # (H,W)
-        sem_mask = (sem_b != 0)         # "things" mask
+        sem_b = sem_np[b]                   # (H,W)
+        sem_mask = (sem_b != 0)             # things
         H, W = sem_mask.shape
         n_pix = H * W
 
@@ -444,38 +447,41 @@ def _infer_instance_from_heads(
             return y * W + x
 
         # --- build mutual-checked edges (right & down only) ---
-        # Right edges: between (y,x) and (y,x+1) for x in [0..W-2]
-        # condition: both sem_mask True AND aff0(y,x) > tau AND aff1(y,x+1) > tau
+        # Right: (y,x)-(y,x+1)
         if W > 1:
             right_ok = (
                 sem_mask[:, :-1] & sem_mask[:, 1:]
                 & (aff_np[b, 0, :, :-1] > tau_high)
                 & (aff_np[b, 1, :, 1:] > tau_high)
             )
+            if union_same_semantic_only:
+                right_ok &= (sem_b[:, :-1] == sem_b[:, 1:])
+
             ry, rx = np.where(right_ok)
         else:
             ry, rx = np.empty((0,), np.int64), np.empty((0,), np.int64)
 
-        # Down edges: between (y,x) and (y+1,x) for y in [0..H-2]
-        # condition: both sem_mask True AND aff2(y,x) > tau AND aff3(y+1,x) > tau
+        # Down: (y,x)-(y+1,x)
         if H > 1:
             down_ok = (
                 sem_mask[:-1, :] & sem_mask[1:, :]
                 & (aff_np[b, 2, :-1, :] > tau_high)
                 & (aff_np[b, 3, 1:, :] > tau_high)
             )
+            if union_same_semantic_only:
+                down_ok &= (sem_b[:-1, :] == sem_b[1:, :])
+
             dy, dx = np.where(down_ok)
         else:
             dy, dx = np.empty((0,), np.int64), np.empty((0,), np.int64)
 
-        # union only the selected edges
-        # (loop count = number of true edges, typically far smaller than H*W)
+        # union only selected edges
         for y, x in zip(ry.tolist(), rx.tolist()):
             union(idx(y, x), idx(y, x + 1))
         for y, x in zip(dy.tolist(), dx.tolist()):
             union(idx(y, x), idx(y + 1, x))
 
-        # --- assign compact instance IDs from union-find roots ---
+        # --- assign compact instance IDs ---
         inst = np.zeros((H, W), dtype=np.int32)
         root_to_id = {}
         next_id = 1
@@ -488,7 +494,7 @@ def _infer_instance_from_heads(
                 next_id += 1
             inst[y, x] = root_to_id[r]
 
-        # --- optional embedding-based merge (only if enabled) ---
+        # --- optional embedding-based merge ---
         if emb_merge_iters > 0:
             D = emb_np.shape[-1]
             for _ in range(emb_merge_iters):
@@ -496,41 +502,39 @@ def _infer_instance_from_heads(
                 if num_comp <= 1:
                     break
 
-                # component means mu[k] via bincount / add.at (fast)
+                # component means
                 mu = np.zeros((num_comp + 1, D), dtype=np.float32)
                 cnt = np.bincount(inst.ravel(), minlength=num_comp + 1).astype(np.float32).reshape(-1, 1)
 
-                # sum embeddings per component
                 flat_inst = inst.ravel()
                 flat_emb = emb_np[b].reshape(-1, D)
-                # ignore background id=0 in summation (still fine if included; we'll keep it, it won't be used)
                 np.add.at(mu, flat_inst, flat_emb)
                 mu = mu / np.clip(cnt, 1.0, None)
 
-                # adjacency pairs from current inst (vectorized)
+                # adjacency pairs
                 pairs = []
 
                 if W > 1:
                     a = inst[:, :-1]
                     c = inst[:, 1:]
                     m = (a > 0) & (c > 0) & (a != c)
+                    if union_same_semantic_only:
+                        m &= (sem_b[:, :-1] == sem_b[:, 1:])
                     if np.any(m):
                         aa = a[m].astype(np.int32)
                         cc = c[m].astype(np.int32)
-                        lo = np.minimum(aa, cc)
-                        hi = np.maximum(aa, cc)
-                        pairs.append(np.stack([lo, hi], axis=1))
+                        pairs.append(np.stack([np.minimum(aa, cc), np.maximum(aa, cc)], axis=1))
 
                 if H > 1:
                     a = inst[:-1, :]
                     c = inst[1:, :]
                     m = (a > 0) & (c > 0) & (a != c)
+                    if union_same_semantic_only:
+                        m &= (sem_b[:-1, :] == sem_b[1:, :])
                     if np.any(m):
                         aa = a[m].astype(np.int32)
                         cc = c[m].astype(np.int32)
-                        lo = np.minimum(aa, cc)
-                        hi = np.maximum(aa, cc)
-                        pairs.append(np.stack([lo, hi], axis=1))
+                        pairs.append(np.stack([np.minimum(aa, cc), np.maximum(aa, cc)], axis=1))
 
                 if not pairs:
                     break
@@ -550,12 +554,14 @@ def _infer_instance_from_heads(
                     if ra != rb:
                         comp_parent[rb] = ra
 
-                # merge adjacent components if embedding distance is small
                 for a, c in adj.tolist():
-                    if np.linalg.norm(mu[a] - mu[c]) < tau_emb_merge:
+                    # (optional safety) do not merge across semantic classes
+                    # already guaranteed by adj construction above if union_same_semantic_only is True
+                    dist = np.linalg.norm(mu[a] - mu[c])
+                    if dist < tau_emb_merge:
                         cunion(a, c)
 
-                # relabel components to compact ids
+                # relabel
                 new_inst = np.zeros_like(inst)
                 root_to_id = {}
                 next_id = 1
