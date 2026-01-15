@@ -29,8 +29,7 @@ import torchvision.utils as vutils
 from la_loader.synthetic_data_loader import LASyntheticDataset3PerIns
 from la_loader import la_transforms
 
-from models.panoptic_stereo import PanopticStereoMultiHead
-from models.multi_head import pos_mu_to_pointmap
+from models.panoptic_stereo import PanopticStereoMultiHead, pos_mu_to_pointmap
 from models.stereo_disparity import make_gn
 from utils import dist_utils, rot_utils
 from utils.logging_utils import draw_axes_on_images_bk, visualize_mono_torch
@@ -262,7 +261,6 @@ def _prepare_pose_targets(
     if pos_map.dim() == 4 and pos_map.shape[1] != 3 and pos_map.shape[-1] == 3:
         pos_map = pos_map.permute(0, 3, 1, 2)
     pos_map = F.interpolate(pos_map, size=size_hw, mode="bilinear", align_corners=False)
-    pos_map = pos_map * 0.001
 
     rot_map = batch["rot_map"].to(device, non_blocking=True)
     if rot_map.dim() == 5 and not (rot_map.shape[1] == 3 and rot_map.shape[2] == 3):
@@ -270,11 +268,8 @@ def _prepare_pose_targets(
     rot_map = F.interpolate(rot_map.flatten(1, 2), size=size_hw, mode="nearest")
     rot_map = rot_map.view(rot_map.size(0), 3, 3, size_hw[0], size_hw[1])
 
-    sem_mask_1_4 = _downsample_label(sem_gt, size_hw) != 0
+    sem_mask_1_4 = _downsample_label(sem_gt, size_hw) > 0
     sem_mask_1_4 = sem_mask_1_4.unsqueeze(1)
-
-    pos_map = pos_map * sem_mask_1_4
-    rot_map = rot_map * sem_mask_1_4.unsqueeze(1)
 
     return pos_map, rot_map, sem_mask_1_4
 
@@ -871,7 +866,7 @@ def _build_instance_weight_map(inst_ids: torch.Tensor, valid_k: torch.Tensor) ->
     wks = inst_ids.new_zeros((B, Kmax, 1, H, W), dtype=torch.float32)
     for k in range(Kmax):
         mask_k = (inst_ids == (k + 1)).unsqueeze(1).to(torch.float32)
-        wks[:, k:k + 1] = mask_k
+        wks[:, k:k + 1] = mask_k.unsqueeze(2)
     wks = wks * valid_k.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).to(wks.dtype)
     return wks, wfg
 
@@ -1118,7 +1113,7 @@ def train_one_epoch(
             )
             disp_preds = pred["disp_preds"]
             disp_logvar_preds = pred["disp_log_var_preds"]
-            mask = disp_gt > 0
+            mask = (inst_gt > 0).unsqueeze(1) # without background
             loss_disp = base.disparity_nll_laplace_raft_style(
                 disp_preds,
                 disp_logvar_preds,
@@ -1201,8 +1196,7 @@ def train_one_epoch(
         scaler.update()
 
         depth_pred_1x = pred["point_map_1x"][:, 2:3]
-        depth_m = depth * 0.001
-        depth_mae = l1(depth_pred_1x[mask], depth_m[mask])
+        depth_mae = l1(depth_pred_1x[mask], depth[mask])
 
         did_optim_step = scaler.get_scale() >= prev_scale
         if scheduler is not None and sched_step_when == "step" and did_optim_step:
@@ -1222,7 +1216,7 @@ def train_one_epoch(
                     stereo,
                     pred["disp_1x"],
                     disp_gt,
-                    depth_pred_1x * 1000.0,
+                    depth_pred_1x,
                     depth,
                     mask[: min(4, stereo.size(0))].to(torch.float32),
                     n_images=min(4, stereo.size(0)),
@@ -1366,7 +1360,7 @@ def validate(
                 stereo,
                 pred["disp_1x"],
                 disp_gt,
-                depth_pred_1x * 1000.0,
+                depth_pred_1x,
                 depth,
                 mask[: min(4, stereo.size(0))].to(torch.float32),
                 n_images=min(4, stereo.size(0)),

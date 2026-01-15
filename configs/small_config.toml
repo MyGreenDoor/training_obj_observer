@@ -6,7 +6,7 @@ seed = 42
 [train]
 output_dir = "outputs/run_debug"   # logs/checkpoints and a copy of this config are saved here
 epochs = 500
-batch_size = 10
+batch_size = 4
 lr = 2e-5
 weight_decay = 1e-5
 amp = false

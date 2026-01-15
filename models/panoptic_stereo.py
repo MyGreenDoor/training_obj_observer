@@ -23,6 +23,7 @@ from models.multi_head import (
     r6d_to_rotmat,
     rotvec_to_rotmat_map,
 )
+from utils import rot_utils
 
 
 class AffEmbHead(nn.Module):
@@ -584,7 +585,6 @@ class PanopticStereoMultiHead(nn.Module):
             downsample=4,
             eps=1e-6,
         )
-        point_map_cur = point_map_cur * 0.001
         depth_1_4 = point_map_cur[:, 2:3]
         disp_1x = self.upsampler(disp_preds[-1], context0, scale_factor=4.0)
         disp_log_var_1x = self.upsampler(disp_log_var_preds[-1], context0, scale_factor=1.0)
@@ -596,7 +596,6 @@ class PanopticStereoMultiHead(nn.Module):
             downsample=1,
             eps=1e-6,
         )
-        point_map_1x = point_map_1x * 0.001
         point_map_1x_norm = normalize_point_map(point_map_1x)
 
         head_out = self.pose_head(
@@ -665,3 +664,45 @@ def denormalize_pos_logvar(pos_logvar_norm: torch.Tensor, pos_mu_norm: torch.Ten
     logz = pos_mu_norm[:, 2:3]
     lv_z = pos_logvar_norm[:, 2:3] + 2.0 * logz
     return torch.cat([pos_logvar_norm[:, 0:1], pos_logvar_norm[:, 1:2], lv_z], dim=1)
+
+
+def pos_mu_to_pointmap(
+    pos_mu: torch.Tensor,
+    K_left_1x: torch.Tensor,
+    downsample: int = 4,
+) -> torch.Tensor:
+    """Convert (dx, dy, logZ) or (Z) to an XYZ point map at 1/4 resolution."""
+    if pos_mu.size(1) == 1:
+        K14 = K_left_1x.clone()
+        K14[:, 0, 0] /= downsample
+        K14[:, 1, 1] /= downsample
+        K14[:, 0, 2] /= downsample
+        K14[:, 1, 2] /= downsample
+        return rot_utils.depth_to_pointmap_from_K(pos_mu, K14)
+
+    if pos_mu.size(1) != 3:
+        raise ValueError(f"pos_mu must have 1 or 3 channels, got {pos_mu.size(1)}")
+
+    B, _, H4, W4 = pos_mu.shape
+    device = pos_mu.device
+    dtype = pos_mu.dtype
+
+    dx = pos_mu[:, 0:1]
+    dy = pos_mu[:, 1:2]
+    z = torch.exp(pos_mu[:, 2:3])
+
+    u = (torch.arange(W4, device=device, dtype=dtype) + 0.5) * float(downsample)
+    v = (torch.arange(H4, device=device, dtype=dtype) + 0.5) * float(downsample)
+    u = u.view(1, 1, 1, W4).expand(B, 1, H4, W4)
+    v = v.view(1, 1, H4, 1).expand(B, 1, H4, W4)
+
+    fx = K_left_1x[:, 0, 0].view(B, 1, 1, 1)
+    fy = K_left_1x[:, 1, 1].view(B, 1, 1, 1)
+    cx = K_left_1x[:, 0, 2].view(B, 1, 1, 1)
+    cy = K_left_1x[:, 1, 2].view(B, 1, 1, 1)
+
+    u_c = u + dx
+    v_c = v + dy
+    X = (u_c - cx) / fx * z
+    Y = (v_c - cy) / fy * z
+    return torch.cat([X, Y, z], dim=1)
