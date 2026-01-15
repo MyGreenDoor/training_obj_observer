@@ -150,8 +150,8 @@ class LiteFPNMultiTaskHeadWithAffEmb(nn.Module):
 
         mu_raw = out_posz[:, 0:3]
         lv_raw = out_posz[:, 3:6]
-        mu_z = mu_raw[:, 2:3] * self.out_pos_scale
-        mu_pos = torch.cat([mu_raw[:, 0:2], mu_z], dim=1)
+        log_z = mu_raw[:, 2:3] * self.out_pos_scale
+        mu_pos = torch.cat([mu_raw[:, 0:2], log_z], dim=1)
         lv_pos = lv_raw.clamp(-8.0, 4.0)
         if self.rot_repr == "r6d":
             r6d = out_rot[:, :6]
@@ -278,8 +278,8 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
 
         mu_raw = out_posz[:, 0:3]
         lv_raw = out_posz[:, 3:6]
-        mu_z = mu_raw[:, 2:3] * self.out_pos_scale
-        mu_pos = torch.cat([mu_raw[:, 0:2], mu_z], dim=1)
+        log_z = mu_raw[:, 2:3] * self.out_pos_scale
+        mu_pos = torch.cat([mu_raw[:, 0:2], log_z], dim=1)
         lv_pos = lv_raw.clamp(-8.0, 4.0)
         if self.rot_repr == "r6d":
             r6d = out_rot[:, :6]
@@ -604,6 +604,10 @@ class PanopticStereoMultiHead(nn.Module):
             mask_1x=point_map_conf_1x,
             point_map_1x=point_map_1x_norm,
         )
+        pos_mu_norm = head_out["pos_mu"]
+        pos_logvar_norm = head_out["pos_logvar"]
+        pos_mu = denormalize_pos_mu(pos_mu_norm)
+        pos_logvar = denormalize_pos_logvar(pos_logvar_norm, pos_mu_norm)
 
         out: Dict[str, torch.Tensor] = {
             **stuff,
@@ -617,8 +621,12 @@ class PanopticStereoMultiHead(nn.Module):
             "point_map_1x": point_map_1x,
             "point_map_conf_1x": point_map_conf_1x,
             "sem_logits": head_out["cls_logits"],
+            "pos_mu": pos_mu,
+            "pos_logvar": pos_logvar,
+            "pos_mu_norm": pos_mu_norm,
+            "pos_logvar_norm": pos_logvar_norm,
         }
-        out.update(head_out)
+        out.update({k: v for k, v in head_out.items() if k not in ("pos_mu", "pos_logvar")})
         return out
 
 
@@ -637,3 +645,23 @@ def denormalize_point_map(point_map_norm: torch.Tensor, eps: float = 1e-6) -> to
     x = point_map_norm[:, 0:1] * z
     y = point_map_norm[:, 1:2] * z
     return torch.cat([x, y, z], dim=1)
+
+
+def normalize_pos_mu(pos_mu: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Normalize (dx, dy, Z) into (dx, dy, logZ)."""
+    z = pos_mu[:, 2:3].clamp_min(eps)
+    logz = torch.log(z)
+    return torch.cat([pos_mu[:, 0:1], pos_mu[:, 1:2], logz], dim=1)
+
+
+def denormalize_pos_mu(pos_mu_norm: torch.Tensor) -> torch.Tensor:
+    """Recover (dx, dy, Z) from (dx, dy, logZ)."""
+    z = torch.exp(pos_mu_norm[:, 2:3])
+    return torch.cat([pos_mu_norm[:, 0:1], pos_mu_norm[:, 1:2], z], dim=1)
+
+
+def denormalize_pos_logvar(pos_logvar_norm: torch.Tensor, pos_mu_norm: torch.Tensor) -> torch.Tensor:
+    """Approximate log-variance for (dx, dy, Z) from (dx, dy, logZ)."""
+    logz = pos_mu_norm[:, 2:3]
+    lv_z = pos_logvar_norm[:, 2:3] + 2.0 * logz
+    return torch.cat([pos_logvar_norm[:, 0:1], pos_logvar_norm[:, 1:2], lv_z], dim=1)

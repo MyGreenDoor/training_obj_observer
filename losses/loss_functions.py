@@ -106,6 +106,7 @@ def _pos_mu_gt_from_t_map(
     K_left_1x: torch.Tensor,
     downsample: int = 4,
     eps: float = 1e-6,
+    use_logz: bool = False,
 ) -> torch.Tensor:
     B, _, H4, W4 = t_map.shape
     device = t_map.device
@@ -130,7 +131,10 @@ def _pos_mu_gt_from_t_map(
 
     dx = u_c - u
     dy = v_c - v
-    return torch.cat([dx, dy, t_map[:, 2:3]], dim=1)
+    z = t_map[:, 2:3]
+    if use_logz:
+        z = torch.log(Z)
+    return torch.cat([dx, dy, z], dim=1)
 
 
 # ----- 4) geodesic θ (f32) -----

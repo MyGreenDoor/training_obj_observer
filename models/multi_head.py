@@ -786,6 +786,19 @@ def pos_mu_to_pointmap(
     return torch.cat([X, Y, z], dim=1)
 
 
+def pos_mu_logz_to_pointmap(
+    pos_mu_logz: torch.Tensor,  # (B,3,H/4,W/4) as (dx, dy, logZ)
+    K_left_1x: torch.Tensor,    # (B,3,3) full-res intrinsics
+    downsample: int = 4,
+) -> torch.Tensor:
+    """Convert (dx, dy, logZ) map to XYZ point map at 1/4 resolution."""
+    if pos_mu_logz.size(1) != 3:
+        raise ValueError(f"pos_mu_logz must have 3 channels, got {pos_mu_logz.size(1)}")
+    z = torch.exp(pos_mu_logz[:, 2:3])
+    pos_mu = torch.cat([pos_mu_logz[:, 0:1], pos_mu_logz[:, 1:2], z], dim=1)
+    return pos_mu_to_pointmap(pos_mu, K_left_1x, downsample=downsample)
+
+
 @torch.jit.script
 def _greedy_match_yx(pred_yx: torch.Tensor, gt_yx: torch.Tensor) -> torch.Tensor:
     """Greedily match predicted peaks to ground truth peaks.

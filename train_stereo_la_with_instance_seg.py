@@ -30,9 +30,12 @@ from la_loader.synthetic_data_loader import LASyntheticDataset3PerIns
 from la_loader import la_transforms
 
 from models.panoptic_stereo import PanopticStereoMultiHead
+from models.multi_head import pos_mu_to_pointmap
 from models.stereo_disparity import make_gn
-from utils import dist_utils
-from utils.logging_utils import visualize_mono_torch
+from utils import dist_utils, rot_utils
+from utils.logging_utils import draw_axes_on_images_bk, visualize_mono_torch
+from utils.projection import SilhouetteDepthRenderer
+from pytorch3d.structures import Meshes
 from losses import loss_functions
 
 import train_stereo_la as base
@@ -817,6 +820,160 @@ def _log_segmentation_visuals(
     writer.add_image(f"{prefix}/vis_instance_pred_gt", grid_inst, step_value)
 
 
+def _overlay_mask_rgb(img_bchw: torch.Tensor, mask_b1hw: torch.Tensor, color=(0.0, 1.0, 0.0), alpha: float = 0.4):
+    """Overlay a single-channel mask on RGB images."""
+    c = torch.tensor(color, device=img_bchw.device, dtype=img_bchw.dtype).view(1, 3, 1, 1)
+    m = mask_b1hw.clamp(0, 1)
+    return img_bchw * (1 - alpha * m) + c * (alpha * m)
+
+
+def _build_meshes_from_batch(batch: Dict[str, Any], device: torch.device) -> Tuple[Optional[Meshes], torch.Tensor]:
+    """Build flat meshes and valid_k from batch lists."""
+    verts_list = batch.get("verts_list", None)
+    faces_list = batch.get("faces_list", None)
+    if verts_list is None or faces_list is None:
+        return None, torch.zeros((0, 0), dtype=torch.bool, device=device)
+
+    verts_all: List[torch.Tensor] = []
+    faces_all: List[torch.Tensor] = []
+    counts: List[int] = []
+    for vlist, flist in zip(verts_list, faces_list):
+        v_t = [torch.from_numpy(v).float() for v in vlist]
+        f_t = [torch.from_numpy(f).long() for f in flist]
+        if len(v_t) != len(f_t):
+            raise ValueError("verts_list and faces_list length mismatch")
+        counts.append(len(v_t))
+        verts_all.extend(v_t)
+        faces_all.extend(f_t)
+
+    B = len(counts)
+    Kmax = max(counts) if counts else 0
+    if Kmax == 0:
+        return None, torch.zeros((B, 0), dtype=torch.bool, device=device)
+
+    valid_k = torch.zeros((B, Kmax), dtype=torch.bool, device=device)
+    for b, k in enumerate(counts):
+        valid_k[b, :k] = True
+
+    meshes_flat = Meshes(verts=verts_all, faces=faces_all).to(device)
+    return meshes_flat, valid_k
+
+
+def _build_instance_weight_map(inst_ids: torch.Tensor, valid_k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build per-instance weight maps from GT instance IDs."""
+    B, H, W = inst_ids.shape
+    Kmax = valid_k.shape[1]
+    if Kmax == 0:
+        wfg = (inst_ids > 0).unsqueeze(1).to(torch.float32)
+        return inst_ids.new_zeros((B, 0, 1, H, W), dtype=torch.float32), wfg
+
+    wfg = (inst_ids > 0).unsqueeze(1).to(torch.float32)
+    wks = inst_ids.new_zeros((B, Kmax, 1, H, W), dtype=torch.float32)
+    for k in range(Kmax):
+        mask_k = (inst_ids == (k + 1)).unsqueeze(1).to(torch.float32)
+        wks[:, k:k + 1] = mask_k
+    wks = wks * valid_k.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).to(wks.dtype)
+    return wks, wfg
+
+
+def _log_pose_visuals(
+    writer: SummaryWriter,
+    step_value: int,
+    prefix: str,
+    stereo: torch.Tensor,
+    pred: Dict[str, torch.Tensor],
+    pos_map_gt: torch.Tensor,
+    rot_map_gt: torch.Tensor,
+    inst_gt: torch.Tensor,
+    left_k: torch.Tensor,
+    batch: Dict[str, Any],
+    n_images: int,
+) -> None:
+    """Log pose and silhouette visualizations using GT instance masks."""
+    if writer is None:
+        return
+
+    device = stereo.device
+    meshes_flat, valid_k = _build_meshes_from_batch(batch, device)
+    if meshes_flat is None or valid_k.numel() == 0:
+        return
+
+    size_hw = pred["pos_mu"].shape[-2:]
+    inst_1x = _downsample_label(inst_gt, size_hw)
+    wks, wfg = _build_instance_weight_map(inst_1x, valid_k)
+
+    pos_map_pred = pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
+    r_pred, t_pred, v_pred, _, _ = rot_utils.pose_from_maps_auto(
+        rot_map=pred["rot_mat"],
+        pos_map=pos_map_pred,
+        Wk_1_4=wks,
+        wfg=wfg,
+        min_px=10,
+        min_wsum=1e-6,
+    )
+    r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
+        rot_map=rot_map_gt,
+        pos_map=pos_map_gt,
+        Wk_1_4=wks,
+        wfg=wfg,
+        min_px=10,
+        min_wsum=1e-6,
+    )
+
+    valid_pred = v_pred & valid_k
+    valid_gt = v_gt & valid_k
+
+    T_pred = rot_utils.compose_T_from_Rt(r_pred, t_pred, valid_pred)
+    T_gt = rot_utils.compose_T_from_Rt(r_gt, t_gt, valid_gt)
+
+    renderer = SilhouetteDepthRenderer().to(device)
+    image_size = (stereo.shape[-2], stereo.shape[-1])
+
+    pred_r = renderer(
+        meshes_flat=meshes_flat,
+        T_cam_obj=T_pred,
+        K_left=left_k[:, 0],
+        valid_k=valid_pred,
+        image_size=image_size,
+    )
+    gt_r = renderer(
+        meshes_flat=meshes_flat,
+        T_cam_obj=T_gt,
+        K_left=left_k[:, 0],
+        valid_k=valid_gt,
+        image_size=image_size,
+    )
+    sil_pred = pred_r["silhouette"]
+    sil_gt = gt_r["silhouette"]
+
+    overlay_pred = _overlay_mask_rgb(stereo[:n_images, :3], sil_pred[:n_images], color=(0.0, 1.0, 0.0), alpha=0.45)
+    overlay_gt = _overlay_mask_rgb(stereo[:n_images, :3], sil_gt[:n_images], color=(1.0, 0.0, 0.0), alpha=0.45)
+    overlay_both = _overlay_mask_rgb(overlay_gt, sil_pred[:n_images], color=(0.0, 1.0, 0.0), alpha=0.45)
+
+    axes_pred = draw_axes_on_images_bk(
+        overlay_pred,
+        left_k[:n_images, 0],
+        T_pred[:n_images],
+        axis_len=0.05,
+        valid=valid_pred[:n_images],
+    )
+    axes_gt = draw_axes_on_images_bk(
+        overlay_gt,
+        left_k[:n_images, 0],
+        T_gt[:n_images],
+        axis_len=0.05,
+        valid=valid_gt[:n_images],
+    )
+
+    grid = vutils.make_grid(
+        torch.cat([stereo[:n_images, :3], axes_pred, axes_gt, overlay_both], dim=0),
+        nrow=4,
+        normalize=True,
+        scale_each=True,
+    )
+    writer.add_image(f"{prefix}/vis_pose_sil", grid, step_value)
+
+
 def _log_disp_and_depth(
     writer: SummaryWriter,
     step_value: int,
@@ -982,10 +1139,12 @@ def train_one_epoch(
             loss_sem = loss_cls
 
             pos_gt_map, rot_gt_map, pose_mask = _prepare_pose_targets(batch, sem_gt, size_hw, device)
-            gt_pos_mu_map = loss_functions._pos_mu_gt_from_t_map(pos_gt_map, left_k[:, 0], downsample=1)
+            gt_pos_mu_map = loss_functions._pos_mu_gt_from_t_map(
+                pos_gt_map, left_k[:, 0], downsample=1, use_logz=True
+            )
             loss_pos = loss_functions.pos_loss_hetero_map(
-                pred["pos_mu"],
-                pred["pos_logvar"],
+                pred["pos_mu_norm"],
+                pred["pos_logvar_norm"],
                 gt_pos_mu_map,
                 pose_mask,
             )
@@ -1081,6 +1240,19 @@ def train_one_epoch(
                     cfg,
                     n_images=min(4, stereo.size(0)),
                 )
+                _log_pose_visuals(
+                    writer,
+                    global_step,
+                    "train",
+                    stereo,
+                    pred,
+                    pos_gt_map,
+                    rot_gt_map,
+                    inst_gt,
+                    left_k,
+                    batch,
+                    n_images=min(4, stereo.size(0)),
+                )
             window_cnt = base._reset_window_meter(window_sum, window_cnt)
 
     return total_loss.item() / max(1, len(loader))
@@ -1141,10 +1313,12 @@ def validate(
         loss_sem = loss_cls
 
         pos_gt_map, rot_gt_map, pose_mask = _prepare_pose_targets(batch, sem_gt, size_hw, device)
-        gt_pos_mu_map = loss_functions._pos_mu_gt_from_t_map(pos_gt_map, left_k[:, 0], downsample=1)
+        gt_pos_mu_map = loss_functions._pos_mu_gt_from_t_map(
+            pos_gt_map, left_k[:, 0], downsample=1, use_logz=True
+        )
         loss_pos = loss_functions.pos_loss_hetero_map(
-            pred["pos_mu"],
-            pred["pos_logvar"],
+            pred["pos_mu_norm"],
+            pred["pos_logvar_norm"],
             gt_pos_mu_map,
             pose_mask,
         )
@@ -1208,6 +1382,19 @@ def validate(
                 sem_gt,
                 inst_gt,
                 cfg,
+                n_images=min(4, stereo.size(0)),
+            )
+            _log_pose_visuals(
+                writer,
+                epoch,
+                "val",
+                stereo,
+                pred,
+                pos_gt_map,
+                rot_gt_map,
+                inst_gt,
+                left_k,
+                batch,
                 n_images=min(4, stereo.size(0)),
             )
 
