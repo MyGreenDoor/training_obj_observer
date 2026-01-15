@@ -597,11 +597,12 @@ class PanopticStereoMultiHead(nn.Module):
             eps=1e-6,
         )
         point_map_1x = point_map_1x * 0.001
+        point_map_1x_norm = normalize_point_map(point_map_1x)
 
         head_out = self.pose_head(
             ctx_1x=stuff["context_1x"],
             mask_1x=point_map_conf_1x,
-            point_map_1x=point_map_1x,
+            point_map_1x=point_map_1x_norm,
         )
 
         out: Dict[str, torch.Tensor] = {
@@ -619,3 +620,20 @@ class PanopticStereoMultiHead(nn.Module):
         }
         out.update(head_out)
         return out
+
+
+def normalize_point_map(point_map: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Normalize XYZ point map to (X/Z, Y/Z, logZ)."""
+    z = point_map[:, 2:3].clamp_min(eps)
+    xz = point_map[:, 0:1] / z
+    yz = point_map[:, 1:2] / z
+    logz = torch.log(z)
+    return torch.cat([xz, yz, logz], dim=1)
+
+
+def denormalize_point_map(point_map_norm: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Recover XYZ point map from (X/Z, Y/Z, logZ)."""
+    z = torch.exp(point_map_norm[:, 2:3]).clamp_min(eps)
+    x = point_map_norm[:, 0:1] * z
+    y = point_map_norm[:, 1:2] * z
+    return torch.cat([x, y, z], dim=1)
