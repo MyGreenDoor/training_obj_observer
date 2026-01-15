@@ -270,8 +270,23 @@ def _prepare_pose_targets(
 
     sem_mask_1_4 = _downsample_label(sem_gt, size_hw) > 0
     sem_mask_1_4 = sem_mask_1_4.unsqueeze(1)
-
-    return pos_map, rot_map, sem_mask_1_4
+    objs_in_left_list: List[torch.Tensor] = []
+    B = len(batch["objs_in_left"])
+    counts: List[int] = []
+    for objs_in_left in batch["objs_in_left"]:
+        objs_in_left = [torch.from_numpy(obj_in_left) for obj_in_left in objs_in_left]
+        counts.append(len(objs_in_left))
+        objs_in_left_list.extend(objs_in_left)
+    objs_in_left_list = torch.stack(objs_in_left_list, dim=0)
+    Kmax = max(counts) if counts else 0
+    valid_k = torch.zeros((B, Kmax), dtype=torch.bool, device=device)
+    objs_in_left = torch.zeros((B, Kmax, 4, 4), dtype=torch.float32, device=device)
+    st_k = 0
+    for b, k in enumerate(counts):
+        valid_k[b, :k] = True
+        objs_in_left[b, :k] = objs_in_left_list[st_k: st_k + k]
+        st_k += counts[b]
+    return pos_map, rot_map, sem_mask_1_4, objs_in_left
 
 
 def _build_affinity_targets(inst_1_4: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -882,6 +897,8 @@ def _log_pose_visuals(
     inst_gt: torch.Tensor,
     left_k: torch.Tensor,
     batch: Dict[str, Any],
+    pos_gt,
+    rot_gt,
     n_images: int,
 ) -> None:
     """Log pose and silhouette visualizations using GT instance masks."""
@@ -918,8 +935,11 @@ def _log_pose_visuals(
     valid_pred = v_pred & valid_k
     valid_gt = v_gt & valid_k
 
+    # T_pred = rot_utils.compose_T_from_Rt(r_pred, t_pred, valid_pred)
+    # T_gt = rot_utils.compose_T_from_Rt(r_gt, t_gt, valid_gt)
+    
     T_pred = rot_utils.compose_T_from_Rt(r_pred, t_pred, valid_pred)
-    T_gt = rot_utils.compose_T_from_Rt(r_gt, t_gt, valid_gt)
+    T_gt = rot_utils.compose_T_from_Rt(rot_gt, pos_gt, valid_gt)
 
     renderer = SilhouetteDepthRenderer().to(device)
     image_size = (stereo.shape[-2], stereo.shape[-1])
@@ -1133,7 +1153,7 @@ def train_one_epoch(
             loss_cls = loss_functions.classification_loss(pred["cls_logits"], sem_gt_1_4, use_focal=False)
             loss_sem = loss_cls
 
-            pos_gt_map, rot_gt_map, pose_mask = _prepare_pose_targets(batch, sem_gt, size_hw, device)
+            pos_gt_map, rot_gt_map, pose_mask, objs_in_left = _prepare_pose_targets(batch, sem_gt, size_hw, device)
             gt_pos_mu_map = loss_functions._pos_mu_gt_from_t_map(
                 pos_gt_map, left_k[:, 0], downsample=1, use_logz=True
             )
@@ -1245,6 +1265,8 @@ def train_one_epoch(
                     inst_gt,
                     left_k,
                     batch,
+                    objs_in_left[..., :3, 3],
+                    objs_in_left[..., :3, :3],
                     n_images=min(4, stereo.size(0)),
                 )
             window_cnt = base._reset_window_meter(window_sum, window_cnt)
@@ -1306,7 +1328,7 @@ def validate(
         loss_cls = loss_functions.classification_loss(pred["cls_logits"], sem_gt_1_4, use_focal=False)
         loss_sem = loss_cls
 
-        pos_gt_map, rot_gt_map, pose_mask = _prepare_pose_targets(batch, sem_gt, size_hw, device)
+        pos_gt_map, rot_gt_map, pose_mask, objs_in_left = _prepare_pose_targets(batch, sem_gt, size_hw, device)
         gt_pos_mu_map = loss_functions._pos_mu_gt_from_t_map(
             pos_gt_map, left_k[:, 0], downsample=1, use_logz=True
         )
@@ -1389,6 +1411,8 @@ def validate(
                 inst_gt,
                 left_k,
                 batch,
+                objs_in_left[..., :3, 3],
+                objs_in_left[..., :3, :3],
                 n_images=min(4, stereo.size(0)),
             )
 
