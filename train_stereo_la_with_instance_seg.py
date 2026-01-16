@@ -869,6 +869,30 @@ def _build_meshes_from_batch(batch: Dict[str, Any], device: torch.device) -> Tup
     return meshes_flat, valid_k
 
 
+def _build_meshes_from_batch_filtered(
+    batch: Dict[str, Any],
+    valid_keep: torch.Tensor,
+    device: torch.device,
+) -> Optional[Meshes]:
+    """Build flat meshes filtered by valid_keep."""
+    verts_list = batch.get("verts_list", None)
+    faces_list = batch.get("faces_list", None)
+    if verts_list is None or faces_list is None:
+        return None
+
+    verts_all: List[torch.Tensor] = []
+    faces_all: List[torch.Tensor] = []
+    for b, (vlist, flist) in enumerate(zip(verts_list, faces_list)):
+        for k, (v, f) in enumerate(zip(vlist, flist)):
+            if k < valid_keep.size(1) and bool(valid_keep[b, k].item()):
+                verts_all.append(torch.from_numpy(v).float())
+                faces_all.append(torch.from_numpy(f).long())
+
+    if not verts_all:
+        return None
+    return Meshes(verts=verts_all, faces=faces_all).to(device)
+
+
 def _build_instance_weight_map(inst_ids: torch.Tensor, valid_k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build per-instance weight maps from GT instance IDs."""
     B, H, W = inst_ids.shape
@@ -884,6 +908,30 @@ def _build_instance_weight_map(inst_ids: torch.Tensor, valid_k: torch.Tensor) ->
         wks[:, k:k + 1] = mask_k.unsqueeze(2)
     wks = wks * valid_k.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).to(wks.dtype)
     return wks, wfg
+
+
+def _origin_in_image_from_t(
+    t_map: torch.Tensor,
+    K_left: torch.Tensor,
+    image_size: Tuple[int, int],
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Check if object origin projects inside the image."""
+    H, W = image_size
+    x = t_map[..., 0]
+    y = t_map[..., 1]
+    z = t_map[..., 2]
+    z_safe = z.clamp_min(eps)
+
+    fx = K_left[:, 0, 0].unsqueeze(1)
+    fy = K_left[:, 1, 1].unsqueeze(1)
+    cx = K_left[:, 0, 2].unsqueeze(1)
+    cy = K_left[:, 1, 2].unsqueeze(1)
+
+    u = fx * (x / z_safe) + cx
+    v = fy * (y / z_safe) + cy
+    in_img = (z > eps) & (u >= 0.0) & (u <= (W - 1)) & (v >= 0.0) & (v <= (H - 1))
+    return in_img
 
 
 def _log_pose_visuals(
@@ -932,8 +980,11 @@ def _log_pose_visuals(
         min_wsum=1e-6,
     )
 
-    valid_pred = v_pred & valid_k
-    valid_gt = v_gt & valid_k
+    image_size = (stereo.shape[-2], stereo.shape[-1])
+    origin_in = _origin_in_image_from_t(t_gt, left_k[:, 0], image_size)
+    valid_render = valid_k & origin_in
+    valid_pred = v_pred & valid_render
+    valid_gt = v_gt & valid_render
 
     # T_pred = rot_utils.compose_T_from_Rt(r_pred, t_pred, valid_pred)
     # T_gt = rot_utils.compose_T_from_Rt(r_gt, t_gt, valid_gt)
@@ -941,21 +992,24 @@ def _log_pose_visuals(
     T_pred = rot_utils.compose_T_from_Rt(r_pred, t_pred, valid_pred)
     T_gt = rot_utils.compose_T_from_Rt(rot_gt, pos_gt, valid_gt)
 
+    meshes_flat = _build_meshes_from_batch_filtered(batch, valid_render, device)
+    if meshes_flat is None:
+        return
+
     renderer = SilhouetteDepthRenderer().to(device)
-    image_size = (stereo.shape[-2], stereo.shape[-1])
 
     pred_r = renderer(
         meshes_flat=meshes_flat,
         T_cam_obj=T_pred,
         K_left=left_k[:, 0],
-        valid_k=valid_pred,
+        valid_k=valid_render,
         image_size=image_size,
     )
     gt_r = renderer(
         meshes_flat=meshes_flat,
         T_cam_obj=T_gt,
         K_left=left_k[:, 0],
-        valid_k=valid_gt,
+        valid_k=valid_render,
         image_size=image_size,
     )
     sil_pred = pred_r["silhouette"]
