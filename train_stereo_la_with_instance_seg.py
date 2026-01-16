@@ -1023,14 +1023,14 @@ def _log_pose_visuals(
         overlay_pred,
         left_k[:n_images, 0],
         T_pred[:n_images],
-        axis_len=0.05,
+        axis_len=50,
         valid=valid_pred[:n_images],
     )
     axes_gt = draw_axes_on_images_bk(
         overlay_gt,
         left_k[:n_images, 0],
         T_gt[:n_images],
-        axis_len=0.05,
+        axis_len=50,
         valid=valid_gt[:n_images],
     )
 
