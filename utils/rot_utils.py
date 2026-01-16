@@ -571,7 +571,7 @@ def _gather_peak_map(
 
 #     # --- peak 取得 ---
 #     if (peaks_yx is None) or (peaks_yx.numel() == 0):
-#         w2d = w.squeeze(2)                        # (B,K,H,W)
+#         w2d = w_peak.squeeze(2)                        # (B,K,H,W)
 #         wflat = w2d.reshape(B, K, -1)             # (B,K,HW)
 #         idx = wflat.argmax(dim=-1)                # (B,K)
 #         y_pk = (idx // W).clamp_(0, H-1)
@@ -656,40 +656,56 @@ def pose_from_maps_auto(
     wfg = wfg.clamp_min(0).to(torch.float32)             # (B,1,H,W)
     w = (Wk * wfg.unsqueeze(1))                          # (B,K,1,H,W)
 
-    # 有効判定
+    # Validity check uses base weights only.
     px = (w > 0).sum(dim=(2,3,4))                        # (B,K)
     wsum = w.sum(dim=(2,3,4))                            # (B,K)
     valid = (px >= min_px) & (wsum >= min_wsum)          # (B,K)
 
-    # 正規化（ゼロ割り防止）
-    denom = wsum.view(B, K, 1, 1, 1).clamp_min(min_wsum)
-    wn = (w / denom)                                     # (B,K,1,H,W)
+    w_pos = w
+    w_rot = w
+    w_peak = w
+    if pos_logvar is not None:
+        pos_logvar_t = torch.jit._unwrap_optional(pos_logvar)
+        pos_lv = pos_logvar_t.mean(dim=1, keepdim=True)
+        pos_conf = torch.exp(-0.5 * pos_lv)
+        w_pos = w_pos * pos_conf.unsqueeze(1)
+        w_peak = w_peak * pos_conf.unsqueeze(1)
+    if rot_logvar_theta is not None:
+        rot_logvar_t = torch.jit._unwrap_optional(rot_logvar_theta)
+        rot_conf = torch.exp(-0.5 * rot_logvar_t)
+        w_rot = w_rot * rot_conf.unsqueeze(1)
+        w_peak = w_peak * rot_conf.unsqueeze(1)
 
-    # --- t: 加重平均 ---
-    t_hat = (pos_map.to(torch.float32).unsqueeze(1) * wn).sum(dim=(3,4))  # (B,K,3)
+    denom_pos = w_pos.sum(dim=(2,3,4)).view(B, K, 1, 1, 1).clamp_min(min_wsum)
+    wn_pos = w_pos / denom_pos
+    denom_rot = w_rot.sum(dim=(2,3,4)).view(B, K, 1, 1, 1).clamp_min(min_wsum)
+    wn_rot = w_rot / denom_rot
 
-    # --- R: Lie 平均（log -> 平均 -> exp） ---
+    # --- t: weighted average ---
+    t_hat = (pos_map.to(torch.float32).unsqueeze(1) * wn_pos).sum(dim=(3,4))  # (B,K,3)
+
+    # --- R: Lie average (log -> avg -> exp) ---
     r_map = so3_log_map(rot_map.to(torch.float32))                # (B,3,H,W)
-    r_hat = (r_map.unsqueeze(1) * wn).sum(dim=(3,4))              # (B,K,3)
+    r_hat = (r_map.unsqueeze(1) * wn_rot).sum(dim=(3,4))          # (B,K,3)
     R_hat = so3_exp_vec(r_hat).to(dtype)                          # (B,K,3,3)
     t_hat = t_hat.to(dtype)
     pos_logvar_k = torch.jit.annotate(Optional[torch.Tensor], None)
     rot_logvar_k = torch.jit.annotate(Optional[torch.Tensor], None)
     if pos_logvar is not None:
         pos_logvar_t = torch.jit._unwrap_optional(pos_logvar)
-        pos_logvar_k = _avg_optional_map(pos_logvar_t, wn)             # (B,K,Cp)
+        pos_logvar_k = _avg_optional_map(pos_logvar_t, wn_pos)         # (B,K,Cp)
     if rot_logvar_theta is not None:
         rot_logvar_t = torch.jit._unwrap_optional(rot_logvar_theta)
-        rot_logvar_k = _avg_optional_map(rot_logvar_t, wn)             # (B,K,Cr)
+        rot_logvar_k = _avg_optional_map(rot_logvar_t, wn_rot)         # (B,K,Cr)
 
-    # --- フォールバックが必要か？（ピーク抽出） ---
+    # --- Fallback if needed (peak selection) ---
     use_pk = ~valid
     need_pk = bool(use_pk.any().item())
 
     if need_pk:
         # peaks が無ければ「最大重み画素」で代用
         if (peaks_yx is None) or (peaks_yx.numel() == 0):
-            w2d = w.squeeze(2)                               # (B,K,H,W)
+            w2d = w_peak.squeeze(2)                               # (B,K,H,W)
             wflat = w2d.reshape(B, K, -1)                    # (B,K,HW)
             idx = wflat.argmax(dim=-1)                       # (B,K)
             y_pk = (idx // W).clamp_(0, H-1)

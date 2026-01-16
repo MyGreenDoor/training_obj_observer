@@ -889,7 +889,7 @@ def _build_model_points_from_batch(
     for vlist, flist, dlist in zip(verts_list, faces_list, diameters_list):
         v_t = [torch.as_tensor(v).float() for v in vlist]
         f_t = [torch.as_tensor(f).long() for f in flist]
-        d_t = [torch.as_tensor(d).float() for d in dlist]
+        d_t = [float(torch.as_tensor(d).reshape(-1)[0].item()) for d in dlist]
         if len(v_t) != len(f_t) or len(v_t) != len(d_t):
             raise ValueError("verts_list, faces_list, and diameters_list length mismatch")
         counts.append(len(v_t))
@@ -911,8 +911,8 @@ def _build_model_points_from_batch(
     for b, k in enumerate(counts):
         if k > 0:
             model_points[b, :k] = pts_all[idx : idx + k]
-            diameters[b, :k] = torch.stack(diameters_all[idx : idx + k]).to(
-                device=device, dtype=pts_all.dtype
+            diameters[b, :k] = torch.as_tensor(
+                diameters_all[idx : idx + k], device=device, dtype=pts_all.dtype
             )
         idx += k
     return model_points, diameters
@@ -1374,7 +1374,9 @@ def train_one_epoch(
                 min_px=10,
                 min_wsum=1e-6,
             )
-            valid_inst = v_pred & v_gt & valid_k_inst
+            image_size = (stereo.shape[-2], stereo.shape[-1])
+            origin_in = _origin_in_image_from_t(t_gt, left_k[:, 0], image_size)
+            valid_inst = v_pred & v_gt & valid_k_inst & origin_in
             if valid_inst.any():
                 t_diff = t_pred - t_gt
                 t_l2 = torch.sqrt((t_diff * t_diff).sum(dim=-1) + 1e-6)
@@ -1618,7 +1620,9 @@ def validate(
             min_px=10,
             min_wsum=1e-6,
         )
-        valid_inst = v_pred & v_gt & valid_k_inst
+        image_size = (stereo.shape[-2], stereo.shape[-1])
+        origin_in = _origin_in_image_from_t(t_gt, left_k[:, 0], image_size)
+        valid_inst = v_pred & v_gt & valid_k_inst & origin_in
         if valid_inst.any():
             t_diff = t_pred - t_gt
             t_l2 = torch.sqrt((t_diff * t_diff).sum(dim=-1) + 1e-6)
