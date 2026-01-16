@@ -1,5 +1,5 @@
 """Panoptic stereo model with disparity + multi-task heads."""
-
+import math
 from typing import Dict, Callable, List, Union, Tuple, Optional
 
 import torch
@@ -178,7 +178,7 @@ class LiteFPNMultiTaskHeadWithAffEmb(nn.Module):
 
 
 class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
-    """LiteFPN-style multi-task head without hidden input, with aff/emb outputs."""
+    """LiteFPN-style multi-task head with U-Net pyramid and aff/emb outputs."""
 
     def __init__(
         self,
@@ -189,8 +189,8 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         rot_repr: str = "r6d",
         out_pos_scale: float = 1.0,
         emb_dim: int = 8,
-        head_c4: int = 160,
-        head_c8: int = 192,
+        head_base_ch: int = 96,
+        head_ch_scale: float = 1.35,
         head_fuse_ch: int = 224,
         head_geo_ch: int = 160,
         head_sem_ch: int = 128,
@@ -201,31 +201,43 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         self.rot_repr = rot_repr.lower()
 
         in_ch = ctx_ch + 1 + 3
-        c4, c8 = int(head_c4), int(head_c8)
+        base_ch = int(head_base_ch)
+        ch_scale = float(head_ch_scale)
         fuse_ch = int(head_fuse_ch)
         geo_ch = int(head_geo_ch)
         sem_ch = int(head_sem_ch)
         inst_ch = int(head_inst_ch)
 
-        self.enc4 = ConvBlock(in_ch, c4, norm_layer)
-        self.down4 = Bottleneck(c4, c4 // 2, c8, norm_layer, s=2)
-        self.enc8 = Bottleneck(c8, c8 // 2, c8, norm_layer, s=1)
-        self.bridge = ASPPLite(c8, norm_layer)
+        def scaled_ch(level: int) -> int:
+            """Compute stage channels from base and scale."""
+            return max(8, int(round(base_ch * (ch_scale ** level))))
 
-        if use_pixelshuffle:
-            self.up = nn.Sequential(
-                nn.Conv2d(c8, c8 * 4, 3, padding=1, bias=False),
-                nn.PixelShuffle(2),
-                nn.SiLU(True),
-            )
-        else:
-            self.up = nn.Sequential(
-                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                conv3x3(c8, c8),
-                norm_layer(c8),
-                nn.SiLU(True),
-            )
-        self.fuse4 = ConvBlock(c8 + c4, fuse_ch, norm_layer)
+        c1 = scaled_ch(0)
+        c2 = scaled_ch(1)
+        c3 = scaled_ch(2)
+        c4 = scaled_ch(3)
+        c5 = scaled_ch(4)
+        c6 = scaled_ch(5)
+
+        self.enc1 = ConvBlock(in_ch, c1, norm_layer)
+        self.down1 = Bottleneck(c1, c1 // 2, c2, norm_layer, s=2)
+        self.down2 = Bottleneck(c2, c2 // 2, c3, norm_layer, s=2)
+        self.down3 = Bottleneck(c3, c3 // 2, c4, norm_layer, s=2)
+        self.down4 = Bottleneck(c4, c4 // 2, c5, norm_layer, s=2)
+        self.down5 = Bottleneck(c5, c5 // 2, c6, norm_layer, s=2)
+
+        self.bridge = ASPPLite(c6, norm_layer)
+
+        self.up5 = self.make_up(c6, c5, norm_layer)
+        self.dec5 = ConvBlock(c5 + c5, c5, norm_layer)
+        self.up4 = self.make_up(c5, c4, norm_layer)
+        self.dec4 = ConvBlock(c4 + c4, c4, norm_layer)
+        self.up3 = self.make_up(c4, c3, norm_layer)
+        self.dec3 = ConvBlock(c3 + c3, c3, norm_layer)
+        self.up2 = self.make_up(c3, c2, norm_layer)
+        self.dec2 = ConvBlock(c2 + c2, c2, norm_layer)
+        self.up1 = self.make_up(c2, c1, norm_layer)
+        self.dec1 = ConvBlock(c1 + c1, fuse_ch, norm_layer)
 
         rot_ch = 6 if self.rot_repr == "r6d" else 3
         self.neck_geo = self.make_neck(fuse_ch, geo_ch, norm_layer)
@@ -237,6 +249,21 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         self.head_cls = nn.Conv2d(sem_ch, num_classes, 1)
         self.affemb_head = AffEmbHead(inst_ch, emb_dim, norm_layer)
         self.out_pos_scale = out_pos_scale
+
+    def make_up(self, in_ch: int, out_ch: int, norm_layer: Callable[[int], nn.Module]) -> nn.Module:
+        """Create a 2x upsampling block with optional pixel shuffle."""
+        if self.use_pixelshuffle:
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch * 4, 3, padding=1, bias=False),
+                nn.PixelShuffle(2),
+                nn.SiLU(True),
+            )
+        return nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            conv3x3(in_ch, out_ch),
+            norm_layer(out_ch),
+            nn.SiLU(True),
+        )
 
     def make_neck(self, in_ch: int, mid_ch: int, norm_layer: Callable[[int], nn.Module]) -> nn.Module:
         """Create lightweight convolutional neck for head branches."""
@@ -264,11 +291,39 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Run FPN-style head on full resolution features."""
         x4_in = torch.cat((ctx_1x, mask_1x, point_map_1x), dim=1)
-        x4 = self.enc4(x4_in)
-        x8 = self.enc8(self.down4(x4))
-        x8 = self.bridge(x8)
-        x4u = self.up(x8)
-        x = self.fuse4(torch.cat((x4u, x4), dim=1))
+        e1 = self.enc1(x4_in)
+        e2 = self.down1(e1)
+        e3 = self.down2(e2)
+        e4 = self.down3(e3)
+        e5 = self.down4(e4)
+        e6 = self.down5(e5)
+
+        b = self.bridge(e6)
+
+        u5 = self.up5(b)
+        if u5.shape[-2:] != e5.shape[-2:]:
+            u5 = F.interpolate(u5, size=e5.shape[-2:], mode="bilinear", align_corners=False)
+        d5 = self.dec5(torch.cat((u5, e5), dim=1))
+
+        u4 = self.up4(d5)
+        if u4.shape[-2:] != e4.shape[-2:]:
+            u4 = F.interpolate(u4, size=e4.shape[-2:], mode="bilinear", align_corners=False)
+        d4 = self.dec4(torch.cat((u4, e4), dim=1))
+
+        u3 = self.up3(d4)
+        if u3.shape[-2:] != e3.shape[-2:]:
+            u3 = F.interpolate(u3, size=e3.shape[-2:], mode="bilinear", align_corners=False)
+        d3 = self.dec3(torch.cat((u3, e3), dim=1))
+
+        u2 = self.up2(d3)
+        if u2.shape[-2:] != e2.shape[-2:]:
+            u2 = F.interpolate(u2, size=e2.shape[-2:], mode="bilinear", align_corners=False)
+        d2 = self.dec2(torch.cat((u2, e2), dim=1))
+
+        u1 = self.up1(d2)
+        if u1.shape[-2:] != e1.shape[-2:]:
+            u1 = F.interpolate(u1, size=e1.shape[-2:], mode="bilinear", align_corners=False)
+        x = self.dec1(torch.cat((u1, e1), dim=1))
         x_geo = self.neck_geo(x)
         x_sem = self.neck_sem(x)
         x_inst = self.neck_inst(x)
@@ -417,14 +472,14 @@ class ContextUNet14Up(nn.Module):
 class ConvexUpsampler(nn.Module):
     """RAFT-style convex upsampling for arbitrary channels."""
 
-    def __init__(self, hidden_ch: int, up_factor: int = 4, groups: int = 16) -> None:
+    def __init__(self, context_ch: int, up_factor: int = 4, groups: int = 16) -> None:
         super().__init__()
         self.s = int(up_factor)
         self.mask_head = nn.Sequential(
-            conv3x3(hidden_ch, hidden_ch),
-            nn.GroupNorm(groups, hidden_ch),
+            conv3x3(context_ch, context_ch),
+            nn.GroupNorm(groups, context_ch),
             nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_ch, 9 * (self.s * self.s), kernel_size=1, bias=True),
+            nn.Conv2d(context_ch, 9 * (self.s * self.s), kernel_size=1, bias=True),
         )
 
     def forward(self, x: torch.Tensor, h: torch.Tensor, scale_factor: float = 1.0) -> torch.Tensor:
@@ -458,8 +513,8 @@ class PanopticStereoMultiHead(nn.Module):
         rot_repr: str = "r6d",
         emb_dim: int = 16,
         use_dummy_head: bool = False,
-        head_c4: int = 160,
-        head_c8: int = 192,
+        head_base_ch: int = 96,
+        head_ch_scale: float = 1.35,
         head_fuse_ch: int = 224,
         head_geo_ch: int = 160,
         head_sem_ch: int = 128,
@@ -470,6 +525,9 @@ class PanopticStereoMultiHead(nn.Module):
         self.lookup_mode = lookup_mode.lower()
         self.hidden_ch = int(hidden_ch)
         self.context_ch = int(context_ch)
+        if self.context_ch % 16 != 0:
+            raise ValueError("context_ch must be divisible by 16 to build context_1x")
+        self.context_1x_ch = self.context_ch // 16
 
         if self.lookup_mode == "1d":
             self.radius_w = radius_w
@@ -497,7 +555,7 @@ class PanopticStereoMultiHead(nn.Module):
         self.context = ContextUNet14Up(
             norm_layer=norm_layer,
             out_ch_1_4=context_ch + hidden_ch,
-            out_ch_1x=context_ch,
+            out_ch_1x=self.context_1x_ch,
             use_aspp=use_ctx_aspp,
         )
         self.update = UpdateBlock(
@@ -513,18 +571,25 @@ class PanopticStereoMultiHead(nn.Module):
             self.pose_head = LiteFPNMultiTaskHeadNoHiddenWithAffEmb(
                 norm_layer=norm_layer,
                 num_classes=num_classes,
-                ctx_ch=context_ch,
+                ctx_ch=self.context_1x_ch,
                 use_pixelshuffle=True,
                 rot_repr=rot_repr,
                 emb_dim=emb_dim,
-                head_c4=head_c4,
-                head_c8=head_c8,
+                head_base_ch=head_base_ch,
+                head_ch_scale=head_ch_scale,
                 head_fuse_ch=head_fuse_ch,
                 head_geo_ch=head_geo_ch,
                 head_sem_ch=head_sem_ch,
                 head_inst_ch=head_inst_ch,
             )
-        self.upsampler = ConvexUpsampler(hidden_ch=context_ch, up_factor=4, groups=16)
+        self.upsampler = ConvexUpsampler(context_ch=context_ch, up_factor=4, groups=16)
+        self.use_ctx1x_for_upsample = True
+        up_guidance_in_ch = self.context_ch + (self.context_1x_ch * 16)
+        self.up_guidance_fuse = nn.Sequential(
+            nn.Conv2d(up_guidance_in_ch, context_ch, kernel_size=1, bias=False),
+            nn.GroupNorm(16, context_ch),
+            nn.SiLU(inplace=True),
+        )
 
     def extract(self, stereo: torch.Tensor) -> Dict[str, torch.Tensor]:
         assert stereo.size(1) == 6
@@ -591,8 +656,18 @@ class PanopticStereoMultiHead(nn.Module):
             eps=1e-6,
         )
         depth_1_4 = point_map_cur[:, 2:3]
-        disp_1x = self.upsampler(disp_preds[-1], context0, scale_factor=4.0)
-        disp_log_var_1x = self.upsampler(disp_log_var_preds[-1], context0, scale_factor=1.0)
+        if self.use_ctx1x_for_upsample:
+            ctx1x = stuff["context_1x"]  # (B, context_ch/16, H4*4, W4*4)
+            # (B, context_ch, H4, W4)
+            ctx1x_s2d = F.pixel_unshuffle(ctx1x, 4)
+            # fuse (B, context_ch + context_ch, H4, W4) -> (B, context_ch, H4, W4)
+            h_up = self.up_guidance_fuse(torch.cat([context0, ctx1x_s2d], dim=1))
+        else:
+            h_up = context0
+
+        # use fused guidance for convex upsampling mask
+        disp_1x = self.upsampler(disp_preds[-1], h_up, scale_factor=4.0)
+        disp_log_var_1x = self.upsampler(disp_log_var_preds[-1], h_up, scale_factor=1.0) + (2.0 * math.log(4.0))
         point_map_1x, _, point_map_conf_1x = disparity_to_pointmap_from_Kpair_with_conf(
             disp_1x,
             disp_log_var_1x,

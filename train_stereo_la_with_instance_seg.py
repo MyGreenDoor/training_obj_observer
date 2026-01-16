@@ -209,6 +209,14 @@ def build_model(cfg: dict, num_classes: int) -> nn.Module:
     """Build the panoptic stereo model."""
     mcfg = cfg.get("model", {})
     seg_cfg = cfg.get("seg_head", {}) or {}
+    head_base_ch = int(seg_cfg.get("head_base_ch", seg_cfg.get("head_c4", 96)))
+    if "head_ch_scale" in seg_cfg:
+        head_ch_scale = float(seg_cfg.get("head_ch_scale", 1.35))
+    elif "head_c4" in seg_cfg and "head_c8" in seg_cfg and float(seg_cfg["head_c4"]) > 0.0:
+        head_ch_scale = float(seg_cfg["head_c8"]) / float(seg_cfg["head_c4"])
+    else:
+        head_ch_scale = 1.35
+
     return PanopticStereoMultiHead(
         levels=int(mcfg.get("levels", 4)),
         norm_layer=make_gn(16),
@@ -223,8 +231,8 @@ def build_model(cfg: dict, num_classes: int) -> nn.Module:
         rot_repr=str(mcfg.get("rot_repr", "r6d")),
         emb_dim=int(seg_cfg.get("emb_dim", 16)),
         use_dummy_head=bool(seg_cfg.get("use_dummy_head", False)),
-        head_c4=int(seg_cfg.get("head_c4", 80)),
-        head_c8=int(seg_cfg.get("head_c8", 112)),
+        head_base_ch=head_base_ch,
+        head_ch_scale=head_ch_scale,
         head_fuse_ch=int(seg_cfg.get("head_fuse_ch", 160)),
         head_geo_ch=int(seg_cfg.get("head_geo_ch", 112)),
         head_sem_ch=int(seg_cfg.get("head_sem_ch", 80)),
@@ -269,8 +277,8 @@ def _prepare_pose_targets(
     rot_map = F.interpolate(rot_map.flatten(1, 2), size=size_hw, mode="nearest")
     rot_map = rot_map.view(rot_map.size(0), 3, 3, size_hw[0], size_hw[1])
 
-    sem_mask_1_4 = _downsample_label(sem_gt, size_hw) > 0
-    sem_mask_1_4 = sem_mask_1_4.unsqueeze(1)
+    sem_mask_hw = _downsample_label(sem_gt, size_hw) > 0
+    sem_mask_hw = sem_mask_hw.unsqueeze(1)
     objs_in_left_list: List[torch.Tensor] = []
     B = len(batch["objs_in_left"])
     counts: List[int] = []
@@ -287,32 +295,124 @@ def _prepare_pose_targets(
         valid_k[b, :k] = True
         objs_in_left[b, :k] = objs_in_left_list[st_k: st_k + k]
         st_k += counts[b]
-    return pos_map, rot_map, sem_mask_1_4, objs_in_left
+    return pos_map, rot_map, sem_mask_hw, objs_in_left
 
 
-def _build_affinity_targets(inst_1_4: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def _compute_pose_losses_and_metrics(
+    pred: Dict[str, torch.Tensor],
+    batch: Dict[str, Any],
+    sem_gt: torch.Tensor,
+    size_hw: Tuple[int, int],
+    left_k: torch.Tensor,
+    wks_inst: torch.Tensor,
+    wfg_inst: torch.Tensor,
+    valid_k_inst: torch.Tensor,
+    image_size: Tuple[int, int],
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Compute pose losses and pose-related metrics."""
+    pos_gt_map, rot_gt_map, pose_mask, _ = _prepare_pose_targets(batch, sem_gt, size_hw, device)
+    gt_pos_mu_map = loss_functions._pos_mu_gt_from_t_map(pos_gt_map, left_k[:, 0], downsample=1, use_logz=True)
+    loss_pos = loss_functions.pos_loss_hetero_map(
+        pred["pos_mu_norm"],
+        pred["pos_logvar_norm"],
+        gt_pos_mu_map,
+        pose_mask,
+    )
+    loss_rot = loss_functions.rotation_loss_hetero_map(
+        pred["rot_mat"],
+        rot_gt_map,
+        pred["rot_logvar_theta"],
+        pose_mask,
+    )
+    rot_deg_map = _rot_geodesic_map_deg(pred["rot_mat"], rot_gt_map).unsqueeze(1)
+    rot_map_deg = (rot_deg_map * pose_mask.to(rot_deg_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
+    pos_map_pred = pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
+    pos_diff = pos_map_pred - pos_gt_map
+    pos_l2_map = torch.sqrt((pos_diff * pos_diff).sum(dim=1, keepdim=True) + 1e-6)
+    pos_map_l2 = (pos_l2_map * pose_mask.to(pos_l2_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
+    r_pred = pred.get("pose_R")
+    t_pred = pred.get("pose_t")
+    v_pred = pred.get("pose_valid")
+    r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
+        rot_map=rot_gt_map,
+        pos_map=pos_gt_map,
+        Wk_1_4=wks_inst,
+        wfg=wfg_inst,
+        min_px=10,
+        min_wsum=1e-6,
+    )
+    origin_in = _origin_in_image_from_t(t_gt, left_k[:, 0], image_size)
+    valid_inst = v_pred & v_gt & valid_k_inst & origin_in
+    if valid_inst.any():
+        t_diff = t_pred - t_gt
+        t_l2 = torch.sqrt((t_diff * t_diff).sum(dim=-1) + 1e-6)
+        pos_inst_l2 = (t_l2 * valid_inst.to(t_l2.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
+        r_deg = _rot_geodesic_deg(r_pred, r_gt)
+        rot_inst_deg = (r_deg * valid_inst.to(r_deg.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
+    else:
+        pos_inst_l2 = pos_map_l2.new_tensor(0.0)
+        rot_inst_deg = pos_map_l2.new_tensor(0.0)
+
+    model_points, _ = _build_model_points_from_batch(batch, device)
+    if model_points is not None and valid_inst.any():
+        adds = _adds_core_from_Rt_no_norm(
+            r_pred,
+            t_pred,
+            r_gt,
+            t_gt,
+            model_points,
+            use_symmetric=True,
+            valid_mask=valid_inst,
+        )
+        add = _adds_core_from_Rt_no_norm(
+            r_pred,
+            t_pred,
+            r_gt,
+            t_gt,
+            model_points,
+            use_symmetric=False,
+            valid_mask=valid_inst,
+        )
+    else:
+        adds = pos_map_l2.new_tensor(0.0)
+        add = pos_map_l2.new_tensor(0.0)
+
+    return {
+        "loss_pos": loss_pos,
+        "loss_rot": loss_rot,
+        "rot_map_deg": rot_map_deg,
+        "pos_map_l2": pos_map_l2,
+        "pos_inst_l2": pos_inst_l2,
+        "rot_inst_deg": rot_inst_deg,
+        "adds": adds,
+        "add": add,
+    }
+
+
+def _build_affinity_targets(inst_hw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build affinity targets and valid masks from instance IDs."""
-    B, H, W = inst_1_4.shape
-    tgt = torch.zeros((B, 4, H, W), device=inst_1_4.device, dtype=torch.float32)
+    B, H, W = inst_hw.shape
+    tgt = torch.zeros((B, 4, H, W), device=inst_hw.device, dtype=torch.float32)
     valid = torch.zeros_like(tgt, dtype=torch.bool)
 
-    same = inst_1_4[:, :, :-1] == inst_1_4[:, :, 1:]
-    both_fg = (inst_1_4[:, :, :-1] > 0) & (inst_1_4[:, :, 1:] > 0)
+    same = inst_hw[:, :, :-1] == inst_hw[:, :, 1:]
+    both_fg = (inst_hw[:, :, :-1] > 0) & (inst_hw[:, :, 1:] > 0)
     tgt[:, 0, :, :-1] = same.float()
     valid[:, 0, :, :-1] = both_fg
 
-    same = inst_1_4[:, :, 1:] == inst_1_4[:, :, :-1]
-    both_fg = (inst_1_4[:, :, 1:] > 0) & (inst_1_4[:, :, :-1] > 0)
+    same = inst_hw[:, :, 1:] == inst_hw[:, :, :-1]
+    both_fg = (inst_hw[:, :, 1:] > 0) & (inst_hw[:, :, :-1] > 0)
     tgt[:, 1, :, 1:] = same.float()
     valid[:, 1, :, 1:] = both_fg
 
-    same = inst_1_4[:, :-1, :] == inst_1_4[:, 1:, :]
-    both_fg = (inst_1_4[:, :-1, :] > 0) & (inst_1_4[:, 1:, :] > 0)
+    same = inst_hw[:, :-1, :] == inst_hw[:, 1:, :]
+    both_fg = (inst_hw[:, :-1, :] > 0) & (inst_hw[:, 1:, :] > 0)
     tgt[:, 2, :-1, :] = same.float()
     valid[:, 2, :-1, :] = both_fg
 
-    same = inst_1_4[:, 1:, :] == inst_1_4[:, :-1, :]
-    both_fg = (inst_1_4[:, 1:, :] > 0) & (inst_1_4[:, :-1, :] > 0)
+    same = inst_hw[:, 1:, :] == inst_hw[:, :-1, :]
+    both_fg = (inst_hw[:, 1:, :] > 0) & (inst_hw[:, :-1, :] > 0)
     tgt[:, 3, 1:, :] = same.float()
     valid[:, 3, 1:, :] = both_fg
 
@@ -380,7 +480,7 @@ def _sample_indices_per_instance(
 
 def embedding_cosface_sampled(
     emb: torch.Tensor,                 # (B,C,H,W)
-    inst_1_4: torch.Tensor,            # (B,H,W) int, bg=0
+    inst_hw: torch.Tensor,             # (B,H,W) int, bg=0
     max_per_inst: int = 64,
     margin: float = 0.25,              # CosFace m
     scale: float = 32.0,               # CosFace s
@@ -396,16 +496,16 @@ def embedding_cosface_sampled(
 
     Returns: (loss, num_samples)
     """
-    assert emb.dim() == 4 and inst_1_4.dim() == 3
+    assert emb.dim() == 4 and inst_hw.dim() == 3
     B, C, H, W = emb.shape
-    assert inst_1_4.shape[0] == B and inst_1_4.shape[1] == H and inst_1_4.shape[2] == W
+    assert inst_hw.shape[0] == B and inst_hw.shape[1] == H and inst_hw.shape[2] == W
 
     emb_n = F.normalize(emb, dim=1, eps=1e-6)
     loss_sum = emb.new_tensor(0.0)
     n_sum = emb.new_tensor(0.0)
 
     for b in range(B):
-        inst = inst_1_4[b]
+        inst = inst_hw[b]
         inst_flat = inst.reshape(-1).long()
 
         # fg indices & per-instance mapping (inv)
@@ -555,13 +655,13 @@ def _infer_instance_from_heads(
     emb: torch.Tensor,
     tau_high: float,
     # embedding merge
-    tau_emb_merge: float = 0.85,  # NOTE: emb_merge_metric="cos" のときは cosine類似度しきい値（大きいほど厳しい）
+    tau_emb_merge: float = 0.85,  # NOTE: emb_merge_metric="cos" uses cosine similarity threshold
     emb_merge_iters: int = 1,
     emb_merge_metric: Literal["cos", "l2"] = "cos",
-    emb_merge_small_area: Optional[int] = None,  # 例: 4 or 9; Noneならサイズ制限なし
+    emb_merge_small_area: Optional[int] = None,
     # semantic
     use_gt_semantic: bool = False,
-    semantic_gt_1_4: Optional[torch.Tensor] = None,
+    semantic_gt_hw: Optional[torch.Tensor] = None,
     union_same_semantic_only: bool = True,
     eps: float = 1e-6,
 ) -> List[np.ndarray]:
@@ -586,8 +686,8 @@ def _infer_instance_from_heads(
     """
     # semantic prediction
     sem_pred = sem_logits.argmax(dim=1)
-    if use_gt_semantic and semantic_gt_1_4 is not None:
-        sem_pred = semantic_gt_1_4
+    if use_gt_semantic and semantic_gt_hw is not None:
+        sem_pred = semantic_gt_hw
 
     # CPU numpy once
     sem_np = sem_pred.detach().cpu().numpy()                       # (B,H,W) int
@@ -794,7 +894,7 @@ def _log_segmentation_visuals(
     instance_gt = instance_gt[:n_images]
 
     size_hw = sem_logits.shape[-2:]
-    sem_gt_1_4 = _downsample_label(semantic_gt, size_hw)
+    sem_gt_hw = _downsample_label(semantic_gt, size_hw)
 
     inst_pred = _infer_instance_from_heads(
         sem_logits,
@@ -804,17 +904,17 @@ def _log_segmentation_visuals(
         tau_emb_merge=float(cfg.get("instance", {}).get("tau_emb_merge", 0.6)),
         emb_merge_iters=int(cfg.get("instance", {}).get("emb_merge_iters", 1)),
         use_gt_semantic=bool(cfg.get("instance", {}).get("use_gt_semantic", False)),
-        semantic_gt_1_4=sem_gt_1_4,
+        semantic_gt_hw=sem_gt_hw,
     )
 
     num_classes = int(cfg.get("data", {}).get("n_classes", sem_logits.shape[1]))
     sem_pred = sem_logits.argmax(dim=1)
     sem_pred_color = _colorize_semantic(sem_pred, num_classes).float() / 255.0
-    sem_gt_color = _colorize_semantic(sem_gt_1_4, num_classes).float() / 255.0
+    sem_gt_color = _colorize_semantic(sem_gt_hw, num_classes).float() / 255.0
 
     inst_pred_color = torch.stack([_colorize_instance_ids(inst) for inst in inst_pred], dim=0).float() / 255.0
-    inst_gt_1_4 = _downsample_label(instance_gt, size_hw).cpu().numpy()
-    inst_gt_color = torch.stack([_colorize_instance_ids(inst) for inst in inst_gt_1_4], dim=0).float() / 255.0
+    inst_gt_hw = _downsample_label(instance_gt, size_hw).cpu().numpy()
+    inst_gt_color = torch.stack([_colorize_instance_ids(inst) for inst in inst_gt_hw], dim=0).float() / 255.0
 
     grid_sem = vutils.make_grid(
         torch.cat([sem_pred_color, sem_gt_color], dim=0),
@@ -1086,8 +1186,8 @@ def _log_pose_visuals(
         return
 
     size_hw = pred["pos_mu"].shape[-2:]
-    inst_1x = _downsample_label(inst_gt, size_hw)
-    wks, wfg = _build_instance_weight_map(inst_1x, valid_k)
+    inst_hw = _downsample_label(inst_gt, size_hw)
+    wks, wfg = _build_instance_weight_map(inst_hw, valid_k)
 
     pos_map_pred = pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
     r_pred, t_pred, v_pred, _, _ = rot_utils.pose_from_maps_auto(
@@ -1305,9 +1405,9 @@ def train_one_epoch(
         inst_gt = batch["instance_seg"].to(device, non_blocking=True)
 
         size_hw = stereo.shape[-2:]
-        inst_gt_1_4 = _downsample_label(inst_gt, size_hw)
-        valid_k_inst = _build_valid_k_from_inst(inst_gt_1_4)
-        wks_inst, wfg_inst = _build_instance_weight_map(inst_gt_1_4, valid_k_inst)
+        inst_gt_hw = _downsample_label(inst_gt, size_hw)
+        valid_k_inst = _build_valid_k_from_inst(inst_gt_hw)
+        wks_inst, wfg_inst = _build_instance_weight_map(inst_gt_hw, valid_k_inst)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=cfg["train"]["amp"]):
@@ -1337,81 +1437,32 @@ def train_one_epoch(
             )
 
             size_hw = pred["sem_logits"].shape[-2:]
-            sem_gt_1_4 = _downsample_label(sem_gt, size_hw)
-            loss_cls = loss_functions.classification_loss(pred["cls_logits"], sem_gt_1_4, use_focal=False)
+            sem_gt_hw = _downsample_label(sem_gt, size_hw)
+            loss_cls = loss_functions.classification_loss(pred["cls_logits"], sem_gt_hw, use_focal=False)
             loss_sem = loss_cls
 
-            pos_gt_map, rot_gt_map, pose_mask, objs_in_left = _prepare_pose_targets(batch, sem_gt, size_hw, device)
-            gt_pos_mu_map = loss_functions._pos_mu_gt_from_t_map(
-                pos_gt_map, left_k[:, 0], downsample=1, use_logz=True
+            pose_out = _compute_pose_losses_and_metrics(
+                pred=pred,
+                batch=batch,
+                sem_gt=sem_gt,
+                size_hw=size_hw,
+                left_k=left_k,
+                wks_inst=wks_inst,
+                wfg_inst=wfg_inst,
+                valid_k_inst=valid_k_inst,
+                image_size=(stereo.shape[-2], stereo.shape[-1]),
+                device=device,
             )
-            loss_pos = loss_functions.pos_loss_hetero_map(
-                pred["pos_mu_norm"],
-                pred["pos_logvar_norm"],
-                gt_pos_mu_map,
-                pose_mask,
-            )
-            loss_rot = loss_functions.rotation_loss_hetero_map(
-                pred["rot_mat"],
-                rot_gt_map,
-                pred["rot_logvar_theta"],
-                pose_mask,
-            )
-            rot_deg_map = _rot_geodesic_map_deg(pred["rot_mat"], rot_gt_map).unsqueeze(1)
-            rot_map_deg = (rot_deg_map * pose_mask.to(rot_deg_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
-            pos_map_pred = pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
-            pos_diff = pos_map_pred - pos_gt_map
-            pos_l2_map = torch.sqrt((pos_diff * pos_diff).sum(dim=1, keepdim=True) + 1e-6)
-            pos_map_l2 = (pos_l2_map * pose_mask.to(pos_l2_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
-            r_pred = pred.get("pose_R")
-            t_pred = pred.get("pose_t")
-            v_pred = pred.get("pose_valid")
-            r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
-                rot_map=rot_gt_map,
-                pos_map=pos_gt_map,
-                Wk_1_4=wks_inst,
-                wfg=wfg_inst,
-                min_px=10,
-                min_wsum=1e-6,
-            )
-            image_size = (stereo.shape[-2], stereo.shape[-1])
-            origin_in = _origin_in_image_from_t(t_gt, left_k[:, 0], image_size)
-            valid_inst = v_pred & v_gt & valid_k_inst & origin_in
-            if valid_inst.any():
-                t_diff = t_pred - t_gt
-                t_l2 = torch.sqrt((t_diff * t_diff).sum(dim=-1) + 1e-6)
-                pos_inst_l2 = (t_l2 * valid_inst.to(t_l2.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
-                r_deg = _rot_geodesic_deg(r_pred, r_gt)
-                rot_inst_deg = (r_deg * valid_inst.to(r_deg.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
-            else:
-                pos_inst_l2 = pos_map_l2.new_tensor(0.0)
-                rot_inst_deg = pos_map_l2.new_tensor(0.0)
+            loss_pos = pose_out["loss_pos"]
+            loss_rot = pose_out["loss_rot"]
+            rot_map_deg = pose_out["rot_map_deg"]
+            pos_map_l2 = pose_out["pos_map_l2"]
+            pos_inst_l2 = pose_out["pos_inst_l2"]
+            rot_inst_deg = pose_out["rot_inst_deg"]
+            adds = pose_out["adds"]
+            add = pose_out["add"]
 
-            model_points, _ = _build_model_points_from_batch(batch, device)
-            if model_points is not None and valid_inst.any():
-                adds = _adds_core_from_Rt_no_norm(
-                    r_pred,
-                    t_pred,
-                    r_gt,
-                    t_gt,
-                    model_points,
-                    use_symmetric=True,
-                    valid_mask=valid_inst,
-                )
-                add = _adds_core_from_Rt_no_norm(
-                    r_pred,
-                    t_pred,
-                    r_gt,
-                    t_gt,
-                    model_points,
-                    use_symmetric=False,
-                    valid_mask=valid_inst,
-                )
-            else:
-                adds = pos_map_l2.new_tensor(0.0)
-                add = pos_map_l2.new_tensor(0.0)
-
-            aff_tgt, aff_valid = _build_affinity_targets(inst_gt_1_4)
+            aff_tgt, aff_valid = _build_affinity_targets(inst_gt_hw)
             loss_aff, aff_valid_px = _affinity_loss(
                 pred["aff_logits"],
                 aff_tgt,
@@ -1420,7 +1471,7 @@ def train_one_epoch(
             )
             loss_emb, emb_pairs = embedding_cosface_sampled(
                 pred["emb"],
-                inst_gt_1_4,    
+                inst_gt_hw,
                 max_per_inst=int(cfg.get("loss", {}).get("emb_max_per_inst", 64)),
                 margin=float(cfg.get("loss", {}).get("emb_margin", 0.25)),
                 scale=32.0,
@@ -1553,9 +1604,9 @@ def validate(
         inst_gt = batch["instance_seg"].to(device, non_blocking=True)
 
         size_hw = stereo.shape[-2:]
-        inst_gt_1_4 = _downsample_label(inst_gt, size_hw)
-        valid_k_inst = _build_valid_k_from_inst(inst_gt_1_4)
-        wks_inst, wfg_inst = _build_instance_weight_map(inst_gt_1_4, valid_k_inst)
+        inst_gt_hw = _downsample_label(inst_gt, size_hw)
+        valid_k_inst = _build_valid_k_from_inst(inst_gt_hw)
+        wks_inst, wfg_inst = _build_instance_weight_map(inst_gt_hw, valid_k_inst)
 
         pred = model(
             stereo,
@@ -1583,81 +1634,32 @@ def validate(
         )
 
         size_hw = pred["sem_logits"].shape[-2:]
-        sem_gt_1_4 = _downsample_label(sem_gt, size_hw)
-        loss_cls = loss_functions.classification_loss(pred["cls_logits"], sem_gt_1_4, use_focal=False)
+        sem_gt_hw = _downsample_label(sem_gt, size_hw)
+        loss_cls = loss_functions.classification_loss(pred["cls_logits"], sem_gt_hw, use_focal=False)
         loss_sem = loss_cls
 
-        pos_gt_map, rot_gt_map, pose_mask, objs_in_left = _prepare_pose_targets(batch, sem_gt, size_hw, device)
-        gt_pos_mu_map = loss_functions._pos_mu_gt_from_t_map(
-            pos_gt_map, left_k[:, 0], downsample=1, use_logz=True
+        pose_out = _compute_pose_losses_and_metrics(
+            pred=pred,
+            batch=batch,
+            sem_gt=sem_gt,
+            size_hw=size_hw,
+            left_k=left_k,
+            wks_inst=wks_inst,
+            wfg_inst=wfg_inst,
+            valid_k_inst=valid_k_inst,
+            image_size=(stereo.shape[-2], stereo.shape[-1]),
+            device=device,
         )
-        loss_pos = loss_functions.pos_loss_hetero_map(
-            pred["pos_mu_norm"],
-            pred["pos_logvar_norm"],
-            gt_pos_mu_map,
-            pose_mask,
-        )
-        loss_rot = loss_functions.rotation_loss_hetero_map(
-            pred["rot_mat"],
-            rot_gt_map,
-            pred["rot_logvar_theta"],
-            pose_mask,
-        )
-        rot_deg_map = _rot_geodesic_map_deg(pred["rot_mat"], rot_gt_map).unsqueeze(1)
-        rot_map_deg = (rot_deg_map * pose_mask.to(rot_deg_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
-        pos_map_pred = pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
-        pos_diff = pos_map_pred - pos_gt_map
-        pos_l2_map = torch.sqrt((pos_diff * pos_diff).sum(dim=1, keepdim=True) + 1e-6)
-        pos_map_l2 = (pos_l2_map * pose_mask.to(pos_l2_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
-        r_pred = pred.get("pose_R")
-        t_pred = pred.get("pose_t")
-        v_pred = pred.get("pose_valid")
-        r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
-            rot_map=rot_gt_map,
-            pos_map=pos_gt_map,
-            Wk_1_4=wks_inst,
-            wfg=wfg_inst,
-            min_px=10,
-            min_wsum=1e-6,
-        )
-        image_size = (stereo.shape[-2], stereo.shape[-1])
-        origin_in = _origin_in_image_from_t(t_gt, left_k[:, 0], image_size)
-        valid_inst = v_pred & v_gt & valid_k_inst & origin_in
-        if valid_inst.any():
-            t_diff = t_pred - t_gt
-            t_l2 = torch.sqrt((t_diff * t_diff).sum(dim=-1) + 1e-6)
-            pos_inst_l2 = (t_l2 * valid_inst.to(t_l2.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
-            r_deg = _rot_geodesic_deg(r_pred, r_gt)
-            rot_inst_deg = (r_deg * valid_inst.to(r_deg.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
-        else:
-            pos_inst_l2 = pos_map_l2.new_tensor(0.0)
-            rot_inst_deg = pos_map_l2.new_tensor(0.0)
+        loss_pos = pose_out["loss_pos"]
+        loss_rot = pose_out["loss_rot"]
+        rot_map_deg = pose_out["rot_map_deg"]
+        pos_map_l2 = pose_out["pos_map_l2"]
+        pos_inst_l2 = pose_out["pos_inst_l2"]
+        rot_inst_deg = pose_out["rot_inst_deg"]
+        adds = pose_out["adds"]
+        add = pose_out["add"]
 
-        model_points, _ = _build_model_points_from_batch(batch, device)
-        if model_points is not None and valid_inst.any():
-            adds = _adds_core_from_Rt_no_norm(
-                r_pred,
-                t_pred,
-                r_gt,
-                t_gt,
-                model_points,
-                use_symmetric=True,
-                valid_mask=valid_inst,
-            )
-            add = _adds_core_from_Rt_no_norm(
-                r_pred,
-                t_pred,
-                r_gt,
-                t_gt,
-                model_points,
-                use_symmetric=False,
-                valid_mask=valid_inst,
-            )
-        else:
-            adds = pos_map_l2.new_tensor(0.0)
-            add = pos_map_l2.new_tensor(0.0)
-
-        aff_tgt, aff_valid = _build_affinity_targets(inst_gt_1_4)
+        aff_tgt, aff_valid = _build_affinity_targets(inst_gt_hw)
         loss_aff, _ = _affinity_loss(
             pred["aff_logits"],
             aff_tgt,
@@ -1666,7 +1668,7 @@ def validate(
         )
         loss_emb, emb_pairs = embedding_cosface_sampled(
             pred["emb"],
-            inst_gt_1_4,    
+            inst_gt_hw,
             max_per_inst=int(cfg.get("loss", {}).get("emb_max_per_inst", 64)),
             margin=float(cfg.get("loss", {}).get("emb_margin", 0.25)),
             scale=32.0,
