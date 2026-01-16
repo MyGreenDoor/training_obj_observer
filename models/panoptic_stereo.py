@@ -189,7 +189,7 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         rot_repr: str = "r6d",
         out_pos_scale: float = 1.0,
         emb_dim: int = 8,
-        head_base_ch: int = 96,
+        head_base_ch: int = 112,
         head_ch_scale: float = 1.35,
         head_fuse_ch: int = 224,
         head_geo_ch: int = 160,
@@ -244,8 +244,11 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         self.neck_sem = self.make_neck(fuse_ch, sem_ch, norm_layer)
         self.neck_inst = self.make_neck(fuse_ch, inst_ch, norm_layer)
 
+        self.head_posz_pre = ConvBlock(geo_ch, geo_ch, norm_layer)
         self.head_posz = nn.Conv2d(geo_ch, 6, 3, padding=1)
+        self.head_rot_pre = ConvBlock(geo_ch, geo_ch, norm_layer)
         self.head_rot = nn.Conv2d(geo_ch, rot_ch + 1, 3, padding=1)
+        self.head_cls_pre = ConvBlock(sem_ch, sem_ch, norm_layer)
         self.head_cls = nn.Conv2d(sem_ch, num_classes, 1)
         self.affemb_head = AffEmbHead(inst_ch, emb_dim, norm_layer)
         self.out_pos_scale = out_pos_scale
@@ -328,9 +331,9 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         x_sem = self.neck_sem(x)
         x_inst = self.neck_inst(x)
 
-        out_posz = self.head_posz(x_geo)
-        out_rot = self.head_rot(x_geo)
-        cls_logits = self.head_cls(x_sem)
+        out_posz = self.head_posz(self.head_posz_pre(x_geo))
+        out_rot = self.head_rot(self.head_rot_pre(x_geo))
+        cls_logits = self.head_cls(self.head_cls_pre(x_sem))
 
         mu_raw = out_posz[:, 0:3]
         lv_raw = out_posz[:, 3:6]
@@ -513,7 +516,7 @@ class PanopticStereoMultiHead(nn.Module):
         rot_repr: str = "r6d",
         emb_dim: int = 16,
         use_dummy_head: bool = False,
-        head_base_ch: int = 96,
+        head_base_ch: int = 112,
         head_ch_scale: float = 1.35,
         head_fuse_ch: int = 224,
         head_geo_ch: int = 160,
@@ -525,9 +528,9 @@ class PanopticStereoMultiHead(nn.Module):
         self.lookup_mode = lookup_mode.lower()
         self.hidden_ch = int(hidden_ch)
         self.context_ch = int(context_ch)
-        if self.context_ch % 16 != 0:
-            raise ValueError("context_ch must be divisible by 16 to build context_1x")
-        self.context_1x_ch = self.context_ch // 16
+        if self.context_ch % 4 != 0:
+            raise ValueError("context_ch must be divisible by 4 to build context_1x")
+        self.context_1x_ch = self.context_ch // 4
 
         if self.lookup_mode == "1d":
             self.radius_w = radius_w

@@ -209,7 +209,7 @@ def build_model(cfg: dict, num_classes: int) -> nn.Module:
     """Build the panoptic stereo model."""
     mcfg = cfg.get("model", {})
     seg_cfg = cfg.get("seg_head", {}) or {}
-    head_base_ch = int(seg_cfg.get("head_base_ch", seg_cfg.get("head_c4", 96)))
+    head_base_ch = int(seg_cfg.get("head_base_ch", seg_cfg.get("head_c4", 112)))
     if "head_ch_scale" in seg_cfg:
         head_ch_scale = float(seg_cfg.get("head_ch_scale", 1.35))
     elif "head_c4" in seg_cfg and "head_c8" in seg_cfg and float(seg_cfg["head_c4"]) > 0.0:
@@ -1550,6 +1550,12 @@ def train_one_epoch(
                     inst_gt,
                     cfg,
                     n_images=min(4, stereo.size(0)),
+                )
+                pos_gt_map, rot_gt_map, _, objs_in_left = _prepare_pose_targets(
+                    batch,
+                    sem_gt,
+                    pred["sem_logits"].shape[-2:],
+                    device,
                 )
                 _log_pose_visuals(
                     writer,
