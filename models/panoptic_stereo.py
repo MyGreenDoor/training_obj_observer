@@ -671,7 +671,7 @@ def pos_mu_to_pointmap(
     K_left_1x: torch.Tensor,
     downsample: int = 4,
 ) -> torch.Tensor:
-    """Convert (dx, dy, logZ) or (Z) to an XYZ point map at 1/4 resolution."""
+    """Convert (dx, dy, Z) or (Z) to an XYZ point map at 1/4 resolution."""
     if pos_mu.size(1) == 1:
         K14 = K_left_1x.clone()
         K14[:, 0, 0] /= downsample
@@ -689,7 +689,7 @@ def pos_mu_to_pointmap(
 
     dx = pos_mu[:, 0:1]
     dy = pos_mu[:, 1:2]
-    z = torch.exp(pos_mu[:, 2:3])
+    z = pos_mu[:, 2:3]
 
     u = (torch.arange(W4, device=device, dtype=dtype) + 0.5) * float(downsample)
     v = (torch.arange(H4, device=device, dtype=dtype) + 0.5) * float(downsample)
