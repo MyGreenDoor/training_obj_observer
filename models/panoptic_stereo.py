@@ -1,6 +1,6 @@
 """Panoptic stereo model with disparity + multi-task heads."""
 
-from typing import Dict, Callable, List, Union, Tuple
+from typing import Dict, Callable, List, Union, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -550,7 +550,12 @@ class PanopticStereoMultiHead(nn.Module):
         K_pair_1x: torch.Tensor,
         baseline_mm: Union[float, torch.Tensor],
         iters: int = 8,
-        disp_init: torch.Tensor = None,
+        disp_init: Optional[torch.Tensor] = None,
+        *,
+        Wk_1_4: Optional[torch.Tensor] = None,
+        wfg_1_4: Optional[torch.Tensor] = None,
+        min_px: int = 10,
+        min_wsum: float = 1e-6,
     ) -> Dict[str, torch.Tensor]:
         stuff = self.extract(stereo)
         featL, featR = stuff["featL_1_4"], stuff["featR_1_4"]
@@ -608,6 +613,46 @@ class PanopticStereoMultiHead(nn.Module):
         pos_mu = denormalize_pos_mu(pos_mu_norm)
         pos_logvar = denormalize_pos_logvar(pos_logvar_norm, pos_mu_norm)
 
+        if torch.jit.is_scripting():
+            out = torch.jit.annotate(Dict[str, torch.Tensor], {})
+            out["featL_1_4"] = featL
+            out["featR_1_4"] = featR
+            out["hidden0"] = hidden
+            out["context0"] = context0
+            out["context_1x"] = stuff["context_1x"]
+            out["depth_1_4"] = depth_1_4
+            out["left_mask_1_4"] = point_map_conf
+            out["point_map_conf"] = point_map_conf
+            out["disp_1x"] = disp_1x
+            out["disp_log_var_1x"] = disp_log_var_1x
+            out["point_map_1x"] = point_map_1x
+            out["point_map_conf_1x"] = point_map_conf_1x
+            out["sem_logits"] = head_out["cls_logits"]
+            out["pos_mu"] = pos_mu
+            out["pos_logvar"] = pos_logvar
+            out["pos_mu_norm"] = pos_mu_norm
+            out["pos_logvar_norm"] = pos_logvar_norm
+            out["mask_logits"] = head_out["mask_logits"]
+            out["center_logits"] = head_out["center_logits"]
+            out["rot_mat"] = head_out["rot_mat"]
+            out["rot_logvar_theta"] = head_out["rot_logvar_theta"]
+            out["aff_logits"] = head_out["aff_logits"]
+            out["emb"] = head_out["emb"]
+            if Wk_1_4 is not None and wfg_1_4 is not None:
+                pos_map_pred = pos_mu_to_pointmap(pos_mu, K_pair_1x[:, 0], downsample=1)
+                r_pred, t_pred, v_pred, _, _ = rot_utils.pose_from_maps_auto(
+                    rot_map=head_out["rot_mat"],
+                    pos_map=pos_map_pred,
+                    Wk_1_4=Wk_1_4,
+                    wfg=wfg_1_4,
+                    min_px=min_px,
+                    min_wsum=min_wsum,
+                )
+                out["pose_R"] = r_pred
+                out["pose_t"] = t_pred
+                out["pose_valid"] = v_pred
+            return out
+
         out: Dict[str, torch.Tensor] = {
             **stuff,
             "disp_preds": disp_preds,
@@ -626,6 +671,20 @@ class PanopticStereoMultiHead(nn.Module):
             "pos_logvar_norm": pos_logvar_norm,
         }
         out.update({k: v for k, v in head_out.items() if k not in ("pos_mu", "pos_logvar")})
+
+        if Wk_1_4 is not None and wfg_1_4 is not None:
+            pos_map_pred = pos_mu_to_pointmap(pos_mu, K_pair_1x[:, 0], downsample=1)
+            r_pred, t_pred, v_pred, _, _ = rot_utils.pose_from_maps_auto(
+                rot_map=head_out["rot_mat"],
+                pos_map=pos_map_pred,
+                Wk_1_4=Wk_1_4,
+                wfg=wfg_1_4,
+                min_px=min_px,
+                min_wsum=min_wsum,
+            )
+            out["pose_R"] = r_pred
+            out["pose_t"] = t_pred
+            out["pose_valid"] = v_pred
         return out
 
 

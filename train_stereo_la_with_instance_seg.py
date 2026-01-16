@@ -35,6 +35,7 @@ from utils import dist_utils, rot_utils
 from utils.logging_utils import draw_axes_on_images_bk, visualize_mono_torch
 from utils.projection import SilhouetteDepthRenderer
 from pytorch3d.structures import Meshes
+from pytorch3d.ops import sample_points_from_meshes
 from losses import loss_functions
 
 import train_stereo_la as base
@@ -869,6 +870,96 @@ def _build_meshes_from_batch(batch: Dict[str, Any], device: torch.device) -> Tup
     return meshes_flat, valid_k
 
 
+def _build_model_points_from_batch(
+    batch: Dict[str, Any],
+    device: torch.device,
+    max_points: int = 2048,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Sample model points from meshes and pack into (B,K,N,3)."""
+    verts_list = batch.get("verts_list", None)
+    faces_list = batch.get("faces_list", None)
+    diameters_list = batch.get("diameters_list", None)
+    if verts_list is None or faces_list is None or diameters_list is None:
+        return None, None
+
+    verts_all: List[torch.Tensor] = []
+    faces_all: List[torch.Tensor] = []
+    diameters_all: List[torch.Tensor] = []
+    counts: List[int] = []
+    for vlist, flist, dlist in zip(verts_list, faces_list, diameters_list):
+        v_t = [torch.as_tensor(v).float() for v in vlist]
+        f_t = [torch.as_tensor(f).long() for f in flist]
+        d_t = [torch.as_tensor(d).float() for d in dlist]
+        if len(v_t) != len(f_t) or len(v_t) != len(d_t):
+            raise ValueError("verts_list, faces_list, and diameters_list length mismatch")
+        counts.append(len(v_t))
+        verts_all.extend(v_t)
+        faces_all.extend(f_t)
+        diameters_all.extend(d_t)
+
+    B = len(counts)
+    Kmax = max(counts) if counts else 0
+    if Kmax == 0:
+        return None, None
+
+    meshes_flat = Meshes(verts=verts_all, faces=faces_all).to(device)
+    pts_all = sample_points_from_meshes(meshes_flat, max_points)  # (sum_K, N, 3)
+
+    model_points = pts_all.new_zeros(B, Kmax, pts_all.size(1), 3)
+    diameters = pts_all.new_zeros(B, Kmax)
+    idx = 0
+    for b, k in enumerate(counts):
+        if k > 0:
+            model_points[b, :k] = pts_all[idx : idx + k]
+            diameters[b, :k] = torch.stack(diameters_all[idx : idx + k]).to(
+                device=device, dtype=pts_all.dtype
+            )
+        idx += k
+    return model_points, diameters
+
+
+def _adds_core_from_Rt_no_norm(
+    R_pred: torch.Tensor,
+    t_pred: torch.Tensor,
+    R_gt: torch.Tensor,
+    t_gt: torch.Tensor,
+    model_points: torch.Tensor,
+    *,
+    use_symmetric: bool = True,
+    max_points: int = 2048,
+    valid_mask: Optional[torch.Tensor] = None,
+    rot_only: bool = False,
+) -> torch.Tensor:
+    """Compute ADD/ADD-S without diameter normalization."""
+    device = R_pred.device
+    P = model_points if model_points.dim() == 4 else model_points.unsqueeze(1)
+    N = P.size(2)
+    if N > max_points:
+        idx = torch.arange(N, device=device)[:max_points]
+        P = P[:, :, idx, :]
+    if rot_only:
+        t_pred = t_gt
+
+    def _xfm(R: torch.Tensor, t: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
+        return (R @ Q.transpose(-1, -2)).transpose(-1, -2) + t.unsqueeze(2)
+
+    Xp = _xfm(R_pred.to(torch.float32), t_pred.to(torch.float32), P.to(torch.float32))
+    Xg = _xfm(R_gt.to(torch.float32), t_gt.to(torch.float32), P.to(torch.float32))
+
+    if use_symmetric:
+        D = torch.cdist(Xp, Xg, p=2)
+        d1 = D.min(dim=3).values.mean(dim=2)
+        d2 = D.min(dim=2).values.mean(dim=2)
+        d = torch.minimum(d1, d2)
+    else:
+        d = (Xp - Xg).norm(dim=-1).mean(dim=-1)
+
+    if valid_mask is not None:
+        v = valid_mask.to(d.dtype)
+        return (d * v).sum() / v.sum().clamp_min(1.0)
+    return d.mean()
+
+
 def _build_meshes_from_batch_filtered(
     batch: Dict[str, Any],
     valid_keep: torch.Tensor,
@@ -908,6 +999,42 @@ def _build_instance_weight_map(inst_ids: torch.Tensor, valid_k: torch.Tensor) ->
         wks[:, k:k + 1] = mask_k.unsqueeze(2)
     wks = wks * valid_k.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).to(wks.dtype)
     return wks, wfg
+
+
+def _build_valid_k_from_inst(inst_ids: torch.Tensor) -> torch.Tensor:
+    """Build valid_k flags from instance ID maps."""
+    B = inst_ids.size(0)
+    max_id = int(inst_ids.max().item()) if inst_ids.numel() > 0 else 0
+    if max_id == 0:
+        return inst_ids.new_zeros((B, 0), dtype=torch.bool)
+
+    valid_k = inst_ids.new_zeros((B, max_id), dtype=torch.bool)
+    for k in range(max_id):
+        valid_k[:, k] = (inst_ids == (k + 1)).any(dim=(1, 2))
+    return valid_k
+
+
+def _rot_geodesic_map_deg(
+    R_pred: torch.Tensor,
+    R_gt: torch.Tensor,
+) -> torch.Tensor:
+    """Compute per-pixel geodesic rotation error in degrees."""
+    R_rel = torch.einsum("bijhw,bjkhw->bikhw", R_pred.transpose(1, 2), R_gt)
+    tr = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
+    cos_val = (tr - 1.0) * 0.5
+    cos_clamped = cos_val.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+    theta = torch.acos(cos_clamped)
+    return theta * (180.0 / 3.141592653589793)
+
+
+def _rot_geodesic_deg(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
+    """Compute per-instance geodesic rotation error in degrees."""
+    R_rel = torch.matmul(R_pred.transpose(-2, -1), R_gt)
+    tr = R_rel[..., 0, 0] + R_rel[..., 1, 1] + R_rel[..., 2, 2]
+    cos_val = (tr - 1.0) * 0.5
+    cos_clamped = cos_val.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+    theta = torch.acos(cos_clamped)
+    return theta * (180.0 / 3.141592653589793)
 
 
 def _origin_in_image_from_t(
@@ -1177,6 +1304,11 @@ def train_one_epoch(
         sem_gt = batch["semantic_seg"].to(device, non_blocking=True)
         inst_gt = batch["instance_seg"].to(device, non_blocking=True)
 
+        size_hw = stereo.shape[-2:]
+        inst_gt_1_4 = _downsample_label(inst_gt, size_hw)
+        valid_k_inst = _build_valid_k_from_inst(inst_gt_1_4)
+        wks_inst, wfg_inst = _build_instance_weight_map(inst_gt_1_4, valid_k_inst)
+
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=cfg["train"]["amp"]):
             pred = model(
@@ -1184,6 +1316,8 @@ def train_one_epoch(
                 k_pair,
                 baseline,
                 iters=cfg["model"]["n_iter"],
+                Wk_1_4=wks_inst,
+                wfg_1_4=wfg_inst,
             )
             disp_preds = pred["disp_preds"]
             disp_logvar_preds = pred["disp_log_var_preds"]
@@ -1223,8 +1357,58 @@ def train_one_epoch(
                 pred["rot_logvar_theta"],
                 pose_mask,
             )
+            rot_deg_map = _rot_geodesic_map_deg(pred["rot_mat"], rot_gt_map).unsqueeze(1)
+            rot_map_deg = (rot_deg_map * pose_mask.to(rot_deg_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
+            pos_map_pred = pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
+            pos_diff = pos_map_pred - pos_gt_map
+            pos_l2_map = torch.sqrt((pos_diff * pos_diff).sum(dim=1, keepdim=True) + 1e-6)
+            pos_map_l2 = (pos_l2_map * pose_mask.to(pos_l2_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
+            r_pred = pred.get("pose_R")
+            t_pred = pred.get("pose_t")
+            v_pred = pred.get("pose_valid")
+            r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
+                rot_map=rot_gt_map,
+                pos_map=pos_gt_map,
+                Wk_1_4=wks_inst,
+                wfg=wfg_inst,
+                min_px=10,
+                min_wsum=1e-6,
+            )
+            valid_inst = v_pred & v_gt & valid_k_inst
+            if valid_inst.any():
+                t_diff = t_pred - t_gt
+                t_l2 = torch.sqrt((t_diff * t_diff).sum(dim=-1) + 1e-6)
+                pos_inst_l2 = (t_l2 * valid_inst.to(t_l2.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
+                r_deg = _rot_geodesic_deg(r_pred, r_gt)
+                rot_inst_deg = (r_deg * valid_inst.to(r_deg.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
+            else:
+                pos_inst_l2 = pos_map_l2.new_tensor(0.0)
+                rot_inst_deg = pos_map_l2.new_tensor(0.0)
 
-            inst_gt_1_4 = _downsample_label(inst_gt, size_hw)
+            model_points, _ = _build_model_points_from_batch(batch, device)
+            if model_points is not None and valid_inst.any():
+                adds = _adds_core_from_Rt_no_norm(
+                    r_pred,
+                    t_pred,
+                    r_gt,
+                    t_gt,
+                    model_points,
+                    use_symmetric=True,
+                    valid_mask=valid_inst,
+                )
+                add = _adds_core_from_Rt_no_norm(
+                    r_pred,
+                    t_pred,
+                    r_gt,
+                    t_gt,
+                    model_points,
+                    use_symmetric=False,
+                    valid_mask=valid_inst,
+                )
+            else:
+                adds = pos_map_l2.new_tensor(0.0)
+                add = pos_map_l2.new_tensor(0.0)
+
             aff_tgt, aff_valid = _build_affinity_targets(inst_gt_1_4)
             loss_aff, aff_valid_px = _affinity_loss(
                 pred["aff_logits"],
@@ -1246,7 +1430,13 @@ def train_one_epoch(
                 "L_sem": loss_sem.detach(),
                 "L_cls": loss_cls.detach(),
                 "L_pos": loss_pos.detach(),
+                "L_pos_map_l2": pos_map_l2.detach(),
+                "L_pos_inst_l2": pos_inst_l2.detach(),
+                "L_rot_map_deg": rot_map_deg.detach(),
+                "L_rot_inst_deg": rot_inst_deg.detach(),
                 "L_rot": loss_rot.detach(),
+                "L_adds": adds.detach(),
+                "L_add": add.detach(),
                 "L_aff": loss_aff.detach(),
                 "L_emb": loss_emb.detach(),
                 "L_disp_1x": loss_disp_1x.detach(),
@@ -1344,7 +1534,13 @@ def validate(
     meters.add_avg("L_sem")
     meters.add_avg("L_cls")
     meters.add_avg("L_pos")
+    meters.add_avg("L_pos_map_l2")
+    meters.add_avg("L_pos_inst_l2")
     meters.add_avg("L_rot")
+    meters.add_avg("L_rot_map_deg")
+    meters.add_avg("L_rot_inst_deg")
+    meters.add_avg("L_adds")
+    meters.add_avg("L_add")
     meters.add_avg("L_disp_1x")
     meters.add_avg("L_aff")
     meters.add_avg("L_emb")
@@ -1354,11 +1550,18 @@ def validate(
         sem_gt = batch["semantic_seg"].to(device, non_blocking=True)
         inst_gt = batch["instance_seg"].to(device, non_blocking=True)
 
+        size_hw = stereo.shape[-2:]
+        inst_gt_1_4 = _downsample_label(inst_gt, size_hw)
+        valid_k_inst = _build_valid_k_from_inst(inst_gt_1_4)
+        wks_inst, wfg_inst = _build_instance_weight_map(inst_gt_1_4, valid_k_inst)
+
         pred = model(
             stereo,
             k_pair,
             baseline,
             iters=cfg["model"]["n_iter"],
+            Wk_1_4=wks_inst,
+            wfg_1_4=wfg_inst,
         )
         disp_preds = pred["disp_preds"]
         disp_logvar_preds = pred["disp_log_var_preds"]
@@ -1398,8 +1601,58 @@ def validate(
             pred["rot_logvar_theta"],
             pose_mask,
         )
+        rot_deg_map = _rot_geodesic_map_deg(pred["rot_mat"], rot_gt_map).unsqueeze(1)
+        rot_map_deg = (rot_deg_map * pose_mask.to(rot_deg_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
+        pos_map_pred = pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
+        pos_diff = pos_map_pred - pos_gt_map
+        pos_l2_map = torch.sqrt((pos_diff * pos_diff).sum(dim=1, keepdim=True) + 1e-6)
+        pos_map_l2 = (pos_l2_map * pose_mask.to(pos_l2_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
+        r_pred = pred.get("pose_R")
+        t_pred = pred.get("pose_t")
+        v_pred = pred.get("pose_valid")
+        r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
+            rot_map=rot_gt_map,
+            pos_map=pos_gt_map,
+            Wk_1_4=wks_inst,
+            wfg=wfg_inst,
+            min_px=10,
+            min_wsum=1e-6,
+        )
+        valid_inst = v_pred & v_gt & valid_k_inst
+        if valid_inst.any():
+            t_diff = t_pred - t_gt
+            t_l2 = torch.sqrt((t_diff * t_diff).sum(dim=-1) + 1e-6)
+            pos_inst_l2 = (t_l2 * valid_inst.to(t_l2.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
+            r_deg = _rot_geodesic_deg(r_pred, r_gt)
+            rot_inst_deg = (r_deg * valid_inst.to(r_deg.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
+        else:
+            pos_inst_l2 = pos_map_l2.new_tensor(0.0)
+            rot_inst_deg = pos_map_l2.new_tensor(0.0)
 
-        inst_gt_1_4 = _downsample_label(inst_gt, size_hw)
+        model_points, _ = _build_model_points_from_batch(batch, device)
+        if model_points is not None and valid_inst.any():
+            adds = _adds_core_from_Rt_no_norm(
+                r_pred,
+                t_pred,
+                r_gt,
+                t_gt,
+                model_points,
+                use_symmetric=True,
+                valid_mask=valid_inst,
+            )
+            add = _adds_core_from_Rt_no_norm(
+                r_pred,
+                t_pred,
+                r_gt,
+                t_gt,
+                model_points,
+                use_symmetric=False,
+                valid_mask=valid_inst,
+            )
+        else:
+            adds = pos_map_l2.new_tensor(0.0)
+            add = pos_map_l2.new_tensor(0.0)
+
         aff_tgt, aff_valid = _build_affinity_targets(inst_gt_1_4)
         loss_aff, _ = _affinity_loss(
             pred["aff_logits"],
@@ -1418,11 +1671,26 @@ def validate(
             topk_neg=None,           # 重いなら 16 とかに
         )
 
-        meters.update_avg("L", float(loss_disp.item()), n=stereo.size(0))
+        loss = cfg["loss"]["w_disp"] * loss_disp
+        loss = loss + cfg.get("loss", {}).get("w_disp_1x", 1.0) * loss_disp_1x
+        loss = loss + cfg.get("loss", {}).get("w_sem", 1.0) * loss_sem
+        loss = loss + cfg.get("loss", {}).get("w_cls", 1.0) * loss_cls
+        loss = loss + cfg.get("loss", {}).get("w_pos", 1.0) * loss_pos
+        loss = loss + cfg.get("loss", {}).get("w_rot", 1.0) * loss_rot
+        loss = loss + cfg.get("loss", {}).get("w_aff", 1.0) * loss_aff
+        loss = loss + cfg.get("loss", {}).get("w_emb", 1.0) * loss_emb
+
+        meters.update_avg("L", float(loss.item()), n=stereo.size(0))
         meters.update_avg("L_sem", float(loss_sem.item()), n=stereo.size(0))
         meters.update_avg("L_cls", float(loss_cls.item()), n=stereo.size(0))
         meters.update_avg("L_pos", float(loss_pos.item()), n=stereo.size(0))
+        meters.update_avg("L_pos_map_l2", float(pos_map_l2.item()), n=stereo.size(0))
+        meters.update_avg("L_pos_inst_l2", float(pos_inst_l2.item()), n=stereo.size(0))
         meters.update_avg("L_rot", float(loss_rot.item()), n=stereo.size(0))
+        meters.update_avg("L_rot_map_deg", float(rot_map_deg.item()), n=stereo.size(0))
+        meters.update_avg("L_rot_inst_deg", float(rot_inst_deg.item()), n=stereo.size(0))
+        meters.update_avg("L_adds", float(adds.item()), n=stereo.size(0))
+        meters.update_avg("L_add", float(add.item()), n=stereo.size(0))
         meters.update_avg("L_disp_1x", float(loss_disp_1x.item()), n=stereo.size(0))
         meters.update_avg("L_aff", float(loss_aff.item()), n=stereo.size(0))
         meters.update_avg("L_emb", float(loss_emb.item()), n=stereo.size(0))
@@ -1472,6 +1740,8 @@ def validate(
 
     loss_disp_avg = meters.get("L").avg
     loss_sem_avg = meters.get("L_sem").avg
+    if writer is not None and dist_utils.is_main_process():
+        base.log_meters_to_tb(writer, meters, epoch, prefix="val")
     return loss_disp_avg, loss_sem_avg
 
 
