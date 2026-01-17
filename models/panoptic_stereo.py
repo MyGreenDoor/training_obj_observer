@@ -189,7 +189,7 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         rot_repr: str = "r6d",
         out_pos_scale: float = 1.0,
         emb_dim: int = 8,
-        head_base_ch: int = 96,
+        head_base_ch: int = 128,
         head_ch_scale: float = 1.35,
         head_downsample: int = 4,
     ) -> None:
