@@ -216,6 +216,7 @@ def build_model(cfg: dict, num_classes: int) -> nn.Module:
         head_ch_scale = float(seg_cfg["head_c8"]) / float(seg_cfg["head_c4"])
     else:
         head_ch_scale = 1.35
+    head_downsample = int(seg_cfg.get("head_downsample", 4))
 
     return PanopticStereoMultiHead(
         levels=int(mcfg.get("levels", 4)),
@@ -233,6 +234,7 @@ def build_model(cfg: dict, num_classes: int) -> nn.Module:
         use_dummy_head=bool(seg_cfg.get("use_dummy_head", False)),
         head_base_ch=head_base_ch,
         head_ch_scale=head_ch_scale,
+        head_downsample=head_downsample,
     )
 
 

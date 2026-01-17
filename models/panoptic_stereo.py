@@ -191,10 +191,14 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         emb_dim: int = 8,
         head_base_ch: int = 96,
         head_ch_scale: float = 1.35,
+        head_downsample: int = 4,
     ) -> None:
         super().__init__()
         self.use_pixelshuffle = use_pixelshuffle
         self.rot_repr = rot_repr.lower()
+        self.head_downsample = int(head_downsample)
+        if self.head_downsample < 1:
+            raise ValueError("head_downsample must be >= 1")
 
         in_ch = ctx_ch + 1 + 3
         base_ch = int(head_base_ch)
@@ -234,6 +238,17 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         self.dec2 = ConvBlock(c2 + c2, c2, norm_layer)
         self.up1 = self.make_up(c2, c1, norm_layer)
         self.dec1 = ConvBlock(c1 + c1, fuse_ch, norm_layer)
+
+        self.detail_pool = nn.AvgPool2d(kernel_size=3, stride=1, padding=1)
+        self.detail_proj = nn.Sequential(
+            nn.Conv2d(in_ch, fuse_ch, 1, bias=False),
+            norm_layer(fuse_ch),
+            nn.SiLU(True),
+        )
+        self.detail_gate = nn.Sequential(
+            nn.Conv2d(fuse_ch, fuse_ch, 1, bias=True),
+            nn.Sigmoid(),
+        )
 
         rot_ch = 6 if self.rot_repr == "r6d" else 3
         self.neck_geo = self.make_neck(fuse_ch, geo_ch, norm_layer)
@@ -289,7 +304,15 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         point_map_1x: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """Run FPN-style head on full resolution features."""
+        out_hw = ctx_1x.shape[-2:]
+        if self.head_downsample > 1:
+            low_hw = (max(1, out_hw[0] // self.head_downsample), max(1, out_hw[1] // self.head_downsample))
+            ctx_1x = F.interpolate(ctx_1x, size=low_hw, mode="bilinear", align_corners=False)
+            mask_1x = F.interpolate(mask_1x, size=low_hw, mode="bilinear", align_corners=False)
+            point_map_1x = F.interpolate(point_map_1x, size=low_hw, mode="bilinear", align_corners=False)
+
         x4_in = torch.cat((ctx_1x, mask_1x, point_map_1x), dim=1)
+        detail = x4_in - self.detail_pool(x4_in)
         e1 = self.enc1(x4_in)
         e2 = self.down1(e1)
         e3 = self.down2(e2)
@@ -323,6 +346,8 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         if u1.shape[-2:] != e1.shape[-2:]:
             u1 = F.interpolate(u1, size=e1.shape[-2:], mode="bilinear", align_corners=False)
         x = self.dec1(torch.cat((u1, e1), dim=1))
+        detail = self.detail_proj(detail)
+        x = x + detail * self.detail_gate(x)
         x_geo = self.neck_geo(x)
         x_sem = self.neck_sem(x)
         x_inst = self.neck_inst(x)
@@ -330,6 +355,15 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         out_posz = self.head_posz(self.head_posz_pre(x_geo))
         out_rot = self.head_rot(self.head_rot_pre(x_geo))
         cls_logits = self.head_cls(self.head_cls_pre(x_sem))
+        affemb_out = self.affemb_head(x_inst)
+        if self.head_downsample > 1:
+            out_posz = F.interpolate(out_posz, size=out_hw, mode="bilinear", align_corners=False)
+            out_rot = F.interpolate(out_rot, size=out_hw, mode="bilinear", align_corners=False)
+            cls_logits = F.interpolate(cls_logits, size=out_hw, mode="bilinear", align_corners=False)
+            aff_logits = F.interpolate(affemb_out["aff_logits"], size=out_hw, mode="bilinear", align_corners=False)
+            emb = F.interpolate(affemb_out["emb"], size=out_hw, mode="bilinear", align_corners=False)
+            emb = F.normalize(emb, dim=1, eps=1e-6)
+            affemb_out = {"aff_logits": aff_logits, "emb": emb}
 
         mu_raw = out_posz[:, 0:3]
         lv_raw = out_posz[:, 3:6]
@@ -344,8 +378,6 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
             rvec = out_rot[:, :3]
             rot_R = rotvec_to_rotmat_map(rvec)
             logvar_theta = out_rot[:, 3:4].clamp(-10.0, 5.0)
-
-        affemb_out = self.affemb_head(x_inst)
 
         return {
             "pos_mu": mu_pos,
@@ -514,6 +546,7 @@ class PanopticStereoMultiHead(nn.Module):
         use_dummy_head: bool = False,
         head_base_ch: int = 96,
         head_ch_scale: float = 1.35,
+        head_downsample: int = 4,
     ) -> None:
         super().__init__()
         self.levels = levels
@@ -572,6 +605,7 @@ class PanopticStereoMultiHead(nn.Module):
                 emb_dim=emb_dim,
                 head_base_ch=head_base_ch,
                 head_ch_scale=head_ch_scale,
+                head_downsample=head_downsample,
             )
         self.upsampler = ConvexUpsampler(context_ch=context_ch, up_factor=4, groups=16)
         self.use_ctx1x_for_upsample = True
