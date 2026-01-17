@@ -184,8 +184,7 @@ def rotation_loss_hetero(R_pred: torch.Tensor,  # (B,K,3,3)
     """
     # 1) 測地角（float32 安定計算）
     theta = _geodesic_angle_so3(R_pred, R_gt)          # (B,K) float32
-    theta = theta
-    theta2 = theta * theta                             # (B,K)
+    theta = theta                           # (B,K)
 
     # 2) 予測ログ分散の安定化
     #    極端な過小/過大分散は学習を壊すので範囲制限（例: [-10, 4]）
@@ -194,7 +193,7 @@ def rotation_loss_hetero(R_pred: torch.Tensor,  # (B,K,3,3)
 
     # 3) ヘテロスケ NLL
     inv_var = torch.exp(-lv)                           # exp(-logσ^2) = 1/σ^2
-    loss = 0.5 * (theta2 * inv_var + lv)              # (B,K)
+    loss = 0.5 * (theta * inv_var + lv)              # (B,K)
 
     return (loss * valid).sum() / valid.sum().clamp_min(1.0)
 
@@ -239,8 +238,7 @@ def rotation_loss_hetero_map(
         cos_val = (tr - 1.0) * 0.5
         cos_clamped = torch.clamp(cos_val, -1.0 + 1e-6, 1.0 - 1e-6)
         theta = torch.acos(cos_clamped)                                     # (B,H,W)
-    theta = theta
-    theta2 = theta * theta                                                  # (B,H,W)
+    theta = theta                                              # (B,H,W)
 
     # 4) valid マップ（重み）整形
     valid = valid_map.float().squeeze(1)                                    # (B,H,W)
@@ -248,7 +246,7 @@ def rotation_loss_hetero_map(
 
     # 5) lv が無い場合: 0.5 * θ^2 を weighted average
     if lv_raw_map is None:
-        loss_map = 0.5 * theta2                                             # (B,H,W)
+        loss_map = 0.5 * theta                                             # (B,H,W)
         weighted = loss_map * valid
         return weighted.sum() / denom
 
@@ -260,7 +258,7 @@ def rotation_loss_hetero_map(
 
     # 6) ヘテロスケ NLL（Gaussian）
     inv_var = torch.exp(-lv)                                                # (B,H,W)
-    loss_map = 0.5 * (theta2 * inv_var + lv)                                # (B,H,W)
+    loss_map = 0.5 * (theta* inv_var + lv)                                # (B,H,W)
 
     # 7) valid マスク & 平均（weight平均）
     weighted = loss_map * valid

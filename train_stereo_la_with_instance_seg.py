@@ -1734,6 +1734,12 @@ def validate(
                 cfg,
                 n_images=min(4, stereo.size(0)),
             )
+            pos_gt_map, rot_gt_map, _, objs_in_left = _prepare_pose_targets(
+                batch,
+                sem_gt,
+                pred["sem_logits"].shape[-2:],
+                device,
+            )
             _log_pose_visuals(
                 writer,
                 epoch,
