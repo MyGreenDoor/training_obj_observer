@@ -189,12 +189,8 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         rot_repr: str = "r6d",
         out_pos_scale: float = 1.0,
         emb_dim: int = 8,
-        head_base_ch: int = 112,
+        head_base_ch: int = 96,
         head_ch_scale: float = 1.35,
-        head_fuse_ch: int = 224,
-        head_geo_ch: int = 160,
-        head_sem_ch: int = 128,
-        head_inst_ch: int = 128,
     ) -> None:
         super().__init__()
         self.use_pixelshuffle = use_pixelshuffle
@@ -203,10 +199,10 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         in_ch = ctx_ch + 1 + 3
         base_ch = int(head_base_ch)
         ch_scale = float(head_ch_scale)
-        fuse_ch = int(head_fuse_ch)
-        geo_ch = int(head_geo_ch)
-        sem_ch = int(head_sem_ch)
-        inst_ch = int(head_inst_ch)
+        fuse_ch = base_ch * 2
+        geo_ch = base_ch
+        sem_ch = base_ch
+        inst_ch = base_ch
 
         def scaled_ch(level: int) -> int:
             """Compute stage channels from base and scale."""
@@ -516,12 +512,8 @@ class PanopticStereoMultiHead(nn.Module):
         rot_repr: str = "r6d",
         emb_dim: int = 16,
         use_dummy_head: bool = False,
-        head_base_ch: int = 112,
+        head_base_ch: int = 96,
         head_ch_scale: float = 1.35,
-        head_fuse_ch: int = 224,
-        head_geo_ch: int = 160,
-        head_sem_ch: int = 128,
-        head_inst_ch: int = 128,
     ) -> None:
         super().__init__()
         self.levels = levels
@@ -580,10 +572,6 @@ class PanopticStereoMultiHead(nn.Module):
                 emb_dim=emb_dim,
                 head_base_ch=head_base_ch,
                 head_ch_scale=head_ch_scale,
-                head_fuse_ch=head_fuse_ch,
-                head_geo_ch=head_geo_ch,
-                head_sem_ch=head_sem_ch,
-                head_inst_ch=head_inst_ch,
             )
         self.upsampler = ConvexUpsampler(context_ch=context_ch, up_factor=4, groups=16)
         self.use_ctx1x_for_upsample = True

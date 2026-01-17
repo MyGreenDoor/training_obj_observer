@@ -209,7 +209,7 @@ def build_model(cfg: dict, num_classes: int) -> nn.Module:
     """Build the panoptic stereo model."""
     mcfg = cfg.get("model", {})
     seg_cfg = cfg.get("seg_head", {}) or {}
-    head_base_ch = int(seg_cfg.get("head_base_ch", seg_cfg.get("head_c4", 112)))
+    head_base_ch = int(seg_cfg.get("head_base_ch", seg_cfg.get("head_c4", 96)))
     if "head_ch_scale" in seg_cfg:
         head_ch_scale = float(seg_cfg.get("head_ch_scale", 1.35))
     elif "head_c4" in seg_cfg and "head_c8" in seg_cfg and float(seg_cfg["head_c4"]) > 0.0:
@@ -233,10 +233,6 @@ def build_model(cfg: dict, num_classes: int) -> nn.Module:
         use_dummy_head=bool(seg_cfg.get("use_dummy_head", False)),
         head_base_ch=head_base_ch,
         head_ch_scale=head_ch_scale,
-        head_fuse_ch=int(seg_cfg.get("head_fuse_ch", 160)),
-        head_geo_ch=int(seg_cfg.get("head_geo_ch", 112)),
-        head_sem_ch=int(seg_cfg.get("head_sem_ch", 80)),
-        head_inst_ch=int(seg_cfg.get("head_inst_ch", 80)),
     )
 
 
