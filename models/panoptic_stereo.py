@@ -1,6 +1,6 @@
 """Panoptic stereo model with disparity + multi-task heads."""
 import math
-from typing import Dict, Callable, List, Union, Tuple, Optional
+from typing import Dict, Callable, List, Union, Tuple, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -547,6 +547,9 @@ class PanopticStereoMultiHead(nn.Module):
         head_base_ch: int = 96,
         head_ch_scale: float = 1.35,
         head_downsample: int = 4,
+        point_map_norm_mean: Optional[Sequence[float]] = None,
+        point_map_norm_std: Optional[Sequence[float]] = None,
+        point_map_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
         self.levels = levels
@@ -615,6 +618,20 @@ class PanopticStereoMultiHead(nn.Module):
             nn.GroupNorm(16, context_ch),
             nn.SiLU(inplace=True),
         )
+        self.point_map_norm_eps = float(point_map_norm_eps)
+        self.use_point_map_norm = point_map_norm_mean is not None and point_map_norm_std is not None
+        if self.use_point_map_norm:
+            mean = torch.as_tensor(point_map_norm_mean, dtype=torch.float32)
+            std = torch.as_tensor(point_map_norm_std, dtype=torch.float32)
+            if mean.numel() != 3 or std.numel() != 3:
+                raise ValueError("point_map_norm_mean/std must have 3 values for (X/Z, Y/Z, logZ).")
+            mean = mean.view(1, 3, 1, 1)
+            std = std.view(1, 3, 1, 1).clamp_min(self.point_map_norm_eps)
+            self.register_buffer("point_map_norm_mean", mean)
+            self.register_buffer("point_map_norm_std", std)
+        else:
+            self.point_map_norm_mean = None
+            self.point_map_norm_std = None
 
     def extract(self, stereo: torch.Tensor) -> Dict[str, torch.Tensor]:
         assert stereo.size(1) == 6
@@ -701,7 +718,12 @@ class PanopticStereoMultiHead(nn.Module):
             downsample=1,
             eps=1e-6,
         )
-        point_map_1x_norm = normalize_point_map(point_map_1x)
+        point_map_1x_norm = normalize_point_map(
+            point_map_1x,
+            eps=self.point_map_norm_eps,
+            mean=self.point_map_norm_mean,
+            std=self.point_map_norm_std,
+        )
 
         head_out = self.pose_head(
             ctx_1x=stuff["context_1x"],
@@ -788,17 +810,36 @@ class PanopticStereoMultiHead(nn.Module):
         return out
 
 
-def normalize_point_map(point_map: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Normalize XYZ point map to (X/Z, Y/Z, logZ)."""
+def normalize_point_map(
+    point_map: torch.Tensor,
+    eps: float = 1e-6,
+    mean: Optional[torch.Tensor] = None,
+    std: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Normalize XYZ point map to (X/Z, Y/Z, logZ), optionally standardizing by mean/std."""
     z = point_map[:, 2:3].clamp_min(eps)
     xz = point_map[:, 0:1] / z
     yz = point_map[:, 1:2] / z
     logz = torch.log(z)
-    return torch.cat([xz, yz, logz], dim=1)
+    point_map_norm = torch.cat([xz, yz, logz], dim=1)
+    if mean is None or std is None:
+        return point_map_norm
+    mean = mean.to(device=point_map.device, dtype=point_map.dtype)
+    std = std.to(device=point_map.device, dtype=point_map.dtype).clamp_min(eps)
+    return (point_map_norm - mean) / std
 
 
-def denormalize_point_map(point_map_norm: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Recover XYZ point map from (X/Z, Y/Z, logZ)."""
+def denormalize_point_map(
+    point_map_norm: torch.Tensor,
+    eps: float = 1e-6,
+    mean: Optional[torch.Tensor] = None,
+    std: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Recover XYZ point map from (X/Z, Y/Z, logZ), optionally de-standardizing by mean/std."""
+    if mean is not None and std is not None:
+        mean = mean.to(device=point_map_norm.device, dtype=point_map_norm.dtype)
+        std = std.to(device=point_map_norm.device, dtype=point_map_norm.dtype).clamp_min(eps)
+        point_map_norm = point_map_norm * std + mean
     z = torch.exp(point_map_norm[:, 2:3]).clamp_min(eps)
     x = point_map_norm[:, 0:1] * z
     y = point_map_norm[:, 1:2] * z

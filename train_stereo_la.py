@@ -313,6 +313,15 @@ def build_model(cfg: dict, class_table: dict) -> SSCFlow2:
         Instantiated SSCFlow2 model.
     """
     mcfg = cfg.get("model", {})
+    dcfg = cfg.get("data", {}) or {}
+    point_map_norm_mean = dcfg.get("point_map_norm_mean")
+    point_map_norm_std = dcfg.get("point_map_norm_std")
+    if point_map_norm_mean is not None and point_map_norm_std is not None:
+        point_map_norm_mean = [float(v) for v in point_map_norm_mean]
+        point_map_norm_std = [float(v) for v in point_map_norm_std]
+    else:
+        point_map_norm_mean = None
+        point_map_norm_std = None
     net = SSCFlow2(
         levels=int(mcfg.get("levels", 4)),
         norm_layer=make_gn(16),  # 既存の norm をお使いなら適宜差し替え
@@ -336,6 +345,8 @@ def build_model(cfg: dict, class_table: dict) -> SSCFlow2:
         use_so3_log_xyz=bool(mcfg.get("use_so3_log_xyz", True)),  # 回転=so3ログ, 並進=Δx,Δy,Δz
         use_so3_log_ratio_normal=bool(mcfg.get("use_so3_log_ratio_normal", True)),
         raft_like_updater=bool(mcfg.get("raft_like_updater", True)),
+        point_map_norm_mean=point_map_norm_mean,
+        point_map_norm_std=point_map_norm_std,
     )
     return net
 

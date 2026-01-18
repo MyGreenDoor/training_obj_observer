@@ -147,7 +147,7 @@ def make_dataloaders(cfg: dict, distributed: bool):
         "instance_seg",
     )
     use_camera_list = ["ZED2", "D415", "ZEDmini"]
-    out_size_wh = (256, 256)
+    out_size_wh = (cfg["data"]["width"],cfg["data"]["height"])
     train_ds = LASyntheticDataset3PerIns(
         out_list=out_list,
         with_data_path=True,
@@ -208,6 +208,15 @@ def make_dataloaders(cfg: dict, distributed: bool):
 def build_model(cfg: dict, num_classes: int) -> nn.Module:
     """Build the panoptic stereo model."""
     mcfg = cfg.get("model", {})
+    dcfg = cfg.get("data", {}) or {}
+    point_map_norm_mean = dcfg.get("point_map_norm_mean")
+    point_map_norm_std = dcfg.get("point_map_norm_std")
+    if point_map_norm_mean is not None and point_map_norm_std is not None:
+        point_map_norm_mean = [float(v) for v in point_map_norm_mean]
+        point_map_norm_std = [float(v) for v in point_map_norm_std]
+    else:
+        point_map_norm_mean = None
+        point_map_norm_std = None
     seg_cfg = cfg.get("seg_head", {}) or {}
     head_base_ch = int(seg_cfg.get("head_base_ch", seg_cfg.get("head_c4", 96)))
     if "head_ch_scale" in seg_cfg:
@@ -235,6 +244,8 @@ def build_model(cfg: dict, num_classes: int) -> nn.Module:
         head_base_ch=head_base_ch,
         head_ch_scale=head_ch_scale,
         head_downsample=head_downsample,
+        point_map_norm_mean=point_map_norm_mean,
+        point_map_norm_std=point_map_norm_std,
     )
 
 

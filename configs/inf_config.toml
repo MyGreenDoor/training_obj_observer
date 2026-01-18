@@ -18,10 +18,13 @@ strict = false          # state_dictのstrictロード
 
 
 [data]
-height = 256
-width = 256
+height = 1280
+width = 720
 num_workers = 6
 max_disp = 128
+# Point map normalization stats for (X/Z, Y/Z, logZ).
+point_map_norm_mean = [0.10870785486809394, 0.0006783541778360774, -1.1229786175730536]
+point_map_norm_std = [0.1862053436395896, 0.17888957276298678, 0.43563977044499047]
 
 [lr_scheduler]
 type = "cosine"        # "cosine" | "onecycle" | "plateau" | "multistep" | "none"

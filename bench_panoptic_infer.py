@@ -104,7 +104,7 @@ def _prep_inputs_from_batch(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, default="configs/config_full.toml", help="Path to config TOML")
+    ap.add_argument("--config", type=str, default="configs/inf_config.toml", help="Path to config TOML")
     ap.add_argument("--ckpt", type=str, default="", help="checkpoint path (optional)")
     ap.add_argument("--strict", action="store_true")
     ap.add_argument("--steps", type=int, default=200)

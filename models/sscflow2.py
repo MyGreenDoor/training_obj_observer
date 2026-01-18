@@ -1,5 +1,5 @@
 
-from typing import Tuple, Dict, Callable, List, Union, Optional
+from typing import Tuple, Dict, Callable, List, Union, Optional, Sequence
 
 from pytorch3d.structures import Meshes
 import torch
@@ -55,7 +55,10 @@ class SSCFlow2(nn.Module):
                  use_gate: bool = True,
                  use_so3_log_xyz: bool = True,        #: 回転=so3ログ, 並進=Δx,Δy,Δz
                  use_so3_log_ratio_normal: bool = True,
-                 raft_like_updater: bool = True
+                 raft_like_updater: bool = True,
+                 point_map_norm_mean: Optional[Sequence[float]] = None,
+                 point_map_norm_std: Optional[Sequence[float]] = None,
+                 point_map_norm_eps: float = 1e-6,
                  ):
         super().__init__()
         self.levels = levels
@@ -123,6 +126,20 @@ class SSCFlow2(nn.Module):
         self.use_so3_log_xyz = use_so3_log_xyz
         self.use_so3_log_ratio_normal = use_so3_log_ratio_normal
         self.raft_like_updater = raft_like_updater
+        self.point_map_norm_eps = float(point_map_norm_eps)
+        self.use_point_map_norm = point_map_norm_mean is not None and point_map_norm_std is not None
+        if self.use_point_map_norm:
+            mean = torch.as_tensor(point_map_norm_mean, dtype=torch.float32)
+            std = torch.as_tensor(point_map_norm_std, dtype=torch.float32)
+            if mean.numel() != 3 or std.numel() != 3:
+                raise ValueError("point_map_norm_mean/std must have 3 values for (X/Z, Y/Z, logZ).")
+            mean = mean.view(1, 3, 1, 1)
+            std = std.view(1, 3, 1, 1).clamp_min(self.point_map_norm_eps)
+            self.register_buffer("point_map_norm_mean", mean)
+            self.register_buffer("point_map_norm_std", std)
+        else:
+            self.point_map_norm_mean = None
+            self.point_map_norm_std = None
 
     def extract(self, stereo: torch.Tensor) -> Dict[str, torch.Tensor]:
         assert stereo.size(1) == 6
@@ -136,8 +153,20 @@ class SSCFlow2(nn.Module):
         context0 = F.relu(ctx[:, 128:], inplace=False)  # (B,128,H/4,W/4)
         return {"featL_1_4": featL, "featR_1_4": featR, "ctx_1_4": ctx,
                 "hidden0": hidden0, "context0": context0}
-        
-    
+
+    def _normalize_point_map(self, point_map: torch.Tensor) -> torch.Tensor:
+        """Normalize point map to standardized (X/Z, Y/Z, logZ) when enabled."""
+        if not self.use_point_map_norm:
+            return point_map
+        z = point_map[:, 2:3].clamp_min(self.point_map_norm_eps)
+        xz = point_map[:, 0:1] / z
+        yz = point_map[:, 1:2] / z
+        logz = torch.log(z)
+        point_map_norm = torch.cat([xz, yz, logz], dim=1)
+        mean = self.point_map_norm_mean.to(device=point_map.device, dtype=point_map.dtype)
+        std = self.point_map_norm_std.to(device=point_map.device, dtype=point_map.dtype)
+        return (point_map_norm - mean) / std
+
     def forward(
         self,
         stereo: torch.Tensor,                 # (B,6,H,W)
@@ -207,12 +236,13 @@ class SSCFlow2(nn.Module):
             downsample=4, eps=1e-6
         )  # (B,3,H/4,W/4)
         depth_1_4 = point_map_cur[:, 2:3]
+        point_map_cur_in = self._normalize_point_map(point_map_cur)
     
         head_out = self.head(
             ctx_14=context0,          # 勾配はここへ
             hidden_14=hidden,
             mask_14=left_mask_1_4,    # 入力インスタンスマスク（そのまま）
-            point_map_14=point_map_cur
+            point_map_14=point_map_cur_in
         )
         with torch.no_grad():
             inst = extract_instances_from_head_vec(
@@ -267,8 +297,9 @@ class SSCFlow2(nn.Module):
             mask_14 = mask_logits.detach()
             extra   = stuff["hidden0"].detach()
             depth_conf =  torch.exp(-0.5 * depth_log_var).detach()
+            point_map_rend_in = self._normalize_point_map(point_map_rend_cur)
             ctx_in = [
-                point_map_cur.detach(),
+                point_map_cur_in.detach(),
                 mask_14,
                 depth_conf,
             ]
@@ -297,7 +328,7 @@ class SSCFlow2(nn.Module):
                 ctx_in.extend([dz_ratio.detach(), dn_x.detach(), dn_y.detach()])
             if self.raft_like_updater:
                 delta_pose_map, flow_pred, pos_logvar_map, rot_logvar_theta_map = self.delta_pose_updater(
-                    point_map_cur.detach(), point_map_rend_cur.detach(), 
+                    point_map_cur_in.detach(), point_map_rend_in.detach(),
                     current_pos_map.detach(), R_log.detach(),
                     cur_pos_logvar_map.detach(), cur_rot_logvar_theta_map.detach(),
                     torch.cat(ctx_in, dim=1),
@@ -305,7 +336,7 @@ class SSCFlow2(nn.Module):
                 flow_pred_list.append(flow_pred)   
             else:
                 delta_pose_map, pos_logvar_map, rot_logvar_theta_map = self.delta_pose_updater(
-                    point_map_cur.detach(), point_map_rend_cur.detach(), current_pos_map.detach(), R_cur_log=R_log,
+                    point_map_cur_in.detach(), point_map_rend_in.detach(), current_pos_map.detach(), R_cur_log=R_log,
                     context=context0.detach(), mask=mask_14, extra_feats=extra,
                     add_feats=add_feats
                 )             
