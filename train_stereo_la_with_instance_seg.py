@@ -1633,7 +1633,7 @@ def validate(
         )
         disp_preds = pred["disp_preds"]
         disp_logvar_preds = pred["disp_log_var_preds"]
-        mask = disp_gt > 0
+        mask = (inst_gt > 0).unsqueeze(1) # without background
         loss_disp = base.disparity_nll_laplace_raft_style(
             disp_preds,
             disp_logvar_preds,
