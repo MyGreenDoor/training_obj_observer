@@ -237,5 +237,14 @@ def main() -> None:
         print(f"[bench] max_mem_alloc_mib={max_alloc:.1f} max_mem_reserved_mib={max_reserved:.1f}")
 
 
+# // RTX 4080 1280 * 720
+# [bench] steps=200 batch=1 iters=4 amp=True
+# [bench] avg_ms=66.307 p50_ms=66.249 p90_ms=66.556 fps=15.08
+# [bench] max_mem_alloc_mib=1517.1 max_mem_reserved_mib=2000.0
+# // RTX 4080 256 * 256
+# [bench] steps=200 batch=1 iters=4 amp=True
+# [bench] avg_ms=17.843 p50_ms=16.934 p90_ms=17.893 fps=56.04
+# [bench] max_mem_alloc_mib=204.5 max_mem_reserved_mib=258.0
+
 if __name__ == "__main__":
     main()
