@@ -628,6 +628,8 @@ def embedding_cosface_sampled(
         n_sum = n_sum + M
 
     loss_out = loss_sum / n_sum.clamp_min(1.0)
+    # Keep graph dependency on emb when no samples are selected.
+    loss_out = loss_out + emb.sum() * 0.0 * (n_sum == 0).to(loss_out.dtype)
     return loss_out, n_sum
 
 
