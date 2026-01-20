@@ -673,6 +673,7 @@ class SSCFlow2(nn.Module):
         gt_Wk_1_4: torch.Tensor = torch.empty(0),      # (B,K,1,H/4,W/4) or empty
         gt_mask_1_4: torch.Tensor = torch.empty(0),    # (B,1,H/4,W/4) or empty
         with_shape_constraint: bool = True,
+        enable_pose_update: bool = True,
     ) -> Dict[str, torch.Tensor]:
 
         stuff = self.extract(stereo)
@@ -769,132 +770,135 @@ class SSCFlow2(nn.Module):
         assert head_out["pos_logvar"].shape[1] == 3
         current_pos_map = pos_mu_to_pointmap(head_out["pos_mu"], K_pair_1x[:, 0], downsample=4)
         current_rot_map = rot_mat
-        with torch.no_grad():
-            render_out = _render_t0_outputs(
-                renderer=self.render,
-                meshes_flat=meshes_flat,
-                K_left_14=K_pair_14[:, 0],        # (B,3,3)
-                instances=inst,
-                valid_k=inst["valid"],                   # (B,K) でも OK（batch 側 valid と同じなら valid_k をそのまま渡す）
-                image_size=featL.shape[-2:],
-            )
-        depth_rend = render_out["depth_pred"]
-        point_map_rend_cur = rot_utils.depth_to_pointmap_from_K(depth_rend, K_pair_14[:, 0])
         flow_pred_list = []
-        cur_pos_logvar_map = pos_logvar
-        cur_rot_logvar_theta_map = rot_logvar_theta
-        for i in range(2):
-            # --- ここから全iterで Δpose を推定して合成 ---
-            mask_14 = mask_logits.detach()
-            extra   = stuff["hidden0"].detach()
-            depth_conf =  torch.exp(-0.5 * depth_log_var).detach()
-            ctx_in = [
-                point_map_cur.detach(),
-                mask_14,
-                depth_conf,
-            ]
-            if self.use_so3_log_xyz:
-                R_log = rot_utils.so3_log_map(current_rot_map.detach())            # (B,3,H,W)
-                ctx_in.append(R_log)
-            else:
-                R_log = None
-            
-            add_feats = [
-                cur_pos_logvar_map.detach(),
-                cur_rot_logvar_theta_map.detach(),
-            ]
-            if self.use_so3_log_ratio_normal:
-                Zc = point_map_cur[:, 2:3].clamp_min(1e-6)
-                Zr = point_map_rend_cur[:, 2:3].clamp_min(1e-6)
-                dz_ratio = torch.log(Zc / Zr)                    # (B,1,H,W)
-
-                xz_c = point_map_cur[:, 0:1] / Zc
-                yz_c = point_map_cur[:, 1:2] / Zc
-                xz_r = point_map_rend_cur[:, 0:1] / Zr
-                yz_r = point_map_rend_cur[:, 1:2] / Zr
-                dn_x = xz_c - xz_r
-                dn_y = yz_c - yz_r
-                add_feats.extend([dz_ratio.detach(), dn_x.detach(), dn_y.detach()])
-                ctx_in.extend([dz_ratio.detach(), dn_x.detach(), dn_y.detach()])
-            if self.raft_like_updater:
-                delta_pose_map, flow_pred, pos_logvar_map, rot_logvar_theta_map = self.delta_pose_updater(
-                    point_map_cur.detach(), point_map_rend_cur.detach(), 
-                    current_pos_map.detach(), R_log.detach(),
-                    cur_pos_logvar_map.detach(), cur_rot_logvar_theta_map.detach(),
-                    torch.cat(ctx_in, dim=1),
+        if enable_pose_update:
+            with torch.no_grad():
+                render_out = _render_t0_outputs(
+                    renderer=self.render,
+                    meshes_flat=meshes_flat,
+                    K_left_14=K_pair_14[:, 0],        # (B,3,3)
+                    instances=inst,
+                    valid_k=inst["valid"],                   # (B,K) でも OK（batch 側 valid と同じなら valid_k をそのまま渡す）
+                    image_size=featL.shape[-2:],
                 )
-                flow_pred_list.append(flow_pred)   
-            else:
-                delta_pose_map, pos_logvar_map, rot_logvar_theta_map = self.delta_pose_updater(
-                    point_map_cur.detach(), point_map_rend_cur.detach(), current_pos_map.detach(), R_cur_log=R_log,
-                    context=context0.detach(), mask=mask_14, extra_feats=extra,
-                    add_feats=add_feats
-                )             
-            # # SE(3)指数写像 → 合成（列ベクトル系）
-            R_delta, t_delta = rot_utils.se3_from_delta_map(delta_pose_map)     # (B,3,3,H/4,W/4), (B,3,H/4,W/4)
-            # # レンダ側/現在地図を更新
-            current_rot_map, current_pos_map = rot_utils.update_pose_maps(
-                current_rot_map.detach(),              # (B,3,3,H/4,W/4)
-                current_pos_map.detach(),              # (B,3,H/4,W/4)   ← これは「現在の並進マップ t=(tx,ty,tz)」を想定
-                R_delta,                      # (B,3,3,H/4,W/4)
-                d_map=t_delta,                # (B,3,H/4,W/4)   ← ここでは t_delta を (dx,dy,dz) として解釈
-                weight=100.0,
-                depth_transform="exp",
-                detach_depth_for_xy=True,     # 不安定なら True 推奨
-                eps=1e-6
-            )
-            rot_maps.append(current_rot_map)
-            pos_maps.append(current_pos_map)
-            pos_logvar_maps.append(pos_logvar_map)
-            rot_logvar_theta_maps.append(rot_logvar_theta_map)
-            cur_pos_logvar_map = pos_logvar_map
-            cur_rot_logvar_theta_map = rot_logvar_theta_map
+            depth_rend = render_out["depth_pred"]
+            point_map_rend_cur = rot_utils.depth_to_pointmap_from_K(depth_rend, K_pair_14[:, 0])
+            cur_pos_logvar_map = pos_logvar
+            cur_rot_logvar_theta_map = rot_logvar_theta
+            for i in range(2):
+                # --- ここから全iterで Δpose を推定して合成 ---
+                mask_14 = mask_logits.detach()
+                extra   = stuff["hidden0"].detach()
+                depth_conf =  torch.exp(-0.5 * depth_log_var).detach()
+                ctx_in = [
+                    point_map_cur.detach(),
+                    mask_14,
+                    depth_conf,
+                ]
+                if self.use_so3_log_xyz:
+                    R_log = rot_utils.so3_log_map(current_rot_map.detach())            # (B,3,H,W)
+                    ctx_in.append(R_log)
+                else:
+                    R_log = None
+            
+                add_feats = [
+                    cur_pos_logvar_map.detach(),
+                    cur_rot_logvar_theta_map.detach(),
+                ]
+                if self.use_so3_log_ratio_normal:
+                    Zc = point_map_cur[:, 2:3].clamp_min(1e-6)
+                    Zr = point_map_rend_cur[:, 2:3].clamp_min(1e-6)
+                    dz_ratio = torch.log(Zc / Zr)                    # (B,1,H,W)
+
+                    xz_c = point_map_cur[:, 0:1] / Zc
+                    yz_c = point_map_cur[:, 1:2] / Zc
+                    xz_r = point_map_rend_cur[:, 0:1] / Zr
+                    yz_r = point_map_rend_cur[:, 1:2] / Zr
+                    dn_x = xz_c - xz_r
+                    dn_y = yz_c - yz_r
+                    add_feats.extend([dz_ratio.detach(), dn_x.detach(), dn_y.detach()])
+                    ctx_in.extend([dz_ratio.detach(), dn_x.detach(), dn_y.detach()])
+                if self.raft_like_updater:
+                    delta_pose_map, flow_pred, pos_logvar_map, rot_logvar_theta_map = self.delta_pose_updater(
+                        point_map_cur.detach(), point_map_rend_cur.detach(), 
+                        current_pos_map.detach(), R_log.detach(),
+                        cur_pos_logvar_map.detach(), cur_rot_logvar_theta_map.detach(),
+                        torch.cat(ctx_in, dim=1),
+                    )
+                    flow_pred_list.append(flow_pred)   
+                else:
+                    delta_pose_map, pos_logvar_map, rot_logvar_theta_map = self.delta_pose_updater(
+                        point_map_cur.detach(), point_map_rend_cur.detach(), current_pos_map.detach(), R_cur_log=R_log,
+                        context=context0.detach(), mask=mask_14, extra_feats=extra,
+                        add_feats=add_feats
+                    )             
+                # # SE(3)指数写像 → 合成（列ベクトル系）
+                R_delta, t_delta = rot_utils.se3_from_delta_map(delta_pose_map)     # (B,3,3,H/4,W/4), (B,3,H/4,W/4)
+                # # レンダ側/現在地図を更新
+                current_rot_map, current_pos_map = rot_utils.update_pose_maps(
+                    current_rot_map.detach(),              # (B,3,3,H/4,W/4)
+                    current_pos_map.detach(),              # (B,3,H/4,W/4)   ← これは「現在の並進マップ t=(tx,ty,tz)」を想定
+                    R_delta,                      # (B,3,3,H/4,W/4)
+                    d_map=t_delta,                # (B,3,H/4,W/4)   ← ここでは t_delta を (dx,dy,dz) として解釈
+                    weight=100.0,
+                    depth_transform="exp",
+                    detach_depth_for_xy=True,     # 不安定なら True 推奨
+                    eps=1e-6
+                )
+                rot_maps.append(current_rot_map)
+                pos_maps.append(current_pos_map)
+                pos_logvar_maps.append(pos_logvar_map)
+                rot_logvar_theta_maps.append(rot_logvar_theta_map)
+                cur_pos_logvar_map = pos_logvar_map
+                cur_rot_logvar_theta_map = rot_logvar_theta_map
             
                         
-            # ==== ここから各 iter で「レンダ側 point map」を“インスタンス単位”に更新 ====
-            if use_gt_peaks:
-                Wk = gt_Wk_1_4
-                # fg_w = gt_mask_1_4
-                fg_w = torch.ones_like(gt_mask_1_4)
-            else:
-                # 1) インスタンス重み（Wk）と前景重みを準備
-                Wk = inst["weight_map"]        # (B,K,1,H/4,W/4)  ※extract_instancesの戻りを保持している想定
-                fg_w = torch.sigmoid(mask_logits).clamp(0, 1) # (B,1,H/4,W/4)    ※他でも可。学習安定優先なら detach
+                # ==== ここから各 iter で「レンダ側 point map」を“インスタンス単位”に更新 ====
+                if use_gt_peaks:
+                    Wk = gt_Wk_1_4
+                    # fg_w = gt_mask_1_4
+                    fg_w = torch.ones_like(gt_mask_1_4)
+                else:
+                    # 1) インスタンス重み（Wk）と前景重みを準備
+                    Wk = inst["weight_map"]        # (B,K,1,H/4,W/4)  ※extract_instancesの戻りを保持している想定
+                    fg_w = torch.sigmoid(mask_logits).clamp(0, 1) # (B,1,H/4,W/4)    ※他でも可。学習安定優先なら detach
 
-            # 2) 現在の rot/pos マップから (R_k, t_k) を抽出
-            Rk, tk, is_valid, _, _ = rot_utils.pose_from_maps_auto(
-                rot_map=current_rot_map,       # (B,3,3,H/4,W/4)
-                pos_map=current_pos_map,       # (B,3,H/4,W/4)
-                Wk_1_4=Wk,                     # (B,K,1,H/4,W/4)
-                wfg=fg_w > 0.5,
-                min_px=10,
-                min_wsum=1e-6,
-            )
-            
-            Rk_list.append(Rk)
-            tk_list.append(tk)
-            
-            # 3) レンダリングベースで再描画（各 iter）
-                # (a) インスタンスごとの SE(3) を T に組み立てる
-                #     compose_T_from_Rt(R, t, valid) の挙動に合わせて valid をそのまま渡す
-            T_upd = rot_utils.compose_T_from_Rt(Rk, tk, is_valid)   # (B,K,4,4)
-            with torch.no_grad():
-                # (b) 更新ポーズで再レンダ
-                render_out_iter = self.render(
-                    meshes_flat=meshes_flat,             # flatten済み Meshes（B×K_valid の並び想定）
-                    T_cam_obj=T_upd,                     # (B,K,4,4)
-                    K_left=K_pair_14[:, 0],              # (B,3,3)   ※1/4 K
-                    valid_k=is_valid,                    # (B,K)     ※無効は内部でスキップ
-                    image_size=featL.shape[-2:],         # (H/4, W/4) と同じ空間解像度でOK
+                # 2) 現在の rot/pos マップから (R_k, t_k) を抽出
+                Rk, tk, is_valid, _, _ = rot_utils.pose_from_maps_auto(
+                    rot_map=current_rot_map,       # (B,3,3,H/4,W/4)
+                    pos_map=current_pos_map,       # (B,3,H/4,W/4)
+                    Wk_1_4=Wk,                     # (B,K,1,H/4,W/4)
+                    wfg=fg_w > 0.5,
+                    min_px=10,
+                    min_wsum=1e-6,
                 )
+            
+                Rk_list.append(Rk)
+                tk_list.append(tk)
+            
+                # 3) レンダリングベースで再描画（各 iter）
+                    # (a) インスタンスごとの SE(3) を T に組み立てる
+                    #     compose_T_from_Rt(R, t, valid) の挙動に合わせて valid をそのまま渡す
+                T_upd = rot_utils.compose_T_from_Rt(Rk, tk, is_valid)   # (B,K,4,4)
+                with torch.no_grad():
+                    # (b) 更新ポーズで再レンダ
+                    render_out_iter = self.render(
+                        meshes_flat=meshes_flat,             # flatten済み Meshes（B×K_valid の並び想定）
+                        T_cam_obj=T_upd,                     # (B,K,4,4)
+                        K_left=K_pair_14[:, 0],              # (B,3,3)   ※1/4 K
+                        valid_k=is_valid,                    # (B,K)     ※無効は内部でスキップ
+                        image_size=featL.shape[-2:],         # (H/4, W/4) と同じ空間解像度でOK
+                    )
 
-            # (c) レンダ深度 → point-map（1/4解像度）
-            depth_rend_iter = render_out_iter["depth"]              # (B,1,H/4,W/4)
-            point_map_rend_cur = rot_utils.depth_to_pointmap_from_K(
-                depth_rend_iter, K_pair_14[:, 0]
-            )  # (B,3,H/4,W/4)
-            Z_mm = point_map_rend_cur[:, 2:3]         # (B,1,H/4,W/4)
-            Z_mm_list.append(Z_mm.clone())
+                # (c) レンダ深度 → point-map（1/4解像度）
+                depth_rend_iter = render_out_iter["depth"]              # (B,1,H/4,W/4)
+                point_map_rend_cur = rot_utils.depth_to_pointmap_from_K(
+                    depth_rend_iter, K_pair_14[:, 0]
+                )  # (B,3,H/4,W/4)
+                Z_mm = point_map_rend_cur[:, 2:3]         # (B,1,H/4,W/4)
+                Z_mm_list.append(Z_mm.clone())
+        else:
+            point_map_rend_cur = point_map_cur.detach()
 
         
 
@@ -924,7 +928,7 @@ class SSCFlow2(nn.Module):
             "pos_logvar_maps": pos_logvar_maps,
             "rot_logvar_theta_maps": rot_logvar_theta_maps,
         }
-        if self.raft_like_updater:
+        if self.raft_like_updater and len(flow_pred_list) > 0:
             flow_preds = torch.cat(flow_pred_list, dim=1)
             dst['flow_preds'] = flow_preds
             dst['flow_pred'] = flow_preds[:, -1]
