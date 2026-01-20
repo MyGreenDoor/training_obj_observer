@@ -5,6 +5,8 @@ Evaluation script for SSCFlow2 on test/val split.
 
 This script mirrors train_stereo_la.py data preparation and runs pose metrics:
 ADD-S, ADD, per-instance position error (mm), and rotation error (deg).
+sample
+python eval_stereo_la.py --ckpt F:/repos/training_obj_observer/outputs/run_debug/checkpoint_119.pth --pose_update --save_images
 """
 import argparse
 import json
@@ -16,13 +18,15 @@ from typing import Dict, List, Tuple, Optional
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Dataset
 import torchvision.utils as vutils
 
 import train_stereo_la as tr
 from la_loader.synthetic_data_loader import LASyntheticDataset3PerObj
+from la_loader.real_data_loader import LARealDataset4PerObj
 from utils import dist_utils, rot_utils
 from utils.projection import SilhouetteDepthRenderer
+from utils.logging_utils import visualize_mono_torch
 from models.multi_head import pos_mu_to_pointmap
 
 
@@ -39,6 +43,26 @@ def _select_dataset_cfg(cfg: dict, split: str) -> Tuple[dict, str]:
     raise KeyError(f"no dataset config for split={split}")
 
 
+class _DatasetWithIndex(Dataset):
+    def __init__(self, base: Dataset):
+        self.base = base
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int):
+        sample = self.base[idx]
+        if isinstance(sample, dict):
+            sample["dataset_index"] = idx
+        return sample
+
+    def __getattr__(self, name: str):
+        if name == "base":
+            raise AttributeError("base is not initialized")
+        base = object.__getattribute__(self, "base")
+        return getattr(base, name)
+
+
 def make_eval_dataloader(cfg: dict, split: str, distributed: bool, batch_size: Optional[int]):
     ds_cfg, split_used = _select_dataset_cfg(cfg, split)
     use_camera_list = ds_cfg.get("use_camera_list", ["ZED2", "D415", "ZEDmini"])
@@ -47,17 +71,31 @@ def make_eval_dataloader(cfg: dict, split: str, distributed: bool, batch_size: O
     spatial_trans = tr._build_spatial_transforms()
 
     out_list = ("stereo", "depth", "disparity", "instance_seg")
-    dataset = LASyntheticDataset3PerObj(
-        out_list=out_list,
-        with_data_path=True,
-        use_camera_list=use_camera_list,
-        with_camera_params=True,
-        out_size_wh=(cfg["data"]["width"], cfg["data"]["height"]),
-        with_depro_matrix=True,
-        target_scene_list=target_scene_list,
-        spatial_transform=spatial_trans,
-        filtering_transform=filtering_trans,
-    )
+    if ds_cfg['name'] ==  "LASyntheticDataset3PerObj": 
+        dataset = LASyntheticDataset3PerObj(
+            out_list=out_list,
+            with_data_path=True,
+            use_camera_list=use_camera_list,
+            with_camera_params=True,
+            out_size_wh=(cfg["data"]["width"], cfg["data"]["height"]),
+            with_depro_matrix=True,
+            target_scene_list=target_scene_list,
+            spatial_transform=spatial_trans,
+            filtering_transform=filtering_trans,
+        )
+    else:
+        dataset = LARealDataset4PerObj(
+            out_list=out_list,
+            with_data_path=True,
+            use_camera_list=use_camera_list,
+            with_camera_params=True,
+            out_size_wh=(cfg["data"]["width"], cfg["data"]["height"]),
+            with_depro_matrix=True,
+            target_scene_list=target_scene_list,
+            spatial_transform=spatial_trans,
+            filtering_transform=filtering_trans,
+        )
+    dataset = _DatasetWithIndex(dataset)  
     class_table = dataset.class_dict
     sampler = DistributedSampler(dataset, shuffle=False) if distributed else None
     g = torch.Generator()
@@ -171,9 +209,14 @@ def _build_semantic_weight_map(
     cls_logits: Optional[torch.Tensor],
     mask_logits: Optional[torch.Tensor],
     mask_thresh: float = 0.5,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
     if cls_logits is None and mask_logits is None:
-        return None, None, None
+        return None, None, None, None
 
     if cls_logits is not None:
         cls_prob = F.softmax(cls_logits.to(torch.float32), dim=1)
@@ -186,9 +229,15 @@ def _build_semantic_weight_map(
     if mask_logits is not None:
         mask = (torch.sigmoid(mask_logits) > mask_thresh).squeeze(1)
 
-    cls_ids = torch.full((B,), -1, device=mask_logits.device if mask_logits is not None else cls_logits.device, dtype=torch.long)
+    cls_ids = torch.full(
+        (B,),
+        -1,
+        device=mask_logits.device if mask_logits is not None else cls_logits.device,
+        dtype=torch.long,
+    )
     Wk = torch.zeros((B, 1, 1, H, W), device=cls_ids.device, dtype=torch.float32)
     valid = torch.zeros((B,), device=cls_ids.device, dtype=torch.bool)
+    pred_mask = torch.zeros((B, 1, H, W), device=cls_ids.device, dtype=torch.float32)
 
     if cls_prob is None:
         for b in range(B):
@@ -199,8 +248,9 @@ def _build_semantic_weight_map(
             wsum = w.sum()
             if wsum > 0:
                 Wk[b, 0, 0] = w / wsum
+                pred_mask[b, 0] = w
                 valid[b] = True
-        return Wk, cls_ids, valid
+        return Wk, cls_ids, valid, pred_mask
 
     cls_map = cls_prob.argmax(dim=1)
     for b in range(B):
@@ -211,7 +261,12 @@ def _build_semantic_weight_map(
         cls_id = int(scores.argmax().item())
         cls_ids[b] = cls_id
 
-        region = (cls_map[b] == cls_id)
+        region_cls = (cls_map[b] == cls_id)
+        if mask is not None and mask[b].any():
+            pred_mask[b, 0] = mask[b].to(torch.float32)
+        else:
+            pred_mask[b, 0] = region_cls.to(torch.float32)
+        region = region_cls
         if mask is not None and mask[b].any():
             region = region & mask[b]
         w = region.to(torch.float32)
@@ -219,7 +274,7 @@ def _build_semantic_weight_map(
         if wsum > 0:
             Wk[b, 0, 0] = w / wsum
             valid[b] = True
-    return Wk, cls_ids, valid
+    return Wk, cls_ids, valid, pred_mask
 
 
 def _infer_gt_class_ids(
@@ -255,13 +310,20 @@ def _infer_gt_class_ids(
     return class_ids
 
 
-def _merge_results(results_list: List[Dict[str, Dict[str, List[dict]]]]):
-    merged: Dict[str, Dict[str, List[dict]]] = {}
+def _merge_results(results_list: List[Dict[str, Dict[str, dict]]]):
+    merged: Dict[str, Dict[str, dict]] = {}
     for res in results_list:
-        for data_path, cls_dict in res.items():
-            dst = merged.setdefault(data_path, {})
-            for cls_id, items in cls_dict.items():
-                dst.setdefault(cls_id, []).extend(items)
+        for cls_id, idx_dict in res.items():
+            dst = merged.setdefault(cls_id, {})
+            for idx_key, item in idx_dict.items():
+                if idx_key not in dst:
+                    dst[idx_key] = item
+                else:
+                    prev = dst[idx_key]
+                    if isinstance(prev, list):
+                        prev.append(item)
+                    else:
+                        dst[idx_key] = [prev, item]
     return merged
 
 
@@ -278,10 +340,10 @@ def evaluate(
     limit_batches: int,
     use_gt_peaks: bool,
     enable_pose_update: bool,
-) -> Dict[str, Dict[str, List[dict]]]:
+) -> Dict[str, Dict[str, dict]]:
     model.eval()
     renderer = SilhouetteDepthRenderer().to(device)
-    results: Dict[str, Dict[str, List[dict]]] = {}
+    results: Dict[str, Dict[str, dict]] = {}
 
     for it, batch in enumerate(loader):
         if limit_batches > 0 and it >= limit_batches:
@@ -323,7 +385,7 @@ def evaluate(
         pred_inst = pred["instances"]
         pred_idx_peak = _select_top1_pred_idx(pred_inst)
 
-        sem_Wk, _, sem_valid = _build_semantic_weight_map(
+        sem_Wk, sem_cls_ids, sem_valid, sem_mask_14 = _build_semantic_weight_map(
             pred.get("cls_logits", None),
             pred.get("mask_logits", None),
         )
@@ -385,8 +447,19 @@ def evaluate(
         H, W = img_left.shape[-2:]
         image_size = (H, W)
 
+        sem_mask_1x = None
+        if save_images and sem_mask_14 is not None:
+            sem_mask_1x = F.interpolate(
+                sem_mask_14.to(torch.float32),
+                size=image_size,
+                mode="nearest",
+            ).clamp(0.0, 1.0)
+
         pred_r = None
         gt_r = None
+        disp_pred_vis = None
+        disp_gt_vis = None
+        input_seg_vis = None
         if save_images:
             pred_r = renderer(
                 meshes_flat=meshes,
@@ -402,6 +475,21 @@ def evaluate(
                 valid_k=valid_k,
                 image_size=image_size,
             )
+            disp_pred_1x = F.interpolate(
+                pred["disp_preds"][-1],
+                size=disp_gt.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ) * 4.0
+            disp_pred_u8, disp_gt_u8 = visualize_mono_torch(
+                disp_pred_1x,
+                mask,
+                disp_gt,
+                mask,
+            )
+            disp_pred_vis = disp_pred_u8.to(torch.float32) / 255.0
+            disp_gt_vis = disp_gt_u8.to(torch.float32) / 255.0
+            input_seg_vis = input_mask.clamp(0.0, 1.0)
 
         data_paths = batch.get("data_path", None)
         if data_paths is None:
@@ -412,10 +500,24 @@ def evaluate(
             data_paths = [str(data_paths) for _ in range(stereo.size(0))]
 
         B = valid_k.shape[0]
+        data_indices = batch.get("dataset_index", None)
+        if data_indices is None:
+            data_indices = batch.get("data_index", None)
+        if data_indices is None:
+            data_indices = batch.get("index", None)
+        if data_indices is None:
+            data_indices = batch.get("idx", None)
+        if data_indices is None:
+            data_indices = [it * B + b for b in range(B)]
+        elif torch.is_tensor(data_indices):
+            data_indices = data_indices.detach().cpu().tolist()
+        elif isinstance(data_indices, (tuple, list)):
+            data_indices = [int(x) for x in data_indices]
+        else:
+            data_indices = [int(data_indices) for _ in range(B)]
         for b in range(B):
             data_path = data_paths[b]
-            if data_path not in results:
-                results[data_path] = {}
+            sample_index = int(data_indices[b])
             if not bool(eval_mask[b]):
                 continue
 
@@ -423,6 +525,7 @@ def evaluate(
             k_pred = int(pred_idx_peak[b].item())
             cls_id = int(class_ids[b, k_gt].item())
             cls_key = str(cls_id)
+            idx_key = str(sample_index)
 
             adds, add = _compute_adds_add_raw(
                 pred_R_sel[b, 0],
@@ -449,6 +552,7 @@ def evaluate(
                 adds_rot_only, add_rot_only, diameter_mm
             )
             pos_mm = torch.norm(pred_t_sel[b, 0] - gt_t_sel[b, 0]).item()
+            cam_obj_dist_mm = torch.norm(gt_t_sel[b, 0]).item()
             rot_deg = _geodesic_angle_deg(pred_R_sel[b, 0], gt_R_sel[b, 0]).item()
 
             pred_peak_yx = pred_inst["yx"][b, k_pred].to(torch.int64).tolist()
@@ -460,47 +564,87 @@ def evaluate(
 
             image_path = ""
             if save_images and pred_r is not None and gt_r is not None:
-                img = _normalize_rgb(img_left[b])
-                pred_mask = pred_r["inst_alpha"][b, 0:1].unsqueeze(1)
-                gt_mask = gt_r["inst_alpha"][b, 0:1].unsqueeze(1)
-                overlay_gt = tr._overlay_mask_rgb(
-                    img.unsqueeze(0), gt_mask, color=(1.0, 0.0, 0.0), alpha=0.45
-                )[0]
-                overlay_pred = tr._overlay_mask_rgb(
-                    img.unsqueeze(0), pred_mask, color=(0.0, 1.0, 0.0), alpha=0.45
-                )[0]
-                overlay_both = tr._overlay_mask_rgb(
-                    overlay_gt.unsqueeze(0), pred_mask, color=(0.0, 1.0, 0.0), alpha=0.45
+                img_l = _normalize_rgb(img_left[b])
+                img_r = _normalize_rgb(stereo[b, 3:])
+                pred_disp = disp_pred_vis[b]
+                gt_disp = disp_gt_vis[b]
+                input_seg = tr._overlay_mask_rgb(
+                    img_l.unsqueeze(0), input_seg_vis[b:b+1], color=(0.0, 1.0, 0.0), alpha=0.45
                 )[0]
 
-                panel = torch.stack([img, overlay_gt, overlay_pred, overlay_both], dim=0)
-                grid = vutils.make_grid(panel, nrow=4, normalize=False)
+                pred_mask_rend = pred_r["silhouette"][b:b+1]
+                gt_mask = gt_r["silhouette"][b:b+1]
+                if sem_mask_1x is not None:
+                    pred_mask_sem = sem_mask_1x[b:b+1]
+                    pred_mask_vis = tr._overlay_mask_rgb(
+                        img_l.unsqueeze(0), pred_mask_sem, color=(0.0, 1.0, 0.0), alpha=0.45
+                    )[0]
+                else:
+                    pred_mask_vis = tr._overlay_mask_rgb(
+                        img_l.unsqueeze(0), pred_mask_rend, color=(0.0, 1.0, 0.0), alpha=0.45
+                    )[0]
+                pred_rend = tr._overlay_mask_rgb(
+                    img_l.unsqueeze(0), pred_mask_rend, color=(0.0, 1.0, 0.0), alpha=0.45
+                )[0]
+                gt_rend = tr._overlay_mask_rgb(
+                    img_l.unsqueeze(0), gt_mask, color=(1.0, 0.0, 0.0), alpha=0.45
+                )[0]
+                pred_and_gt_rend = tr._overlay_mask_rgb(
+                    gt_rend.unsqueeze(0), pred_mask_rend, color=(0.0, 1.0, 0.0), alpha=0.45
+                )[0]
+
+                panel = torch.stack(
+                    [
+                        img_l,
+                        img_r,
+                        input_seg,
+                        pred_disp,
+                        gt_disp,
+                        pred_mask_vis,
+                        pred_rend,
+                        gt_rend,
+                        pred_and_gt_rend,
+                    ],
+                    dim=0,
+                )
+                grid = vutils.make_grid(panel, nrow=3, normalize=False)
                 safe_name = _safe_key(data_path)
-                image_name = f"{safe_name}_k{k_pred:02d}_c{cls_id:02d}.png"
+                image_name = f"{safe_name}_k{k_pred:02d}_c{cls_id:02d}_idx{sample_index}.png"
                 image_path = str(output_dir / image_name)
                 output_dir.mkdir(parents=True, exist_ok=True)
                 vutils.save_image(grid, image_path)
 
-            results[data_path].setdefault(cls_key, []).append(
-                {
-                    "instance_index": int(k_pred),
-                    "gt_index": int(k_gt),
-                    "pred_peak_yx": pred_peak_yx,
-                    "gt_peak_yx": gt_peak_yx,
-                    "pred_score": pred_score_val,
-                    "adds": float(adds),
-                    "add": float(add),
-                    "adds_norm": float(adds_norm),
-                    "add_norm": float(add_norm),
-                    "adds_rot_only": float(adds_rot_only),
-                    "add_rot_only": float(add_rot_only),
-                    "adds_rot_only_norm": float(adds_rot_only_norm),
-                    "add_rot_only_norm": float(add_rot_only_norm),
-                    "pos_mm": float(pos_mm),
-                    "rot_deg": float(rot_deg),
-                    "image_path": image_path,
-                }
-            )
+            entry = {
+                "dataset_index": int(sample_index),
+                "data_path": data_path,
+                "instance_index": int(k_pred),
+                "gt_index": int(k_gt),
+                "pred_peak_yx": pred_peak_yx,
+                "gt_peak_yx": gt_peak_yx,
+                "pred_score": pred_score_val,
+                "adds": float(adds),
+                "add": float(add),
+                "adds_norm": float(adds_norm),
+                "add_norm": float(add_norm),
+                "adds_rot_only": float(adds_rot_only),
+                "add_rot_only": float(add_rot_only),
+                "adds_rot_only_norm": float(adds_rot_only_norm),
+                "add_rot_only_norm": float(add_rot_only_norm),
+                "pos_mm": float(pos_mm),
+                "gt_cam_obj_dist_mm": float(cam_obj_dist_mm),
+                "rot_deg": float(rot_deg),
+                "image_path": image_path,
+            }
+            if cls_key not in results:
+                results[cls_key] = {}
+            if idx_key not in results[cls_key]:
+                results[cls_key][idx_key] = entry
+            else:
+                prev = results[cls_key][idx_key]
+                if isinstance(prev, list):
+                    prev.append(entry)
+                else:
+                    results[cls_key][idx_key] = [prev, entry]
     return results
 
 
@@ -597,7 +741,7 @@ def main():
     )
 
     if dist.is_available() and dist.is_initialized():
-        gathered: List[Dict[str, Dict[str, List[dict]]]] = [None for _ in range(dist_utils.get_world_size())]
+        gathered: List[Dict[str, Dict[str, dict]]] = [None for _ in range(dist_utils.get_world_size())]
         dist.all_gather_object(gathered, results)
         if dist_utils.is_main_process():
             results = _merge_results(gathered)
