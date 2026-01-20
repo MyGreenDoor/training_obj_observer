@@ -1525,6 +1525,19 @@ def train_one_epoch(
 
         depth_pred_1x = pred["point_map_1x"][:, 2:3]
         depth_mae = l1(depth_pred_1x[mask], depth[mask])
+        depth_err = (depth_pred_1x - depth).abs()
+        valid_mask = mask.bool()
+        if valid_mask.any().item():
+            depth_acc_1mm = (depth_err[valid_mask] < 1.0).float().mean()
+            depth_acc_2mm = (depth_err[valid_mask] < 2.0).float().mean()
+            depth_acc_4mm = (depth_err[valid_mask] < 4.0).float().mean()
+        else:
+            depth_acc_1mm = depth_err.new_tensor(0.0)
+            depth_acc_2mm = depth_err.new_tensor(0.0)
+            depth_acc_4mm = depth_err.new_tensor(0.0)
+        logs["depth_acc_1mm"] = depth_acc_1mm
+        logs["depth_acc_2mm"] = depth_acc_2mm
+        logs["depth_acc_4mm"] = depth_acc_4mm
 
         did_optim_step = scaler.get_scale() >= prev_scale
         if scheduler is not None and sched_step_when == "step" and did_optim_step:
@@ -1614,6 +1627,9 @@ def validate(
     meters.add_avg("L_disp_1x")
     meters.add_avg("L_aff")
     meters.add_avg("L_emb")
+    meters.add_sc("depth_acc_1mm")
+    meters.add_sc("depth_acc_2mm")
+    meters.add_sc("depth_acc_4mm")
 
     for it, batch in enumerate(loader):
         stereo, depth, disp_gt, k_pair, baseline, left_k = _prepare_stereo_and_cam(batch, device)
@@ -1718,8 +1734,23 @@ def validate(
         meters.update_avg("L_aff", float(loss_aff.item()), n=stereo.size(0))
         meters.update_avg("L_emb", float(loss_emb.item()), n=stereo.size(0))
 
+        depth_pred_1x = pred["point_map_1x"][:, 2:3]
+        depth_err = (depth_pred_1x - depth).abs()
+        valid_mask = mask.bool()
+        valid_count = float(valid_mask.sum().item())
+        if valid_count > 0.0:
+            acc_1mm = float((depth_err[valid_mask] < 1.0).sum().item())
+            acc_2mm = float((depth_err[valid_mask] < 2.0).sum().item())
+            acc_4mm = float((depth_err[valid_mask] < 4.0).sum().item())
+        else:
+            acc_1mm = 0.0
+            acc_2mm = 0.0
+            acc_4mm = 0.0
+        meters.update_sc("depth_acc_1mm", acc_1mm, valid_count)
+        meters.update_sc("depth_acc_2mm", acc_2mm, valid_count)
+        meters.update_sc("depth_acc_4mm", acc_4mm, valid_count)
+
         if writer is not None and dist_utils.is_main_process() and it == 0:
-            depth_pred_1x = pred["point_map_1x"][:, 2:3]
             _log_disp_and_depth(
                 writer,
                 epoch,

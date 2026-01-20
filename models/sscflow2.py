@@ -26,6 +26,7 @@ from models.stereo_disparity import (
 from utils.projection import SilhouetteDepthRenderer
 from utils import rot_utils
 from utils.logging_utils import section_timer
+from utils.normalization_utils import normalize_point_map, denormalize_pos_mu, denormalize_pos_logvar
 from models.updater import DeltaPoseRegressorMapHourglass4L, DeltaPoseRegressorUNet, DeltaPoseRegressor, DeltaPoseRegressor_CF
 from models.raft_base_updater import DeltaPoseRegressorRAFTLike
 
@@ -59,6 +60,7 @@ class SSCFlow2(nn.Module):
                  point_map_norm_mean: Optional[Sequence[float]] = None,
                  point_map_norm_std: Optional[Sequence[float]] = None,
                  point_map_norm_eps: float = 1e-6,
+                 use_pos_logz: bool = True,
                  ):
         super().__init__()
         self.levels = levels
@@ -127,6 +129,7 @@ class SSCFlow2(nn.Module):
         self.use_so3_log_ratio_normal = use_so3_log_ratio_normal
         self.raft_like_updater = raft_like_updater
         self.point_map_norm_eps = float(point_map_norm_eps)
+        self.use_pos_logz = bool(use_pos_logz)
         self.use_point_map_norm = point_map_norm_mean is not None and point_map_norm_std is not None
         if self.use_point_map_norm:
             mean = torch.as_tensor(point_map_norm_mean, dtype=torch.float32)
@@ -158,14 +161,12 @@ class SSCFlow2(nn.Module):
         """Normalize point map to standardized (X/Z, Y/Z, logZ) when enabled."""
         if not self.use_point_map_norm:
             return point_map
-        z = point_map[:, 2:3].clamp_min(self.point_map_norm_eps)
-        xz = point_map[:, 0:1] / z
-        yz = point_map[:, 1:2] / z
-        logz = torch.log(z)
-        point_map_norm = torch.cat([xz, yz, logz], dim=1)
-        mean = self.point_map_norm_mean.to(device=point_map.device, dtype=point_map.dtype)
-        std = self.point_map_norm_std.to(device=point_map.device, dtype=point_map.dtype)
-        return (point_map_norm - mean) / std
+        return normalize_point_map(
+            point_map,
+            eps=self.point_map_norm_eps,
+            mean=self.point_map_norm_mean,
+            std=self.point_map_norm_std,
+        )
 
     def forward(
         self,
@@ -245,11 +246,19 @@ class SSCFlow2(nn.Module):
             mask_14=left_mask_1_4,    # 入力インスタンスマスク（そのまま）
             point_map_14=point_map_cur_in
         )
+        pos_mu_raw = head_out["pos_mu"]
+        pos_logvar_raw = head_out["pos_logvar"]
+        if self.use_pos_logz:
+            pos_mu = denormalize_pos_mu(pos_mu_raw)
+            pos_logvar = denormalize_pos_logvar(pos_logvar_raw, pos_mu_raw)
+        else:
+            pos_mu = pos_mu_raw
+            pos_logvar = pos_logvar_raw
         with torch.no_grad():
             inst = extract_instances_from_head_vec(
                 head_out["center_logits"],
                 head_out["mask_logits"],
-                head_out["pos_mu"],
+                pos_mu,
                 head_out["rot_mat"],
                 head_out["cls_logits"],
                 K_pair_1x[:, 0],
@@ -260,7 +269,7 @@ class SSCFlow2(nn.Module):
                 self.nms_radius,
                 self.center_thresh,
                 True,                            # use_uncertainty
-                head_out.get("pos_logvar", None),
+                pos_logvar,
                 head_out.get("rot_logvar_theta", None),
                 2.0, 4,                          # gauss_sigma, gauss_radius
                 True                             # class_from_logits
@@ -270,14 +279,12 @@ class SSCFlow2(nn.Module):
         # 単発ヘッド出力に格納
         mask_logits        = head_out["mask_logits"]
         center_logits      = head_out["center_logits"]
-        pos_mu             = head_out["pos_mu"]
-        pos_logvar         = head_out["pos_logvar"]
         rot_mat            = head_out["rot_mat"]
         rot_logvar_theta   = head_out["rot_logvar_theta"]
         cls_logits         = head_out["cls_logits"]
-        assert head_out["pos_mu"].shape[1] == 3
-        assert head_out["pos_logvar"].shape[1] == 3
-        current_pos_map = pos_mu_to_pointmap(head_out["pos_mu"], K_pair_1x[:, 0], downsample=4)
+        assert pos_mu.shape[1] == 3
+        assert pos_logvar.shape[1] == 3
+        current_pos_map = pos_mu_to_pointmap(pos_mu, K_pair_1x[:, 0], downsample=4)
         current_rot_map = rot_mat
         flow_pred_list = []
         if enable_pose_update:

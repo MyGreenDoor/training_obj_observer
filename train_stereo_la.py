@@ -345,6 +345,7 @@ def build_model(cfg: dict, class_table: dict) -> SSCFlow2:
         use_so3_log_xyz=bool(mcfg.get("use_so3_log_xyz", True)),  # 回転=so3ログ, 並進=Δx,Δy,Δz
         use_so3_log_ratio_normal=bool(mcfg.get("use_so3_log_ratio_normal", True)),
         raft_like_updater=bool(mcfg.get("raft_like_updater", True)),
+        use_pos_logz=bool(mcfg.get("use_pos_logz", False)),
         point_map_norm_mean=point_map_norm_mean,
         point_map_norm_std=point_map_norm_std,
     )
@@ -889,6 +890,9 @@ def _init_window_meter():
         "loss": 0.0,
         "loss_disp":  0.0,
         "depth_mae":  0.0,
+        "depth_acc_1mm": 0.0,
+        "depth_acc_2mm": 0.0,
+        "depth_acc_4mm": 0.0,
         "L_ctr":  0.0,
         "L_mask":  0.0,
         "L_pos":  0.0,
@@ -954,6 +958,12 @@ def _flush_train_window_to_tb(writer, window_sum, window_cnt, optimizer, global_
     writer.add_scalar(f"{prefix}/loss",       window_sum["loss"]      / denom, global_step)
     writer.add_scalar(f"{prefix}/loss_disp",  window_sum["loss_disp"] / denom, global_step)
     writer.add_scalar(f"{prefix}/depth_mae",  window_sum["depth_mae"] / denom, global_step)
+    if "depth_acc_1mm" in window_sum:
+        writer.add_scalar(f"{prefix}/depth_acc_1mm", window_sum["depth_acc_1mm"] / denom, global_step)
+    if "depth_acc_2mm" in window_sum:
+        writer.add_scalar(f"{prefix}/depth_acc_2mm", window_sum["depth_acc_2mm"] / denom, global_step)
+    if "depth_acc_4mm" in window_sum:
+        writer.add_scalar(f"{prefix}/depth_acc_4mm", window_sum["depth_acc_4mm"] / denom, global_step)
     writer.add_scalar(f"{prefix}/lr", optimizer.param_groups[0]["lr"], global_step)
     
     # 追加/動的な loss 群（"L_" で始まるキーをすべて出力）
@@ -1724,6 +1734,19 @@ def train_one_epoch(
         # ---- メトリクス ----
         depth_pred_1x = F.interpolate(depth_pred, size=(256, 256), mode="bilinear", align_corners=False)
         depth_mae = l1(depth_pred_1x[mask], depth[mask])
+        depth_err = (depth_pred_1x - depth).abs()
+        valid_mask = mask.bool()
+        if valid_mask.any().item():
+            depth_acc_1mm = (depth_err[valid_mask] < 1.0).float().mean()
+            depth_acc_2mm = (depth_err[valid_mask] < 2.0).float().mean()
+            depth_acc_4mm = (depth_err[valid_mask] < 4.0).float().mean()
+        else:
+            depth_acc_1mm = depth_err.new_tensor(0.0)
+            depth_acc_2mm = depth_err.new_tensor(0.0)
+            depth_acc_4mm = depth_err.new_tensor(0.0)
+        logs["depth_acc_1mm"] = depth_acc_1mm
+        logs["depth_acc_2mm"] = depth_acc_2mm
+        logs["depth_acc_4mm"] = depth_acc_4mm
 
         # ---- スケジューラ（AMPのスキップ検知） ----
         did_optim_step = scaler.get_scale() >= prev_scale
@@ -1787,6 +1810,9 @@ def validate(
     meters = DictMeters()
     meters.add_sc("disp_epe")
     meters.add_sc("depth_mae")
+    meters.add_sc("depth_acc_1mm")
+    meters.add_sc("depth_acc_2mm")
+    meters.add_sc("depth_acc_4mm")
     for loss_str in ["L", "L_ctr", "L_mask", "L_pos", "L_rot", "L_cls", "L_adds"]:
         meters.add_avg(loss_str)
     renderer = SilhouetteDepthRenderer(
@@ -1839,6 +1865,20 @@ def validate(
         abs_err_sum = (depth_pred_1x - depth).abs()[mask].sum().item()
         pix_count   = mask.sum().item()
         meters.update_sc("depth_mae", float(abs_err_sum), float(pix_count))
+        depth_err = (depth_pred_1x - depth).abs()
+        valid_mask = mask.bool()
+        valid_count = float(valid_mask.sum().item())
+        if valid_count > 0.0:
+            acc_1mm = float((depth_err[valid_mask] < 1.0).sum().item())
+            acc_2mm = float((depth_err[valid_mask] < 2.0).sum().item())
+            acc_4mm = float((depth_err[valid_mask] < 4.0).sum().item())
+        else:
+            acc_1mm = 0.0
+            acc_2mm = 0.0
+            acc_4mm = 0.0
+        meters.update_sc("depth_acc_1mm", acc_1mm, valid_count)
+        meters.update_sc("depth_acc_2mm", acc_2mm, valid_count)
+        meters.update_sc("depth_acc_4mm", acc_4mm, valid_count)
 
         # ---- 画像ログ（最初のバッチのみ） ----
         if writer is not None and dist_utils.is_main_process() and it == 0:
