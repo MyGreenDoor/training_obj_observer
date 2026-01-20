@@ -499,21 +499,28 @@ def so3_log_map(rot_map: torch.Tensor) -> torch.Tensor:
     return rv.to(rot_map.dtype)
 
 
-# ===== 追加: 付随マップ（pos_logvar / rot_logvar_theta）を同じ重みで平均 =====
+# ===== Extra: average auxiliary maps with the same weights =====
+@torch.jit.script
 def _avg_optional_map(m: torch.Tensor, wn: torch.Tensor) -> torch.Tensor:
-    # m: (B,C,H,W) -> (B,K,C)（wnで重み平均）
+    # m: (B,C,H,W) -> (B,K,C), weighted average by wn
     C = m.size(1)
-    mk = (m.unsqueeze(1) * wn)  # (B,K,1,H,W)
-    # ブロードキャストのためにCを合わせる
-    mk = (m.unsqueeze(1) * wn)  # (B,K,1,H,W)
-    # もう一度やり直し: ちゃんとCを掛ける
-    mk = (m.unsqueeze(1) * wn)  # (B,K,1,H,W)
-    # 上の行をCに対応させる:
-    mk = (m.unsqueeze(1) * wn)               # (B,K,C?,H,W)? ←Cを足す
-    # 正: wnは(…1,H,W)なので m.unsqueeze(1)は(…C,H,W)。ブロードキャストOK。
-    mk = (m.unsqueeze(1) * wn)               # (B,K,C,H,W)
-    mk = mk.sum(dim=(3,4))                                     # (B,K,C)
+    mk = (m.unsqueeze(1) * wn)  # (B,K,C,H,W)
+    mk = mk.sum(dim=(3,4))      # (B,K,C)
     return mk
+
+
+@torch.jit.script
+def _gather_peak_map(
+    m: torch.Tensor,
+    b_ix: torch.Tensor,
+    lin: torch.Tensor,
+    H: int,
+    W: int,
+) -> torch.Tensor:
+    # m: (B,C,H,W) -> (B,K,C) at (y_pk,x_pk)
+    C = m.size(1)
+    m_flat = m.permute(0, 2, 3, 1).reshape(m.size(0), H * W, C)  # (B,HW,C)
+    return m_flat[b_ix, lin]
 
 
 
@@ -526,8 +533,8 @@ def _avg_optional_map(m: torch.Tensor, wn: torch.Tensor) -> torch.Tensor:
 #     min_px: int = 10,
 #     min_wsum: float = 1e-6,
 #     tau_peak: float = 0.0,          # 例: 0.2（peak信頼ゲート）
-#     pos_logvar: torch.Tensor = None,        # (B,Cp,H,W) 例: Cp=1 or 3
-#     rot_logvar_theta: torch.Tensor = None,  # (B,Cr,H,W) 例: Cr=1
+#     pos_logvar: Optional[torch.Tensor] = None,        # (B,Cp,H,W) 例: Cp=1 or 3
+#     rot_logvar_theta: Optional[torch.Tensor] = None,  # (B,Cr,H,W) 例: Cr=1
 # ):
 #     """
 #     Always pick R, t (and logvars if provided) at peak.
@@ -564,7 +571,7 @@ def _avg_optional_map(m: torch.Tensor, wn: torch.Tensor) -> torch.Tensor:
 
 #     # --- peak 取得 ---
 #     if (peaks_yx is None) or (peaks_yx.numel() == 0):
-#         w2d = w.squeeze(2)                        # (B,K,H,W)
+#         w2d = w_peak.squeeze(2)                        # (B,K,H,W)
 #         wflat = w2d.reshape(B, K, -1)             # (B,K,HW)
 #         idx = wflat.argmax(dim=-1)                # (B,K)
 #         y_pk = (idx // W).clamp_(0, H-1)
@@ -606,18 +613,25 @@ def _avg_optional_map(m: torch.Tensor, wn: torch.Tensor) -> torch.Tensor:
 #     return R_hat, t_hat, valid, pos_logvar_k, rot_logvar_k
 
 
+@torch.jit.script
 def pose_from_maps_auto(
     rot_map: torch.Tensor,      # (B,3,3,H,W)
     pos_map: torch.Tensor,      # (B,3,H,W)
     Wk_1_4: torch.Tensor,       # (B,K,1,H,W)
     wfg: torch.Tensor,          # (B,1,H,W)
-    peaks_yx: torch.Tensor = None,  # (B,K,2) or None
+    peaks_yx: Optional[torch.Tensor] = None,  # (B,K,2) or None
     min_px: int = 10,
     min_wsum: float = 1e-6,
     tau_peak: float = 0.0,          # 例: 0.2 など（peak信頼の閾値）
-    pos_logvar: torch.Tensor = None,        # (B,Cp,H,W) 例: Cp=1(Zのみ) or 3(XYZ)
-    rot_logvar_theta: torch.Tensor = None,  # (B,Cr,H,W) 例: Cr=1（角度分散など）
-):
+    pos_logvar: Optional[torch.Tensor] = None,        # (B,Cp,H,W) 例: Cp=1(Zのみ) or 3(XYZ)
+    rot_logvar_theta: Optional[torch.Tensor] = None,  # (B,Cr,H,W) 例: Cr=1（角度分散など）
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
     """
     return:
       R_hat: (B,K,3,3)
@@ -642,38 +656,56 @@ def pose_from_maps_auto(
     wfg = wfg.clamp_min(0).to(torch.float32)             # (B,1,H,W)
     w = (Wk * wfg.unsqueeze(1))                          # (B,K,1,H,W)
 
-    # 有効判定
+    # Validity check uses base weights only.
     px = (w > 0).sum(dim=(2,3,4))                        # (B,K)
     wsum = w.sum(dim=(2,3,4))                            # (B,K)
     valid = (px >= min_px) & (wsum >= min_wsum)          # (B,K)
 
-    # 正規化（ゼロ割り防止）
-    denom = wsum.view(B, K, 1, 1, 1).clamp_min(min_wsum)
-    wn = (w / denom)                                     # (B,K,1,H,W)
+    w_pos = w
+    w_rot = w
+    w_peak = w
+    if pos_logvar is not None:
+        pos_logvar_t = torch.jit._unwrap_optional(pos_logvar)
+        pos_lv = pos_logvar_t.mean(dim=1, keepdim=True)
+        pos_conf = torch.exp(-0.5 * pos_lv)
+        w_pos = w_pos * pos_conf.unsqueeze(1)
+        w_peak = w_peak * pos_conf.unsqueeze(1)
+    if rot_logvar_theta is not None:
+        rot_logvar_t = torch.jit._unwrap_optional(rot_logvar_theta)
+        rot_conf = torch.exp(-0.5 * rot_logvar_t)
+        w_rot = w_rot * rot_conf.unsqueeze(1)
+        w_peak = w_peak * rot_conf.unsqueeze(1)
 
-    # --- t: 加重平均 ---
-    t_hat = (pos_map.to(torch.float32).unsqueeze(1) * wn).sum(dim=(3,4))  # (B,K,3)
+    denom_pos = w_pos.sum(dim=(2,3,4)).view(B, K, 1, 1, 1).clamp_min(min_wsum)
+    wn_pos = w_pos / denom_pos
+    denom_rot = w_rot.sum(dim=(2,3,4)).view(B, K, 1, 1, 1).clamp_min(min_wsum)
+    wn_rot = w_rot / denom_rot
 
-    # --- R: Lie 平均（log -> 平均 -> exp） ---
+    # --- t: weighted average ---
+    t_hat = (pos_map.to(torch.float32).unsqueeze(1) * wn_pos).sum(dim=(3,4))  # (B,K,3)
+
+    # --- R: Lie average (log -> avg -> exp) ---
     r_map = so3_log_map(rot_map.to(torch.float32))                # (B,3,H,W)
-    r_hat = (r_map.unsqueeze(1) * wn).sum(dim=(3,4))              # (B,K,3)
+    r_hat = (r_map.unsqueeze(1) * wn_rot).sum(dim=(3,4))          # (B,K,3)
     R_hat = so3_exp_vec(r_hat).to(dtype)                          # (B,K,3,3)
     t_hat = t_hat.to(dtype)
-    pos_logvar_k = None
-    rot_logvar_k = None
+    pos_logvar_k = torch.jit.annotate(Optional[torch.Tensor], None)
+    rot_logvar_k = torch.jit.annotate(Optional[torch.Tensor], None)
     if pos_logvar is not None:
-        pos_logvar_k = _avg_optional_map(pos_logvar, wn)               # (B,K,Cp)
+        pos_logvar_t = torch.jit._unwrap_optional(pos_logvar)
+        pos_logvar_k = _avg_optional_map(pos_logvar_t, wn_pos)         # (B,K,Cp)
     if rot_logvar_theta is not None:
-        rot_logvar_k = _avg_optional_map(rot_logvar_theta, wn)         # (B,K,Cr)
+        rot_logvar_t = torch.jit._unwrap_optional(rot_logvar_theta)
+        rot_logvar_k = _avg_optional_map(rot_logvar_t, wn_rot)         # (B,K,Cr)
 
-    # --- フォールバックが必要か？（ピーク抽出） ---
+    # --- Fallback if needed (peak selection) ---
     use_pk = ~valid
     need_pk = bool(use_pk.any().item())
 
     if need_pk:
         # peaks が無ければ「最大重み画素」で代用
         if (peaks_yx is None) or (peaks_yx.numel() == 0):
-            w2d = w.squeeze(2)                               # (B,K,H,W)
+            w2d = w_peak.squeeze(2)                               # (B,K,H,W)
             wflat = w2d.reshape(B, K, -1)                    # (B,K,HW)
             idx = wflat.argmax(dim=-1)                       # (B,K)
             y_pk = (idx // W).clamp_(0, H-1)
@@ -702,20 +734,14 @@ def pose_from_maps_auto(
         t_hat = torch.where(mT, t_pk.to(t_hat.dtype), t_hat)
 
         # ▼ 追加：logvar 系もピーク値でフォールバックして整合
-        def _gather_peak_map(m: torch.Tensor):
-            # m: (B,C,H,W) -> (B,K,C) at (y_pk,x_pk)
-            if m is None:
-                return None
-            C = m.size(1)
-            m_flat = m.permute(0,2,3,1).reshape(B, H*W, C)       # (B,HW,C)
-            m_pk = m_flat[b_ix, lin]                              # (B,K,C)
-            return m_pk.to(dtype)
-        if pos_logvar_k is not None:
-            pos_logvar_pk = _gather_peak_map(pos_logvar)         # (B,K,Cp)
+        if pos_logvar is not None and pos_logvar_k is not None:
+            pos_logvar_t = torch.jit._unwrap_optional(pos_logvar)
+            pos_logvar_pk = _gather_peak_map(pos_logvar_t, b_ix, lin, H, W).to(dtype)       # (B,K,Cp)
             m = use_pk.unsqueeze(-1)                              # (B,K,1)
             pos_logvar_k = torch.where(m, pos_logvar_pk, pos_logvar_k)
-        if rot_logvar_k is not None:
-            rot_logvar_pk = _gather_peak_map(rot_logvar_theta)   # (B,K,Cr)
+        if rot_logvar_theta is not None and rot_logvar_k is not None:
+            rot_logvar_t = torch.jit._unwrap_optional(rot_logvar_theta)
+            rot_logvar_pk = _gather_peak_map(rot_logvar_t, b_ix, lin, H, W).to(dtype)       # (B,K,Cr)
             m = use_pk.unsqueeze(-1)
             rot_logvar_k = torch.where(m, rot_logvar_pk, rot_logvar_k)
 
