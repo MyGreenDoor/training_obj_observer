@@ -1784,7 +1784,7 @@ def _load_model_state(model, state_dict, strict: bool = False):
 def main() -> None:
     """Entry point for panoptic stereo training."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, help="Path to config TOML", default="configs/small_config.toml")
+    parser.add_argument("--config", type=str, help="Path to config TOML", default="configs/small_config_panoptic.toml")
     parser.add_argument("--launcher", type=str, choices=["none", "pytorch"], default="none")
     args = parser.parse_args()
 

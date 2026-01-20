@@ -62,8 +62,8 @@ levels = 4
 radius_w = 4              # 右方向半径
 radius_h = 1              # 縦方向半径（2D は radius_w をコピーして使う想定、a2d は個別指定）
 
-hidden_ch = 128     # 隠れ層次元
-context_ch = 128     # コンテキスト次元
+hidden_ch = 96     # 隠れ層次元
+context_ch = 96     # コンテキスト次元
 
 topk=50
 nms_radius=4
