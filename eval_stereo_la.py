@@ -431,6 +431,19 @@ def evaluate(
         pred_R_sel = pred_R_sem
         pred_t_sel = pred_t_sem
         pred_valid_sel = pred_valid_sem
+        sym_axes = batch.get("symmetry_axes", None)
+        sym_orders = batch.get("symmetry_orders", None)
+        if sym_axes is not None and sym_orders is not None:
+            sym_axes = sym_axes.to(device, non_blocking=True)
+            sym_orders = sym_orders.to(device, non_blocking=True)
+            sym_axes_sel = sym_axes[b_ix, gt_idx].unsqueeze(1)
+            sym_orders_sel = sym_orders[b_ix, gt_idx].unsqueeze(1)
+            pred_R_sel, _ = rot_utils.canonicalize_pose_gspose_torch(
+                pred_R_sel,
+                pred_t_sel,
+                sym_axes_sel,
+                sym_orders_sel,
+            )
         gt_R_sel = gt_R[b_ix, gt_idx].unsqueeze(1)
         gt_t_sel = gt_t[b_ix, gt_idx].unsqueeze(1)
         gt_valid_sel = gt_valid[b_ix, gt_idx].unsqueeze(1)

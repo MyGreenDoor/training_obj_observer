@@ -352,6 +352,18 @@ def _gather_map_at_peaks(map_: torch.Tensor, idxs_yx: torch.Tensor) -> torch.Ten
     return val 
 
 
+def _build_inst_id_map(
+    weight_map_inst: torch.Tensor,
+    mask_1_4: typing.Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Build 0-based instance ID map from weight maps."""
+    inst_id = weight_map_inst.squeeze(2).argmax(dim=1)
+    if mask_1_4 is not None:
+        fg = mask_1_4.squeeze(1) > 0
+        inst_id = torch.where(fg, inst_id, torch.zeros_like(inst_id))
+    return inst_id
+
+
 def pick_representatives_mask_only(inst_mask, valid_map, pos_map, rot_map=None, n_erode=0):
     """
     inst_mask: (B,K,H,W)  0/1
@@ -506,10 +518,15 @@ def loss_pose_sequence(
     adds_max_points: int = 4096,
     eps_small: float = 1e-6,
     rot_only: bool = True,
+    symmetry_axes: typing.Optional[torch.Tensor] = None,
+    symmetry_orders: typing.Optional[torch.Tensor] = None,
+    inst_id_map: typing.Optional[torch.Tensor] = None,
 ) -> typing.Dict[str, torch.Tensor]:
     total = R_gt_map.new_tensor(0.0)
     sum_w = R_gt_map.new_tensor(0.0)
     logs: typing.Dict[str, torch.Tensor] = {}
+    if symmetry_axes is not None and symmetry_orders is not None and inst_id_map is None:
+        inst_id_map = _build_inst_id_map(weight_map_inst, t_gt_map[:, -1:])
     for t, (R_pred_map, t_pred_map) in enumerate(zip(R_pred_list, t_pred_list)):
         wt = (gamma ** t)
 
@@ -517,7 +534,30 @@ def loss_pose_sequence(
         rot_lv = None
         if rot_logvar_theta_list is not None and t < len(rot_logvar_theta_list):
             rot_lv = rot_logvar_theta_list[t]
-        L_rot_t = rotation_loss_hetero_map(R_pred_map, R_gt_map, rot_lv, t_gt_map[:, -1:] > 0)
+        R_map_use = R_pred_map
+        R_t, t_t, _, _, _ = rot_utils.pose_from_maps_auto(
+            rot_map=R_pred_map,
+            pos_map=t_pred_map,
+            Wk_1_4=weight_map_inst,
+            wfg=wfg,
+            peaks_yx=peak_yx,
+        )
+        R_t_use = R_t
+        if symmetry_axes is not None and symmetry_orders is not None and inst_id_map is not None:
+            R_t_use, delta = rot_utils.canonicalize_pose_gspose_torch(
+                R_t,
+                t_t,
+                symmetry_axes,
+                symmetry_orders,
+            )
+            R_map_use = rot_utils.apply_symmetry_rotation_map(
+                R_map_use,
+                symmetry_axes,
+                delta,
+                inst_id_map,
+                fg_mask=t_gt_map[:, -1:],
+            )
+        L_rot_t = rotation_loss_hetero_map(R_map_use, R_gt_map, rot_lv, t_gt_map[:, -1:] > 0)
 
         # ----- translation loss (pixel-weighted) -----
         
@@ -529,16 +569,9 @@ def loss_pose_sequence(
         L_pos_t = pos_loss_hetero_map(t_pred_map / pos_scale, pos_lv, t_gt_map / pos_scale, t_gt_map[:, -1:] > 0)
         
         # ----- ADD/ADD-S（任意; 安全化付き）-----
-        R_t, t_t, _, _, _ = rot_utils.pose_from_maps_auto(
-            rot_map=R_pred_map, 
-            pos_map=t_pred_map,
-            Wk_1_4=weight_map_inst, 
-            wfg=wfg,
-            peaks_yx=peak_yx,
-        )
         with torch.no_grad():
             L_adds_t = adds_core_from_Rt(
-                    R_pred=R_t, t_pred=t_t,
+                    R_pred=R_t_use, t_pred=t_t,
                     R_gt=R_gt,     t_gt=t_gt,
                     model_points=model_points,
                     diameters=diameters,
@@ -549,7 +582,7 @@ def loss_pose_sequence(
                 )
             
             L_add_t = adds_core_from_Rt(
-                    R_pred=R_t, t_pred=t_t,
+                    R_pred=R_t_use, t_pred=t_t,
                     R_gt=R_gt,     t_gt=t_gt,
                     model_points=model_points,
                     diameters=diameters,
@@ -639,7 +672,28 @@ def loss_step_iter0(out, gt,
         pos_logvar=out["pos_logvar"],
         rot_logvar_theta=out["rot_logvar_theta"]
     ) # (B,K,3,3), (B,K,3), (B,K)
-    
+
+    sym_axes = gt.get("symmetry_axes", None)
+    sym_orders = gt.get("symmetry_orders", None)
+    rot_map_use = out["rot_mat"]
+    R_pred_use = R_pred
+    inst_id_map = None
+    if sym_axes is not None and sym_orders is not None:
+        inst_id_map = _build_inst_id_map(gt["weight_map_inst"], gt.get("mask_1_4", None))
+        R_pred_use, delta = rot_utils.canonicalize_pose_gspose_torch(
+            R_pred,
+            t_pred,
+            sym_axes,
+            sym_orders,
+        )
+        rot_map_use = rot_utils.apply_symmetry_rotation_map(
+            rot_map_use,
+            sym_axes,
+            delta,
+            inst_id_map,
+            fg_mask=gt.get("mask_1_4", None),
+        )
+
     idx_yx, t_gt, R_gt = pick_representatives_mask_only(
         inst_mask=gt["pos_1_4"][:, -1:] > 0,
         valid_map=gt["pos_1_4"][:, -1:] > 0,
@@ -669,9 +723,9 @@ def loss_step_iter0(out, gt,
 
     # 4) Rotation
     L_rot = rotation_loss_hetero(
-        R_pred, R_gt, rot_log_theta, valid
+        R_pred_use, R_gt, rot_log_theta, valid
     )
-    L_rot_map = rotation_loss_hetero_map(out["rot_mat"], gt["R_1_4"], out["rot_logvar_theta"], gt["pos_1_4"][:, -1:] > 0)
+    L_rot_map = rotation_loss_hetero_map(rot_map_use, gt["R_1_4"], out["rot_logvar_theta"], gt["pos_1_4"][:, -1:] > 0)
     
         # ★ 追加: iter0 ADD/ADD-S
     L_adds = torch.tensor(0.0, device=device)
@@ -679,7 +733,7 @@ def loss_step_iter0(out, gt,
     if can_adds:
         with torch.no_grad():
             L_adds = adds_core_from_Rt(
-                R_pred = R_pred,
+                R_pred = R_pred_use,
                 t_pred= t_pred,          # ここは「Zのみ」のデザインでもOK（μ_zを使う）
                 R_gt     = R_gt,
                 t_gt   = t_gt,          # (X,Y,Z)。Zしか無いなら X,Y を GT から計算して入れる
@@ -694,7 +748,7 @@ def loss_step_iter0(out, gt,
     if can_add:
         with torch.no_grad():
             L_add = adds_core_from_Rt(
-                R_pred = R_pred,
+                R_pred = R_pred_use,
                 t_pred= t_pred,          # ここは「Zのみ」のデザインでもOK（μ_zを使う）
                 R_gt     = R_gt,
                 t_gt   = t_gt,          # (X,Y,Z)。Zしか無いなら X,Y を GT から計算して入れる
@@ -734,6 +788,9 @@ def loss_step_iter0(out, gt,
         adds_use_symmetric = use_adds_symmetric,
         adds_max_points = adds_max_points,
         rot_only=True,
+        symmetry_axes=sym_axes,
+        symmetry_orders=sym_orders,
+        inst_id_map=inst_id_map,
     )
     L_maps   = maps_out["loss"]            # Tensor
     map_logs = maps_out.get("logs", {})    # dict

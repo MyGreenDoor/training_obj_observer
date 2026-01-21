@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "config": "configs/inf_config_panoptic.toml",
+    "ckpt": "F:/repos/training_obj_observer/outputs/run_debug/checkpoint_021.pth",
+    "split": "val",
+    "timestamp": "2026-01-21T12:16:28.901305",
+    "iters": 4
+  },
+  "metrics": {
+    "L": 6.306039354264594,
+    "L_sem": 0.06585847253626628,
+    "L_cls": 0.06585847253626628,
+    "L_pos": 0.9035713650076368,
+    "L_pos_map_l2": 15.635803218025536,
+    "L_pos_inst_l2": 14.572280237930876,
+    "L_rot": 0.10677885920236235,
+    "L_rot_map_deg": 40.1097613969737,
+    "L_rot_inst_deg": 43.30990612507919,
+    "L_adds": 8.833273007840884,
+    "L_add": 20.271405868584157,
+    "L_disp_1x": 1.5385291116418869,
+    "L_aff": 0.03029707676174493,
+    "L_emb": 0.24662456527852897,
+    "depth_acc_1mm": 0.3161402595390675,
+    "depth_acc_2mm": 0.5170706716426906,
+    "depth_acc_4mm": 0.7313456548903392
+  }
+}

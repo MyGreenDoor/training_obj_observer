@@ -53,6 +53,30 @@ mp.set_sharing_strategy(strategy)
 
 # --- TOML read/write helpers ---
 _CFG_TEXT_CACHE = None  # original text of the config file
+_WARNED_SYMMETRY_KEYS = False  # Warn once when symmetry metadata is missing/empty.
+
+
+def _warn_missing_symmetry_keys(batch: Dict[str, Any]) -> None:
+    """Warn once if symmetry keys are missing or empty."""
+    global _WARNED_SYMMETRY_KEYS
+    if _WARNED_SYMMETRY_KEYS:
+        return
+    axes = batch.get("symmetry_axes", None)
+    orders = batch.get("symmetry_orders", None)
+    missing = axes is None or orders is None
+    empty = False
+    if not missing:
+        if isinstance(axes, torch.Tensor) and isinstance(orders, torch.Tensor):
+            empty = axes.numel() == 0 or orders.numel() == 0
+        else:
+            try:
+                empty = len(axes) == 0 or len(orders) == 0
+            except TypeError:
+                empty = False
+    if missing or empty:
+        if dist_utils.is_main_process():
+            print("[warn] symmetryキーが欠けている／空")
+        _WARNED_SYMMETRY_KEYS = True
 
 
 def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -66,6 +90,8 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     # まず可変Kテンソル
     Wk_list = [b.pop('instance_weight_map') for b in batch]  # list of (Ki,H4,W4)
+    sym_axes_list = [b.pop("symmetry_axes", None) for b in batch]
+    sym_orders_list = [b.pop("symmetry_orders", None) for b in batch]
 
     # インスタンスごとの mesh をフラット化
     verts_all, faces_all, bk_splits, diameters_all = [], [], [], []  # bk_splits: 画像ごとの Ki
@@ -96,7 +122,6 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     out['instance_weight_map'] = Wk
     out['valid_k'] = valid_k
-
     # ---- フラットな全インスタンスから点群サンプル → 再パック ----
     N_pts = 4096
     meshes_all_mm = Meshes(
@@ -108,6 +133,23 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 画像ごとにスライスして (B, Ki, N, 3) → pad to (B, Kmax, N, 3)
     B = len(bk_splits)
     Kmax = Wk.size(1)
+    if any(v is not None for v in sym_axes_list) and any(v is not None for v in sym_orders_list):
+        sym_axes = torch.zeros((B, Kmax, 3), dtype=torch.float32)
+        sym_orders = torch.ones((B, Kmax), dtype=torch.float32)
+        for b, (axes_item, orders_item) in enumerate(zip(sym_axes_list, sym_orders_list)):
+            if axes_item is None or orders_item is None:
+                continue
+            if not isinstance(axes_item, (list, tuple)):
+                axes_item = list(axes_item)
+            if not isinstance(orders_item, (list, tuple)):
+                orders_item = list(orders_item)
+            k_lim = min(len(axes_item), Kmax)
+            for k in range(k_lim):
+                sym_axes[b, k] = torch.as_tensor(axes_item[k]).view(-1)[:3].float()
+                sym_orders[b, k] = float(torch.as_tensor(orders_item[k]).reshape(-1)[0].item())
+        out["symmetry_axes"] = sym_axes
+        out["symmetry_orders"] = sym_orders
+
     model_points = pts_all.new_zeros(B, Kmax, N_pts, 3)
     diameters = torch.zeros((B, Kmax), dtype=torch.float32)
     idx = 0
@@ -983,6 +1025,7 @@ def _prepare_iter0_targets(batch, cfg, device):
     Returns:
         Tuple of (gt_iter0, instance_weight_map, mask).
     """
+    _warn_missing_symmetry_keys(batch)
     gt_iter0 = {}
     mask = batch['instance_seg'].to(device, non_blocking=True).unsqueeze(1) > 0
     H4 = cfg['data']['height'] // 4
@@ -995,6 +1038,10 @@ def _prepare_iter0_targets(batch, cfg, device):
     gt_iter0['cls_target']  = batch['class_map'].to(device, non_blocking=True)
     gt_iter0['R_1_4']       = batch['rot_map'].to(device, non_blocking=True)
     gt_iter0['diameters']   = batch['diameters'].to(device, non_blocking=True)
+    if "symmetry_axes" in batch:
+        gt_iter0["symmetry_axes"] = batch["symmetry_axes"].to(device, non_blocking=True)
+    if "symmetry_orders" in batch:
+        gt_iter0["symmetry_orders"] = batch["symmetry_orders"].to(device, non_blocking=True)
 
     instance_weight_map = batch['instance_weight_map'].to(device, non_blocking=True).unsqueeze(2)  # (B,K,1,H4,W4)
     B, K, _, H4m, W4m = instance_weight_map.shape
@@ -1156,6 +1203,26 @@ def _log_pose_and_silhouette(
         pred_instances['valid'],
     )
     vis_pred_pose = pred_pose[:n_images].detach().clone()
+    pred_pose_norm = None
+    sym_axes = gt_iter0.get("symmetry_axes", None)
+    sym_orders = gt_iter0.get("symmetry_orders", None)
+    if sym_axes is not None and sym_orders is not None:
+        sym_axes = sym_axes.to(pred_pose.device)
+        sym_orders = sym_orders.to(pred_pose.device)
+        if valid_k is not None and valid_k.numel() > 0:
+            sym_axes = torch.where(valid_k.unsqueeze(-1), sym_axes, torch.zeros_like(sym_axes))
+            sym_orders = torch.where(valid_k, sym_orders, torch.ones_like(sym_orders))
+        R_pred_norm, _ = rot_utils.canonicalize_pose_gspose_torch(
+            pred_instances['R'],
+            pred_instances['t'],
+            sym_axes,
+            sym_orders,
+        )
+        pred_pose_norm = rot_utils.compose_T_from_Rt(
+            R_pred_norm,
+            pred_instances['t'],
+            pred_instances['valid'],
+        )
 
     _, t_gt, R_gt = loss_functions.pick_representatives_mask_only(
         inst_mask=gt_iter0["pos_1_4"][:, -1:] > 0,
@@ -1227,6 +1294,41 @@ def _log_pose_and_silhouette(
         scale_each=True,
     )
     writer.add_image(f"{prefix}/vis_init_pose", grid, step_value)
+    if pred_pose_norm is not None:
+        pred_r_norm = renderer(
+            meshes_flat=meshes_flat_n,
+            T_cam_obj=pred_pose_norm[:n_images],
+            K_left=k_pair[:n_images, 0],
+            valid_k=valid_k[:n_images],
+            image_size=image_size,
+        )
+        sil_pred_norm = pred_r_norm["silhouette"]
+        overlay_pred_norm = _overlay_mask_rgb(
+            stereo[:n_images, :3],
+            sil_pred_norm,
+            color=(0.0, 1.0, 0.0),
+            alpha=0.45,
+        )
+        overlay_both_norm = _overlay_mask_rgb(
+            overlay_gt,
+            sil_pred_norm,
+            color=(0.0, 1.0, 0.0),
+            alpha=0.45,
+        )
+        init_projected_norm = draw_axes_on_images_bk(
+            overlay_pred_norm,
+            k_pair[:4, 0],
+            pred_pose_norm[0:4],
+            axis_len=30.0,
+            valid=valid_k[0:4],
+        )
+        grid_norm = vutils.make_grid(
+            torch.cat([stereo[:4, :3], init_projected_norm, projected_gt, overlay_both_norm], dim=0),
+            nrow=4,
+            normalize=True,
+            scale_each=True,
+        )
+        writer.add_image(f"{prefix}/vis_init_pose_norm", grid_norm, step_value)
 
     grid_mask = make_mask_overlay_grid(
         stereo[:4, :3],
@@ -1336,6 +1438,51 @@ def _log_final_pose(
         scale_each=True,
     )
     writer.add_image(f"{prefix}/vis_final_pose", grid_final, step_value)
+    sym_axes = gt_iter0.get("symmetry_axes", None)
+    sym_orders = gt_iter0.get("symmetry_orders", None)
+    if sym_axes is not None and sym_orders is not None:
+        sym_axes = sym_axes.to(stereo.device)
+        sym_orders = sym_orders.to(stereo.device)
+        if valid_k is not None and valid_k.numel() > 0:
+            sym_axes = torch.where(valid_k.unsqueeze(-1), sym_axes, torch.zeros_like(sym_axes))
+            sym_orders = torch.where(valid_k, sym_orders, torch.ones_like(sym_orders))
+        r_final_norm, _ = rot_utils.canonicalize_pose_gspose_torch(
+            r_final,
+            t_final,
+            sym_axes,
+            sym_orders,
+        )
+        T_final_norm = rot_utils.compose_T_from_Rt(r_final_norm, t_final, is_valid)
+        T_final_norm_vis = T_final_norm[:n_images].detach().clone()
+        final_r_norm = renderer(
+            meshes_flat=meshes_flat_n,
+            T_cam_obj=T_final_norm_vis,
+            K_left=k_pair[:n_images, 0],
+            valid_k=valid_k[:n_images],
+            image_size=image_size,
+        )
+        sil_final_norm = final_r_norm["silhouette"]
+        overlay_final_norm = _overlay_mask_rgb(
+            stereo[:n_images, :3],
+            sil_final_norm,
+            color=(0.0, 1.0, 0.0),
+            alpha=0.45,
+        )
+        final_axes_norm = draw_axes_on_images_bk(
+            overlay_final_norm,
+            k_pair[:n_images, 0],
+            T_final_norm_vis[:n_images],
+            axis_len=30.0,
+            valid=valid_k[:n_images],
+        )
+        overlay_both_norm = _overlay_mask_rgb(overlay_gt, sil_final_norm, color=(0.0, 1.0, 0.0), alpha=0.45)
+        grid_final_norm = vutils.make_grid(
+            torch.cat([stereo[:n_images, :3], final_axes_norm, projected_gt, overlay_both_norm], dim=0),
+            nrow=4,
+            normalize=True,
+            scale_each=True,
+        )
+        writer.add_image(f"{prefix}/vis_final_pose_norm", grid_final_norm, step_value)
 
 
 def _log_depth_progress(
@@ -1583,6 +1730,8 @@ def _build_flow_gts(
     left_k_14: torch.Tensor,
     R_gt: torch.Tensor,
     t_gt: torch.Tensor,
+    symmetry_axes: Optional[torch.Tensor] = None,
+    symmetry_orders: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Build flow ground truth tensors for each predicted pose update.
 
@@ -1598,12 +1747,20 @@ def _build_flow_gts(
     """
     flow_gts = []
     for Rk, tk in zip(pred['Rk_list'][:-1], pred['tk_list'][:-1]):
+        R_dst = Rk
+        if symmetry_axes is not None and symmetry_orders is not None:
+            R_dst, _ = rot_utils.align_pose_by_symmetry_min_rotation(
+                R_src=R_gt,
+                R_dst=Rk,
+                axis=symmetry_axes,
+                order=symmetry_orders,
+            )
         flow_gt = flow_utils.gt_flow_from_pointmap_and_poses(
             point_map=gt_point_map_14,
             K=left_k_14,
             R_src=R_gt,
             t_src_mm=t_gt,
-            R_dst=Rk,
+            R_dst=R_dst,
             t_dst_mm=tk,
             point_frame="camera",
             point_unit_m=False,
@@ -1691,7 +1848,15 @@ def train_one_epoch(
                     n_erode=1,
                 )
                 gt_point_map_14 = gt_point_map_14 * (gt_iter0['mask_1_4'] > 0)
-                flow_gts = _build_flow_gts(pred, gt_point_map_14, left_k_14, R_gt, t_gt)
+                flow_gts = _build_flow_gts(
+                    pred,
+                    gt_point_map_14,
+                    left_k_14,
+                    R_gt,
+                    t_gt,
+                    gt_iter0.get("symmetry_axes", None),
+                    gt_iter0.get("symmetry_orders", None),
+                )
             gt_iter0["flow_gts"] = flow_gts  # (B,2,H/4,W/4)
             gt_iter0['flow_gt'] = flow_gts[:, -1]
             disp_pred   = pred["disp_preds"]

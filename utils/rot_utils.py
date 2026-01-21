@@ -114,6 +114,233 @@ def compose_T_from_Rt(
     return T
 
 
+def _axis_angle_to_matrix(axis: torch.Tensor, angle: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Build rotation matrices from axes and angles with safe normalization."""
+    axis = axis.reshape(-1, 3)
+    angle = angle.reshape(-1)
+    axis_norm = torch.linalg.norm(axis, dim=1, keepdim=True)
+    default_axis = torch.tensor([1.0, 0.0, 0.0], device=axis.device, dtype=axis.dtype).view(1, 3)
+    axis_unit = torch.where(axis_norm > eps, axis / axis_norm, default_axis)
+    axis_angle = axis_unit * angle.unsqueeze(1)
+    R = _axis_angle_to_R(axis_angle)
+    return R.reshape(*axis.shape[:-1], 3, 3)
+
+
+def _proj_perp(v: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+    """Project vectors v onto the plane orthogonal to n."""
+    return v - (v * n).sum(dim=-1, keepdim=True) * n
+
+
+def canonicalize_pose_gspose_torch(
+    R: torch.Tensor,
+    t: torch.Tensor,
+    axis: torch.Tensor,
+    order: torch.Tensor,
+    eps: float = 1e-8,
+    boundary_bias: float = 1e-12,
+    ensure_objx_toward_pos_camx: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Canonicalize object-to-camera rotations under rotational symmetry.
+
+    Args:
+        R: (...,3,3) rotation matrices (object -> camera).
+        t: (...,3) translation vectors in camera frame.
+        axis: (...,3) symmetry axes in object frame.
+        order: (...) symmetry orders (0=continuous, 1=no symmetry, 2/4/... finite).
+        eps: Numerical stability epsilon.
+        boundary_bias: Bias for half-open rounding in finite symmetry.
+        ensure_objx_toward_pos_camx: Apply the +X_obj toward +X_cam tie-break.
+
+    Returns:
+        Tuple of (R_can, delta) with R_can shape (...,3,3) and delta shape (...,).
+    """
+    orig_shape = R.shape[:-2]
+    Rf = R.reshape(-1, 3, 3)
+    tf = t.reshape(-1, 3)
+    af = axis.reshape(-1, 3)
+    of = order.reshape(-1).to(Rf.dtype)
+
+    axis_norm = torch.linalg.norm(af, dim=1, keepdim=True)
+    axis_valid = axis_norm.squeeze(1) > eps
+    af_unit = af / axis_norm.clamp_min(eps)
+
+    is_finite = torch.isfinite(of)
+    is_cont = (~is_finite) | (of == 0.0)
+    is_noop = is_finite & (of == 1.0)
+    is_finite_sym = is_finite & (of >= 2.0)
+    sym_active = axis_valid & (is_cont | is_finite_sym) & (~is_noop)
+
+    c_obj = -torch.einsum("bij,bj->bi", Rf.transpose(1, 2), tf)
+    p = _proj_perp(c_obj, af_unit)
+    p_norm = torch.linalg.norm(p, dim=1)
+
+    x = torch.tensor([1.0, 0.0, 0.0], device=Rf.device, dtype=Rf.dtype).view(1, 3)
+    y = torch.tensor([0.0, 1.0, 0.0], device=Rf.device, dtype=Rf.dtype).view(1, 3)
+    z = torch.tensor([0.0, 0.0, 1.0], device=Rf.device, dtype=Rf.dtype).view(1, 3)
+    ux = _proj_perp(x, af_unit)
+    uz = _proj_perp(z, af_unit)
+    uy = _proj_perp(y, af_unit)
+    nx = torch.linalg.norm(ux, dim=1)
+    nz = torch.linalg.norm(uz, dim=1)
+    ny = torch.linalg.norm(uy, dim=1)
+
+    use_x = nx > eps
+    use_z = (~use_x) & (nz > eps)
+    use_y = (~use_x) & (~use_z) & (ny > eps)
+    valid_basis = use_x | use_z | use_y
+
+    U = torch.zeros_like(af_unit)
+    U = torch.where(use_x.unsqueeze(1), ux, U)
+    U = torch.where(use_z.unsqueeze(1), uz, U)
+    U = torch.where(use_y.unsqueeze(1), uy, U)
+    U = U / torch.linalg.norm(U, dim=1, keepdim=True).clamp_min(eps)
+    V = torch.cross(af_unit, U, dim=1)
+    V = V / torch.linalg.norm(V, dim=1, keepdim=True).clamp_min(eps)
+
+    phi = torch.atan2((p * V).sum(dim=1), (p * U).sum(dim=1))
+    delta_base = torch.zeros_like(phi)
+    if is_cont.any():
+        delta_base = torch.where(is_cont, phi, delta_base)
+    if is_finite_sym.any():
+        step = (2.0 * torch.pi) / of.clamp_min(2.0)
+        k = torch.floor(phi / step + 0.5 - boundary_bias)
+        delta_base = torch.where(is_finite_sym, k * step, delta_base)
+
+    delta_base = torch.where(sym_active & (p_norm > eps) & valid_basis, delta_base, torch.zeros_like(delta_base))
+
+    if ensure_objx_toward_pos_camx:
+        even_mask = is_cont | (is_finite_sym & torch.isclose(torch.remainder(of, 2.0), torch.zeros_like(of)))
+        R_axis_base = _axis_angle_to_matrix(af_unit, delta_base, eps=eps)
+        R_new_base = torch.einsum("bij,bjk->bik", Rf, R_axis_base)
+        x_cam = R_new_base[:, :, 0]
+        flip = even_mask & (x_cam[:, 0] < 0.0)
+        delta = torch.where(flip, delta_base + torch.pi, delta_base)
+    else:
+        delta = delta_base
+
+    delta = torch.where(sym_active, delta, torch.zeros_like(delta))
+    R_axis = _axis_angle_to_matrix(af_unit, delta, eps=eps)
+    R_can = torch.einsum("bij,bjk->bik", Rf, R_axis)
+    R_can = torch.where(sym_active.view(-1, 1, 1), R_can, Rf)
+
+    return R_can.reshape(*orig_shape, 3, 3), delta.reshape(*orig_shape)
+
+
+def align_pose_by_symmetry_min_rotation(
+    R_src: torch.Tensor,
+    R_dst: torch.Tensor,
+    axis: torch.Tensor,
+    order: torch.Tensor,
+    eps: float = 1e-6,
+    boundary_bias: float = 1e-12,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Align R_dst by symmetry to minimize rotation from R_src.
+
+    Args:
+        R_src: (...,3,3) source rotations.
+        R_dst: (...,3,3) destination rotations.
+        axis: (...,3) symmetry axes.
+        order: (...) symmetry orders.
+        eps: Numerical stability epsilon.
+        boundary_bias: Bias for finite symmetry rounding.
+
+    Returns:
+        Tuple of (R_dst_aligned, delta) with shapes (...,3,3) and (...,).
+    """
+    orig_shape = R_src.shape[:-2]
+    Rs = R_src.reshape(-1, 3, 3)
+    Rd = R_dst.reshape(-1, 3, 3)
+    af = axis.reshape(-1, 3)
+    of = order.reshape(-1).to(Rs.dtype)
+
+    axis_norm = torch.linalg.norm(af, dim=1, keepdim=True)
+    axis_valid = axis_norm.squeeze(1) > eps
+    af_unit = af / axis_norm.clamp_min(eps)
+
+    is_finite = torch.isfinite(of)
+    is_cont = (~is_finite) | (of == 0.0)
+    is_noop = is_finite & (of == 1.0)
+    is_finite_sym = is_finite & (of >= 2.0)
+    sym_active = axis_valid & (is_cont | is_finite_sym) & (~is_noop)
+
+    M = torch.einsum("bij,bjk->bik", Rs.transpose(1, 2), Rd)
+    trM = M[:, 0, 0] + M[:, 1, 1] + M[:, 2, 2]
+    aMa = torch.einsum("bi,bij,bj->b", af_unit, M, af_unit)
+
+    ax, ay, az = af_unit[:, 0], af_unit[:, 1], af_unit[:, 2]
+    K = torch.stack(
+        [
+            torch.zeros_like(ax), -az, ay,
+            az, torch.zeros_like(ax), -ax,
+            -ay, ax, torch.zeros_like(ax),
+        ],
+        dim=-1,
+    ).reshape(-1, 3, 3)
+    trMK = (M * K.transpose(1, 2)).sum(dim=(1, 2))
+
+    B = trM - aMa
+    C = trMK
+    phi = torch.atan2(C, B)
+
+    delta = torch.zeros_like(phi)
+    if is_cont.any():
+        delta = torch.where(is_cont, phi, delta)
+    if is_finite_sym.any():
+        step = (2.0 * torch.pi) / of.clamp_min(2.0)
+        k = torch.floor(phi / step + 0.5 - boundary_bias)
+        delta = torch.where(is_finite_sym, k * step, delta)
+
+    delta = torch.where(sym_active, delta, torch.zeros_like(delta))
+    R_axis = _axis_angle_to_matrix(af_unit, delta, eps=eps)
+    R_aligned = torch.einsum("bij,bjk->bik", Rd, R_axis)
+    R_aligned = torch.where(sym_active.view(-1, 1, 1), R_aligned, Rd)
+    return R_aligned.reshape(*orig_shape, 3, 3), delta.reshape(*orig_shape)
+
+
+def apply_symmetry_rotation_map(
+    rot_map: torch.Tensor,
+    axis: torch.Tensor,
+    delta: torch.Tensor,
+    inst_id_map: torch.Tensor,
+    fg_mask: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Apply per-instance symmetry rotations to a rotation map.
+
+    Args:
+        rot_map: (B,3,3,H,W) rotation map.
+        axis: (B,K,3) symmetry axes.
+        delta: (B,K) symmetry deltas.
+        inst_id_map: (B,H,W) instance IDs (0-based).
+        fg_mask: Optional (B,1,H,W) foreground mask.
+        eps: Numerical stability epsilon.
+
+    Returns:
+        rot_map aligned to symmetry as (B,3,3,H,W).
+    """
+    B, _, _, H, W = rot_map.shape
+    if axis.numel() == 0 or delta.numel() == 0 or inst_id_map.numel() == 0:
+        return rot_map
+    K = axis.shape[1]
+    if K == 0:
+        return rot_map
+    idx = inst_id_map.clamp(0, K - 1).long()
+    idx_flat = idx.reshape(B, -1)
+    axis_map = axis.gather(1, idx_flat.unsqueeze(-1).expand(-1, -1, 3)).view(B, H, W, 3)
+    delta_map = delta.gather(1, idx_flat).view(B, H, W)
+    if fg_mask is not None:
+        valid = fg_mask.squeeze(1) > 0
+        delta_map = torch.where(valid, delta_map, torch.zeros_like(delta_map))
+
+    R_axis = _axis_angle_to_matrix(axis_map, delta_map, eps=eps).reshape(B, H, W, 3, 3)
+    rot_hw = rot_map.permute(0, 3, 4, 1, 2)
+    rot_aligned = torch.einsum("bhwij,bhwjk->bhwik", rot_hw, R_axis)
+    return rot_aligned.permute(0, 3, 4, 1, 2)
+
+
 @torch.jit.script
 def _rotvec_to_rotmat_map(rvec: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     # rvec: (B,3,H,W) → (B,3,3,H,W)

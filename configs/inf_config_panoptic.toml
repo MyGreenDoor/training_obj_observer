@@ -33,7 +33,7 @@ warmup_steps = 500
 min_lr = 1e-6
 
 [[data.train_datasets]]
-name   = "LASyntheticDataset3PerObj"
+name   = "LASyntheticDataset3PerIns"
 use_camera_list = ["D415", "ZED2", "ZEDmini"]
 target_scene_list = [
 # '00000001','00000002','00000003',
@@ -57,12 +57,12 @@ target_scene_list = [
 
 
 [[data.val_datasets]]
-name   = "LASyntheticDataset3PerObj"
+name   = "LASyntheticDataset3PerIns"
 use_camera_list = ["D415", "ZED2", "ZEDmini"]
 target_scene_list = ['00000004', '01000010','01000121','01000315','01002228','02000015','02000112']
 
 [[data.test_datasets]]
-name   = "LARealDataset4PerObj"
+name   = "LARealDataset4PerIns"
 use_camera_list = ["ZED"]
 target_scene_list = [
                     "00000000", "00000001", "00000002", "00000003", "00000004", "00000005",
@@ -91,8 +91,8 @@ levels = 4
 radius_w = 4              # 右方向半径
 radius_h = 1              # 縦方向半径（2D は radius_w をコピーして使う想定、a2d は個別指定）
 
-hidden_ch = 96      # 隠れ層次元
-context_ch = 96     # コンテキスト次元
+hidden_ch = 128      # 隠れ層次元
+context_ch = 128     # コンテキスト次元
 
 topk=50
 nms_radius=4
