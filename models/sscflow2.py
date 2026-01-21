@@ -352,15 +352,11 @@ class SSCFlow2(nn.Module):
                 # # SE(3)?????? ??????????????????
                 R_delta, t_delta = rot_utils.se3_from_delta_map(delta_pose_map)     # (B,3,3,H/4,W/4), (B,3,H/4,W/4)
                 # # ????????/?????????????
-                current_rot_map, current_pos_map = rot_utils.update_pose_maps(
+                current_rot_map, current_pos_map = rot_utils.update_pose_maps_se3(
                     current_rot_map.detach(),              # (B,3,3,H/4,W/4)
-                    current_pos_map.detach(),              # (B,3,H/4,W/4)   ???????????????????????t=(tx,ty,tz)???????
-                    R_delta,                      # (B,3,3,H/4,W/4)
-                    d_map=t_delta,                # (B,3,H/4,W/4)   ????????? t_delta ??(dx,dy,dz) ?????????
-                    weight=100.0,
-                    depth_transform="exp",
-                    detach_depth_for_xy=True,     # ?????????True ????
-                    eps=1e-6
+                    current_pos_map.detach(),              # (B,3,H/4,W/4)
+                    R_delta,                               # (B,3,3,H/4,W/4)
+                    t_delta,                               # (B,3,H/4,W/4)
                 )
                 rot_maps.append(current_rot_map)
                 pos_maps.append(current_pos_map)

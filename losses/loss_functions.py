@@ -463,6 +463,7 @@ def adds_core_from_Rt(
     max_points: int = 4096,
     valid_mask: torch.Tensor = None,              # (B,K) or None
     rot_only: bool = True,
+    normalize_by_diameter: bool = True,
 ) -> torch.Tensor:
     device = R_pred.device
     P = model_points if model_points.dim()==4 else model_points.unsqueeze(1)
@@ -488,7 +489,8 @@ def adds_core_from_Rt(
         d  = torch.minimum(d1, d2)                # (B,K)
     else:
         d  = (Xp - Xg).norm(dim=-1).mean(dim=-1)  # (B,K)
-    d /= (diameters / 100.0) # normalize
+    if normalize_by_diameter:
+        d = d / (diameters / 100.0)
     if valid_mask is not None:
         v = valid_mask.to(d.dtype)
         return (d * d * v).sum() / v.sum().clamp_min(1.0)
@@ -518,6 +520,7 @@ def loss_pose_sequence(
     adds_max_points: int = 4096,
     eps_small: float = 1e-6,
     rot_only: bool = True,
+    adds_norm_by_diameter: bool = True,
     symmetry_axes: typing.Optional[torch.Tensor] = None,
     symmetry_orders: typing.Optional[torch.Tensor] = None,
     inst_id_map: typing.Optional[torch.Tensor] = None,
@@ -579,6 +582,7 @@ def loss_pose_sequence(
                     max_points=adds_max_points,
                     valid_mask=valid_mask,      # (B,K)
                     rot_only=rot_only,
+                    normalize_by_diameter=adds_norm_by_diameter,
                 )
             
             L_add_t = adds_core_from_Rt(
@@ -590,6 +594,7 @@ def loss_pose_sequence(
                     max_points=adds_max_points,
                     valid_mask=valid_mask,      # (B,K)
                     rot_only=rot_only,
+                    normalize_by_diameter=adds_norm_by_diameter,
                 )
 
         Lt = w_rot * L_rot_t + w_pos * L_pos_t #+ w_adds_per_t * L_adds_t + w_adds_per_t * L_add_t * 0.2
@@ -742,7 +747,8 @@ def loss_step_iter0(out, gt,
                 use_symmetric= use_adds_symmetric,
                 max_points   = adds_max_points,
                 valid_mask   = valid,
-                rot_only=True,
+                rot_only=False,
+                normalize_by_diameter=False,
             )
     can_add = all(k in gt for k in ["peaks_yx", "K_left_1x", "model_points"])
     if can_add:
@@ -757,7 +763,8 @@ def loss_step_iter0(out, gt,
                 use_symmetric= False,
                 max_points   = adds_max_points,
                 valid_mask   = valid,
-                rot_only=True,
+                rot_only=False,
+                normalize_by_diameter=False,
             )
 
 
@@ -787,7 +794,8 @@ def loss_step_iter0(out, gt,
         gamma=update_gamma,
         adds_use_symmetric = use_adds_symmetric,
         adds_max_points = adds_max_points,
-        rot_only=True,
+        rot_only=False,
+        adds_norm_by_diameter=False,
         symmetry_axes=sym_axes,
         symmetry_orders=sym_orders,
         inst_id_map=inst_id_map,

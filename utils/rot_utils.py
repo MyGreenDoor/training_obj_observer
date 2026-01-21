@@ -549,6 +549,19 @@ def update_pose_maps(
     return R_new, t_new
 
 
+@torch.jit.script
+def update_pose_maps_se3(
+    R_cur: torch.Tensor,          # (B,3,3,H,W) current rotation
+    t_cur: torch.Tensor,          # (B,3,H,W) current translation in camera frame
+    R_delta: torch.Tensor,        # (B,3,3,H,W) left-multiplied rotation delta
+    t_delta: torch.Tensor,        # (B,3,H,W) translation delta in camera frame
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Update pose maps by SE(3) left-multiplication in camera frame."""
+    R_new = compose_rotmap(R_delta, R_cur)
+    t_new = torch.einsum("bijhw,bjhw->bihw", R_delta, t_cur) + t_delta
+    return R_new, t_new
+
+
 def splat_per_instance(point_map_rend, inst_id_map, Rk, tk, K14, tau=0.02, eps=1e-6):
     B, _, H, W = point_map_rend.shape
     device = point_map_rend.device
