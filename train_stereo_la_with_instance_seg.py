@@ -331,7 +331,6 @@ def _compute_pose_losses_and_metrics(
         gt_pos_mu_map,
         pose_mask,
     )
-    rot_map_use = pred["rot_mat"]
     pos_map_pred = pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
     pos_diff = pos_map_pred - pos_gt_map
     pos_l2_map = torch.sqrt((pos_diff * pos_diff).sum(dim=1, keepdim=True) + 1e-6)
@@ -347,33 +346,35 @@ def _compute_pose_losses_and_metrics(
         min_px=10,
         min_wsum=1e-6,
     )
-    r_pred_use = r_pred
+    rot_gt_map_use = rot_gt_map
+    r_gt_use = r_gt
     sym_axes, sym_orders = _prepare_symmetry_tensors(batch, device, valid_k_inst.shape[1])
-    if sym_axes is not None and sym_orders is not None and rot_map_use.numel() > 0:
+    if sym_axes is not None and sym_orders is not None and pred["rot_mat"].numel() > 0:
         inst_gt = batch["instance_seg"].to(device, non_blocking=True)
         inst_gt_hw = _downsample_label(inst_gt, size_hw)
         inst_id_map = (inst_gt_hw - 1).clamp_min(0)
         fg_mask = (inst_gt_hw > 0).unsqueeze(1)
-        r_pred_use, delta = rot_utils.canonicalize_pose_gspose_torch(
-            r_pred,
-            t_pred,
-            sym_axes,
-            sym_orders,
-        )
-        rot_map_use = rot_utils.apply_symmetry_rotation_map(
-            rot_map_use,
-            sym_axes,
-            delta,
-            inst_id_map,
-            fg_mask=fg_mask,
-        )
+        with torch.no_grad():
+            r_gt_use, delta = rot_utils.align_pose_by_symmetry_min_rotation(
+                r_pred,
+                r_gt,
+                sym_axes,
+                sym_orders,
+            )
+            rot_gt_map_use = rot_utils.apply_symmetry_rotation_map(
+                rot_gt_map_use,
+                sym_axes,
+                delta,
+                inst_id_map,
+                fg_mask=fg_mask,
+            )
     loss_rot = loss_functions.rotation_loss_hetero_map(
-        rot_map_use,
-        rot_gt_map,
+        pred["rot_mat"],
+        rot_gt_map_use,
         pred["rot_logvar_theta"],
         pose_mask,
     )
-    rot_deg_map = _rot_geodesic_map_deg(rot_map_use, rot_gt_map).unsqueeze(1)
+    rot_deg_map = _rot_geodesic_map_deg(pred["rot_mat"], rot_gt_map_use).unsqueeze(1)
     rot_map_deg = (rot_deg_map * pose_mask.to(rot_deg_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
     origin_in = _origin_in_image_from_t(t_gt, left_k[:, 0], image_size)
     valid_inst = v_pred & v_gt & valid_k_inst & origin_in
@@ -381,7 +382,7 @@ def _compute_pose_losses_and_metrics(
         t_diff = t_pred - t_gt
         t_l2 = torch.sqrt((t_diff * t_diff).sum(dim=-1) + 1e-6)
         pos_inst_l2 = (t_l2 * valid_inst.to(t_l2.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
-        r_deg = _rot_geodesic_deg(r_pred_use, r_gt)
+        r_deg = _rot_geodesic_deg(r_pred, r_gt_use)
         rot_inst_deg = (r_deg * valid_inst.to(r_deg.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
     else:
         pos_inst_l2 = pos_map_l2.new_tensor(0.0)
@@ -390,18 +391,18 @@ def _compute_pose_losses_and_metrics(
     model_points, _ = _build_model_points_from_batch(batch, device)
     if model_points is not None and valid_inst.any():
         adds = _adds_core_from_Rt_no_norm(
-            r_pred_use,
+            r_pred,
             t_pred,
-            r_gt,
+            r_gt_use,
             t_gt,
             model_points,
             use_symmetric=True,
             valid_mask=valid_inst,
         )
         add = _adds_core_from_Rt_no_norm(
-            r_pred_use,
+            r_pred,
             t_pred,
-            r_gt,
+            r_gt_use,
             t_gt,
             model_points,
             use_symmetric=False,
@@ -1360,47 +1361,6 @@ def _log_pose_visuals(
         scale_each=True,
     )
     writer.add_image(f"{prefix}/vis_pose_sil", grid, step_value)
-    sym_axes, sym_orders = _prepare_symmetry_tensors(batch, device, valid_k.shape[1])
-    if sym_axes is not None and sym_orders is not None:
-        if valid_k.numel() > 0:
-            sym_axes = torch.where(valid_k.unsqueeze(-1), sym_axes, torch.zeros_like(sym_axes))
-            sym_orders = torch.where(valid_k, sym_orders, torch.ones_like(sym_orders))
-        r_pred_norm, _ = rot_utils.canonicalize_pose_gspose_torch(
-            r_pred,
-            t_pred,
-            sym_axes,
-            sym_orders,
-        )
-        T_pred_norm = rot_utils.compose_T_from_Rt(r_pred_norm, t_pred, valid_pred)
-        pred_r_norm = renderer(
-            meshes_flat=meshes_flat,
-            T_cam_obj=T_pred_norm,
-            K_left=left_k[:, 0],
-            valid_k=valid_render,
-            image_size=image_size,
-        )
-        sil_pred_norm = pred_r_norm["silhouette"]
-        overlay_pred_norm = _overlay_mask_rgb(
-            stereo[:n_images, :3],
-            sil_pred_norm[:n_images],
-            color=(0.0, 1.0, 0.0),
-            alpha=0.45,
-        )
-        overlay_both_norm = _overlay_mask_rgb(overlay_gt, sil_pred_norm[:n_images], color=(0.0, 1.0, 0.0), alpha=0.45)
-        axes_pred_norm = draw_axes_on_images_bk(
-            overlay_pred_norm,
-            left_k[:n_images, 0],
-            T_pred_norm[:n_images],
-            axis_len=50,
-            valid=valid_pred[:n_images],
-        )
-        grid_norm = vutils.make_grid(
-            torch.cat([stereo[:n_images, :3], axes_pred_norm, axes_gt, overlay_both_norm], dim=0),
-            nrow=4,
-            normalize=True,
-            scale_each=True,
-        )
-        writer.add_image(f"{prefix}/vis_pose_sil_norm", grid_norm, step_value)
 
 
 def _log_disp_and_depth(

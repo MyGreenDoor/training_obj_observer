@@ -438,15 +438,17 @@ def evaluate(
             sym_orders = sym_orders.to(device, non_blocking=True)
             sym_axes_sel = sym_axes[b_ix, gt_idx].unsqueeze(1)
             sym_orders_sel = sym_orders[b_ix, gt_idx].unsqueeze(1)
-            pred_R_sel, _ = rot_utils.canonicalize_pose_gspose_torch(
-                pred_R_sel,
-                pred_t_sel,
-                sym_axes_sel,
-                sym_orders_sel,
-            )
         gt_R_sel = gt_R[b_ix, gt_idx].unsqueeze(1)
         gt_t_sel = gt_t[b_ix, gt_idx].unsqueeze(1)
         gt_valid_sel = gt_valid[b_ix, gt_idx].unsqueeze(1)
+        if sym_axes is not None and sym_orders is not None:
+            with torch.no_grad():
+                gt_R_sel, _ = rot_utils.align_pose_by_symmetry_min_rotation(
+                    pred_R_sel,
+                    gt_R_sel,
+                    sym_axes_sel,
+                    sym_orders_sel,
+                )
         eval_mask = (gt_has & pred_valid_sel.squeeze(1))
 
         class_ids = _infer_gt_class_ids(gt_iter0["cls_target"], instance_weight_map, valid_k)

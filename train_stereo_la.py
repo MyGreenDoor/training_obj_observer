@@ -1203,26 +1203,6 @@ def _log_pose_and_silhouette(
         pred_instances['valid'],
     )
     vis_pred_pose = pred_pose[:n_images].detach().clone()
-    pred_pose_norm = None
-    sym_axes = gt_iter0.get("symmetry_axes", None)
-    sym_orders = gt_iter0.get("symmetry_orders", None)
-    if sym_axes is not None and sym_orders is not None:
-        sym_axes = sym_axes.to(pred_pose.device)
-        sym_orders = sym_orders.to(pred_pose.device)
-        if valid_k is not None and valid_k.numel() > 0:
-            sym_axes = torch.where(valid_k.unsqueeze(-1), sym_axes, torch.zeros_like(sym_axes))
-            sym_orders = torch.where(valid_k, sym_orders, torch.ones_like(sym_orders))
-        R_pred_norm, _ = rot_utils.canonicalize_pose_gspose_torch(
-            pred_instances['R'],
-            pred_instances['t'],
-            sym_axes,
-            sym_orders,
-        )
-        pred_pose_norm = rot_utils.compose_T_from_Rt(
-            R_pred_norm,
-            pred_instances['t'],
-            pred_instances['valid'],
-        )
 
     _, t_gt, R_gt = loss_functions.pick_representatives_mask_only(
         inst_mask=gt_iter0["pos_1_4"][:, -1:] > 0,
@@ -1294,41 +1274,6 @@ def _log_pose_and_silhouette(
         scale_each=True,
     )
     writer.add_image(f"{prefix}/vis_init_pose", grid, step_value)
-    if pred_pose_norm is not None:
-        pred_r_norm = renderer(
-            meshes_flat=meshes_flat_n,
-            T_cam_obj=pred_pose_norm[:n_images],
-            K_left=k_pair[:n_images, 0],
-            valid_k=valid_k[:n_images],
-            image_size=image_size,
-        )
-        sil_pred_norm = pred_r_norm["silhouette"]
-        overlay_pred_norm = _overlay_mask_rgb(
-            stereo[:n_images, :3],
-            sil_pred_norm,
-            color=(0.0, 1.0, 0.0),
-            alpha=0.45,
-        )
-        overlay_both_norm = _overlay_mask_rgb(
-            overlay_gt,
-            sil_pred_norm,
-            color=(0.0, 1.0, 0.0),
-            alpha=0.45,
-        )
-        init_projected_norm = draw_axes_on_images_bk(
-            overlay_pred_norm,
-            k_pair[:4, 0],
-            pred_pose_norm[0:4],
-            axis_len=30.0,
-            valid=valid_k[0:4],
-        )
-        grid_norm = vutils.make_grid(
-            torch.cat([stereo[:4, :3], init_projected_norm, projected_gt, overlay_both_norm], dim=0),
-            nrow=4,
-            normalize=True,
-            scale_each=True,
-        )
-        writer.add_image(f"{prefix}/vis_init_pose_norm", grid_norm, step_value)
 
     grid_mask = make_mask_overlay_grid(
         stereo[:4, :3],
@@ -1438,55 +1383,6 @@ def _log_final_pose(
         scale_each=True,
     )
     writer.add_image(f"{prefix}/vis_final_pose", grid_final, step_value)
-    sym_axes = gt_iter0.get("symmetry_axes", None)
-    sym_orders = gt_iter0.get("symmetry_orders", None)
-    if sym_axes is not None and sym_orders is not None:
-        b_r, k_r = r_final.shape[:2]
-        sym_axes = sym_axes[:b_r, :k_r].to(stereo.device)
-        sym_orders = sym_orders[:b_r, :k_r].to(stereo.device)
-        valid_k_use = None
-        if valid_k is not None and valid_k.numel() > 0:
-            valid_k_use = valid_k[:b_r, :k_r]
-        if valid_k_use is not None:
-            sym_axes = torch.where(valid_k_use.unsqueeze(-1), sym_axes, torch.zeros_like(sym_axes))
-            sym_orders = torch.where(valid_k_use, sym_orders, torch.ones_like(sym_orders))
-        r_final_norm, _ = rot_utils.canonicalize_pose_gspose_torch(
-            r_final,
-            t_final,
-            sym_axes,
-            sym_orders,
-        )
-        T_final_norm = rot_utils.compose_T_from_Rt(r_final_norm, t_final, is_valid)
-        T_final_norm_vis = T_final_norm[:n_images].detach().clone()
-        final_r_norm = renderer(
-            meshes_flat=meshes_flat_n,
-            T_cam_obj=T_final_norm_vis,
-            K_left=k_pair[:n_images, 0],
-            valid_k=valid_k[:n_images],
-            image_size=image_size,
-        )
-        sil_final_norm = final_r_norm["silhouette"]
-        overlay_final_norm = _overlay_mask_rgb(
-            stereo[:n_images, :3],
-            sil_final_norm,
-            color=(0.0, 1.0, 0.0),
-            alpha=0.45,
-        )
-        final_axes_norm = draw_axes_on_images_bk(
-            overlay_final_norm,
-            k_pair[:n_images, 0],
-            T_final_norm_vis[:n_images],
-            axis_len=30.0,
-            valid=valid_k[:n_images],
-        )
-        overlay_both_norm = _overlay_mask_rgb(overlay_gt, sil_final_norm, color=(0.0, 1.0, 0.0), alpha=0.45)
-        grid_final_norm = vutils.make_grid(
-            torch.cat([stereo[:n_images, :3], final_axes_norm, projected_gt, overlay_both_norm], dim=0),
-            nrow=4,
-            normalize=True,
-            scale_each=True,
-        )
-        writer.add_image(f"{prefix}/vis_final_pose_norm", grid_final_norm, step_value)
 
 
 def _log_depth_progress(
