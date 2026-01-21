@@ -493,7 +493,7 @@ def adds_core_from_Rt(
         d = d / (diameters / 100.0)
     if valid_mask is not None:
         v = valid_mask.to(d.dtype)
-        return (d * d * v).sum() / v.sum().clamp_min(1.0)
+        return (d * v).sum() / v.sum().clamp_min(1.0)
     return d.mean()
 
 
