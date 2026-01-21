@@ -1441,11 +1441,15 @@ def _log_final_pose(
     sym_axes = gt_iter0.get("symmetry_axes", None)
     sym_orders = gt_iter0.get("symmetry_orders", None)
     if sym_axes is not None and sym_orders is not None:
-        sym_axes = sym_axes.to(stereo.device)
-        sym_orders = sym_orders.to(stereo.device)
+        b_r, k_r = r_final.shape[:2]
+        sym_axes = sym_axes[:b_r, :k_r].to(stereo.device)
+        sym_orders = sym_orders[:b_r, :k_r].to(stereo.device)
+        valid_k_use = None
         if valid_k is not None and valid_k.numel() > 0:
-            sym_axes = torch.where(valid_k.unsqueeze(-1), sym_axes, torch.zeros_like(sym_axes))
-            sym_orders = torch.where(valid_k, sym_orders, torch.ones_like(sym_orders))
+            valid_k_use = valid_k[:b_r, :k_r]
+        if valid_k_use is not None:
+            sym_axes = torch.where(valid_k_use.unsqueeze(-1), sym_axes, torch.zeros_like(sym_axes))
+            sym_orders = torch.where(valid_k_use, sym_orders, torch.ones_like(sym_orders))
         r_final_norm, _ = rot_utils.canonicalize_pose_gspose_torch(
             r_final,
             t_final,
