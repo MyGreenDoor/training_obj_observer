@@ -1749,15 +1749,126 @@ def _build_flow_gts(
     Returns:
         Flow tensors stacked as (B, T, 2, H/4, W/4).
     """
+    def _flow_mean_magnitude(flow: torch.Tensor, invalid_value: float) -> torch.Tensor:
+        fx = flow[:, 0]
+        fy = flow[:, 1]
+        valid = (
+            (fx.abs() < invalid_value * 0.99)
+            & (fy.abs() < invalid_value * 0.99)
+            & torch.isfinite(fx)
+            & torch.isfinite(fy)
+        )
+        if not valid.any():
+            return torch.tensor(float("inf"), device=flow.device, dtype=flow.dtype)
+        mag = torch.sqrt(fx * fx + fy * fy)
+        return mag[valid].mean()
+
+    def _select_symmetry_pose_by_min_flow(
+        point_map: torch.Tensor,
+        K: torch.Tensor,
+        R_src: torch.Tensor,
+        t_src: torch.Tensor,
+        R_dst: torch.Tensor,
+        t_dst: torch.Tensor,
+        axis: torch.Tensor,
+        order: torch.Tensor,
+        invalid_value: float,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Select symmetry-equivalent R_dst that minimizes mean flow magnitude."""
+        if R_dst.dim() == 4 and R_dst.size(1) > 1:
+            R_aligned, _ = rot_utils.align_pose_by_symmetry_min_rotation(
+                R_src=R_src,
+                R_dst=R_dst,
+                axis=axis,
+                order=order,
+            )
+            return R_aligned
+
+        R_src_s = R_src[:, 0] if (R_src.dim() == 4 and R_src.size(1) == 1) else R_src
+        t_src_s = t_src[:, 0] if (t_src.dim() == 3 and t_src.size(1) == 1) else t_src
+        R_dst_s = R_dst[:, 0] if (R_dst.dim() == 4 and R_dst.size(1) == 1) else R_dst
+        t_dst_s = t_dst[:, 0] if (t_dst.dim() == 3 and t_dst.size(1) == 1) else t_dst
+        axis_s = axis[:, 0] if (axis.dim() == 3 and axis.size(1) == 1) else axis
+        order_s = order[:, 0] if (order.dim() == 2 and order.size(1) == 1) else order
+
+        B = R_dst_s.size(0)
+        R_sel = R_dst_s.clone()
+        for b in range(B):
+            a = axis_s[b].to(R_dst_s.device, dtype=R_dst_s.dtype)
+            o = order_s[b].to(R_dst_s.device, dtype=R_dst_s.dtype)
+            if torch.linalg.norm(a) < eps:
+                continue
+            if torch.isfinite(o):
+                o_val = float(o.item())
+                if o_val <= 1.0:
+                    continue
+                if o_val == 0.0:
+                    R_tmp, _ = rot_utils.align_pose_by_symmetry_min_rotation(
+                        R_src=R_src_s[b:b + 1],
+                        R_dst=R_dst_s[b:b + 1],
+                        axis=a.view(1, 3),
+                        order=o.view(1),
+                    )
+                    R_sel[b] = R_tmp[0]
+                    continue
+                n = int(round(o_val))
+            else:
+                R_tmp, _ = rot_utils.align_pose_by_symmetry_min_rotation(
+                    R_src=R_src_s[b:b + 1],
+                    R_dst=R_dst_s[b:b + 1],
+                    axis=a.view(1, 3),
+                    order=o.view(1),
+                )
+                R_sel[b] = R_tmp[0]
+                continue
+
+            if n < 2:
+                continue
+
+            deltas = (2.0 * torch.pi) * torch.arange(n, device=R_dst_s.device, dtype=R_dst_s.dtype) / float(n)
+            axis_rep = a.view(1, 3).expand(n, -1)
+            R_axis = rot_utils._axis_angle_to_matrix(axis_rep, deltas)
+            R_cands = torch.einsum("ij,bjk->bik", R_dst_s[b], R_axis)
+
+            best_idx = 0
+            best_val = None
+            for i in range(n):
+                flow_i = flow_utils.gt_flow_from_pointmap_and_poses(
+                    point_map=point_map[b:b + 1],
+                    K=K[b:b + 1],
+                    R_src=R_src_s[b:b + 1],
+                    t_src_mm=t_src_s[b:b + 1],
+                    R_dst=R_cands[i:i + 1],
+                    t_dst_mm=t_dst_s[b:b + 1],
+                    point_frame="camera",
+                    point_unit_m=False,
+                    invalid_value=invalid_value,
+                )
+                val = _flow_mean_magnitude(flow_i, invalid_value)
+                if best_val is None or val < best_val:
+                    best_val = val
+                    best_idx = i
+            R_sel[b] = R_cands[best_idx]
+
+        if R_dst.dim() == 4 and R_dst.size(1) == 1:
+            return R_sel.unsqueeze(1)
+        return R_sel
+
     flow_gts = []
     for Rk, tk in zip(pred['Rk_list'][:-1], pred['tk_list'][:-1]):
         R_dst = Rk
         if symmetry_axes is not None and symmetry_orders is not None:
-            R_dst, _ = rot_utils.align_pose_by_symmetry_min_rotation(
+            R_dst = _select_symmetry_pose_by_min_flow(
+                point_map=gt_point_map_14,
+                K=left_k_14,
                 R_src=R_gt,
+                t_src=t_gt,
                 R_dst=Rk,
+                t_dst=tk,
                 axis=symmetry_axes,
                 order=symmetry_orders,
+                invalid_value=400.0,
             )
         flow_gt = flow_utils.gt_flow_from_pointmap_and_poses(
             point_map=gt_point_map_14,
