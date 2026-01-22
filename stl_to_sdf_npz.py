@@ -4,20 +4,18 @@
 import argparse
 import json
 import os
+import warnings
 from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
+import trimesh
 
 
 def _ensure_trimesh(mesh):
-    """
-    trimesh.load() が Scene を返すことがあるので，Trimesh に寄せる．
-    """
     import trimesh
 
     if isinstance(mesh, trimesh.Scene):
-        # Scene -> 一つのメッシュに結合（STLなら通常Trimeshだが保険）
         if len(mesh.geometry) == 0:
             raise ValueError("Empty trimesh.Scene (no geometry).")
         meshes = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
@@ -26,6 +24,40 @@ def _ensure_trimesh(mesh):
         mesh = trimesh.util.concatenate(meshes)
     if not isinstance(mesh, trimesh.Trimesh):
         raise TypeError(f"Loaded object is not trimesh.Trimesh: {type(mesh)}")
+    return mesh
+
+
+def watertight_report(mesh):
+    # unique edgeごとの出現回数
+    inv = np.asarray(mesh.edges_unique_inverse)
+    m = int(np.asarray(mesh.edges_unique).shape[0])
+    counts = np.bincount(inv, minlength=m)
+
+    n_boundary = int((counts == 1).sum())   # 境界（穴/割れ）候補
+    n_nonmanifold = int((counts > 2).sum()) # 非多様体
+
+    return {
+        "is_watertight": bool(mesh.is_watertight),
+        "is_winding_consistent": bool(mesh.is_winding_consistent),
+        "is_volume": bool(mesh.is_volume),
+        "n_boundary_edges": n_boundary,
+        "n_nonmanifold_edges": n_nonmanifold,
+    }
+
+
+def repair_and_recheck(mesh: trimesh.Trimesh):
+    mesh = mesh.copy()
+
+    # まとめて基本処理（validate=True で重複/退化face除去も含む）
+    mesh.process(validate=True)  # :contentReference[oaicite:4]{index=4}
+
+    # 残りがちなので明示
+    if hasattr(mesh, "remove_unreferenced_vertices"):
+        mesh.remove_unreferenced_vertices()
+
+    # 小穴埋め（必要なら）
+    trimesh.repair.fill_holes(mesh)
+
     return mesh
 
 
@@ -40,13 +72,6 @@ def mesh_to_voxel_sdf_trimesh(
     batch: int = 200_000,
     out_dtype: np.dtype = np.float32,
 ) -> Tuple[np.ndarray, dict]:
-    """
-    Triangle mesh -> voxel SDF grid.
-
-    Returns:
-        sdf: (res,res,res) out_dtype
-        meta: dict (JSON化可能な要素中心，数値も含む)
-    """
     import trimesh
 
     verts = np.asarray(verts, dtype=np.float64)
@@ -65,7 +90,7 @@ def mesh_to_voxel_sdf_trimesh(
         extent = float((vmax - vmin).max())
         if extent <= 0:
             raise ValueError("Degenerate mesh bbox extent.")
-        scale = 1.0 / extent  # max edge length -> 1
+        scale = 1.0 / extent
         verts = (verts - center) * scale
         transform = {"center": center.tolist(), "scale": float(scale)}
 
@@ -90,20 +115,25 @@ def mesh_to_voxel_sdf_trimesh(
     out = np.empty((N,), dtype=np.float64)
 
     if signed:
+        # trimesh: outside negative, inside positive
         for s in range(0, N, batch):
             e = min(N, s + batch)
             out[s:e] = pq.signed_distance(pts[s:e])
     else:
         for s in range(0, N, batch):
             e = min(N, s + batch)
-            out[s:e] = pq.distance(pts[s:e])
+            _, dist, _ = pq.on_surface(pts[s:e])
+            out[s:e] = dist
 
     sdf = out.reshape(res, res, res).astype(out_dtype, copy=False)
+
+    if signed:
+        # inside_negative に揃える（外側が正，内側が負）
+        sdf = -sdf
 
     if trunc is not None:
         t = float(trunc)
         np.clip(sdf, -t, t, out=sdf)
-
     voxel_size = float((bbox_max - bbox_min).max() / (res - 1))
 
     meta = {
@@ -111,7 +141,7 @@ def mesh_to_voxel_sdf_trimesh(
         "res": int(res),
         "indexing": "ij",
         "signed": bool(signed),
-        "sign_convention": "inside_negative",  # trimesh convention
+        "sign_convention": "inside_negative",
         "padding": float(padding),
         "normalize_to_cube": bool(normalize_to_cube),
         "trunc": None if trunc is None else float(trunc),
@@ -126,55 +156,61 @@ def mesh_to_voxel_sdf_trimesh(
 
 
 def iter_stl_files(root_dir: Path):
-    # 大文字拡張子にも対応
     for p in root_dir.rglob("*"):
         if p.is_file() and p.suffix.lower() == ".stl":
             yield p
+
+
+def warn_non_watertight(stl_path: Path, rel: Path):
+    # warnings.warn は標準で1回しか出さないことがあるので，
+    # ここでは filename を含めて明示的に出力する（必要なら always でもOK）
+    warnings.warn(
+        f"Non-watertight STL detected (signed SDF may be unreliable). "
+        f"Will fall back to unsigned distance in signed_policy=auto: {rel}  [{stl_path}]",
+        category=UserWarning,
+        stacklevel=2,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Recursively convert STL meshes to voxel SDF and save as NPZ with mirrored folder structure."
     )
-    parser.add_argument("--root_dir", type=str, required=True, help="Input root directory to search STL files.")
-    parser.add_argument("--dst_dir", type=str, required=True, help="Output root directory to save NPZ files.")
-    parser.add_argument("--res", type=int, default=128, help="Voxel resolution (default: 128).")
-    parser.add_argument("--padding", type=float, default=0.05, help="BBox padding ratio (default: 0.05).")
-    parser.add_argument(
-        "--normalize_to_cube",
-        action="store_true",
-        help="Normalize mesh to have max bbox edge length = 1 and centered at origin before voxelization.",
-    )
+    parser.add_argument("--root_dir", type=str, required=True)
+    parser.add_argument("--dst_dir", type=str, required=True)
+    parser.add_argument("--res", type=int, default=128)
+    parser.add_argument("--padding", type=float, default=0.05)
+    parser.add_argument("--normalize_to_cube", action="store_true")
     parser.add_argument(
         "--signed_policy",
         choices=["auto", "force", "off"],
         default="auto",
-        help="Signed SDF policy. auto: signed only if watertight; force: always signed; off: always unsigned.",
+        help="auto: signed only if watertight (warn if not); force: always signed; off: always unsigned.",
     )
-    parser.add_argument("--trunc", type=float, default=None, help="Optional truncation value for TSDF (clamp).")
-    parser.add_argument("--batch", type=int, default=200_000, help="Query batch size (default: 200000).")
+    parser.add_argument("--trunc", type=float, default=None)
+    parser.add_argument("--batch", type=int, default=200_000)
+    parser.add_argument("--dtype", choices=["f16", "f32"], default="f32")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
-        "--dtype",
-        choices=["f16", "f32"],
-        default="f32",
-        help="Output SDF dtype (default: f32).",
+        "--warn_always",
+        action="store_true",
+        help="If set, show repeated warnings (default warnings may be filtered).",
     )
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing npz outputs.")
-    parser.add_argument("--quiet", action="store_true", help="Reduce logging.")
     args = parser.parse_args()
+
+    if args.warn_always:
+        warnings.simplefilter("always", UserWarning)
 
     root_dir = Path(args.root_dir).expanduser().resolve()
     dst_dir = Path(args.dst_dir).expanduser().resolve()
-
     if not root_dir.exists():
         raise FileNotFoundError(f"root_dir not found: {root_dir}")
-
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     out_dtype = np.float16 if args.dtype == "f16" else np.float32
 
-    # Lazy import (heavy)
-    import trimesh
+    import trimesh  # noqa: F401
 
     stl_list = list(iter_stl_files(root_dir))
     if not args.quiet:
@@ -196,8 +232,16 @@ def main():
         try:
             mesh = trimesh.load(str(stl_path), force="mesh")
             mesh = _ensure_trimesh(mesh)
+            # report_before = watertight_report(mesh)
+            mesh_repaired = repair_and_recheck(mesh)
+            report_after = watertight_report(mesh_repaired)
+            if report_after["is_watertight"]:
+                mesh = mesh_repaired
 
-            # なるべく素の形状を使う（process=Trueだと修復が入ることがある）
+                
+            mesh2 = repair_and_recheck(mesh)
+            report_after = watertight_report(mesh2)
+
             verts = np.asarray(mesh.vertices)
             faces = np.asarray(mesh.faces)
 
@@ -208,7 +252,10 @@ def main():
             elif args.signed_policy == "force":
                 use_signed = True
             else:
-                use_signed = is_watertight  # auto
+                # auto: watertight なら signed，そうでなければ warning + unsigned
+                if not is_watertight:
+                    warn_non_watertight(stl_path, rel)
+                use_signed = is_watertight
 
             sdf, meta = mesh_to_voxel_sdf_trimesh(
                 verts=verts,
@@ -222,7 +269,6 @@ def main():
                 out_dtype=out_dtype,
             )
 
-            # 追加の追跡情報（npzに入れる）
             meta["source_relpath"] = str(rel).replace(os.sep, "/")
             meta["source_abspath"] = str(stl_path)
             meta["watertight"] = is_watertight
@@ -232,8 +278,7 @@ def main():
             np.savez_compressed(
                 out_path,
                 sdf=sdf,
-                meta=np.string_(meta_str),
-                # よく使うものはトップレベルにも置く（読込を楽にする）
+                meta=np.bytes_(meta_str.encode("utf-8")),
                 bbox_min=np.asarray(meta["bbox_min"], dtype=np.float32),
                 bbox_max=np.asarray(meta["bbox_max"], dtype=np.float32),
                 voxel_size=np.asarray(meta["voxel_size"], dtype=np.float32),
