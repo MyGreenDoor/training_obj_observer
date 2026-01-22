@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# python stl_to_sdf_npz.py  --root_dir /mnt/ssd2tb/new_format --dst_dir /mnt/ssd2tb/new_format_sdf --normalize_to_cube --repair --merge_digits 6 --morph_close_iters 1 --res 192 --workers 20
+# python stl_to_sdf_npz.py  --root_dir /mnt/ssd2tb/new_format --dst_dir /mnt/ssd2tb/new_format_sdf --normalize_to_cube --repair --merge_digits 6 --morph_close_iters 1 --res 128 --workers 10
 
 
 import argparse
