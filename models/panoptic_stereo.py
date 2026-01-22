@@ -390,6 +390,213 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
         }
 
 
+class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
+    """LiteFPN-style head for translation plus latent map (no rotation outputs)."""
+
+    def __init__(
+        self,
+        norm_layer: Callable[[int], nn.Module],
+        num_classes: int,
+        ctx_ch: int = 128,
+        use_pixelshuffle: bool = True,
+        emb_dim: int = 8,
+        latent_dim: int = 16,
+        latent_l2_norm: bool = True,
+        head_base_ch: int = 128,
+        head_ch_scale: float = 1.35,
+        head_downsample: int = 4,
+        out_pos_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.use_pixelshuffle = use_pixelshuffle
+        self.head_downsample = int(head_downsample)
+        self.latent_l2_norm = bool(latent_l2_norm)
+        if self.head_downsample < 1:
+            raise ValueError("head_downsample must be >= 1")
+        if latent_dim <= 0:
+            raise ValueError("latent_dim must be > 0")
+
+        in_ch = ctx_ch + 1 + 3
+        base_ch = int(head_base_ch)
+        ch_scale = float(head_ch_scale)
+        fuse_ch = base_ch * 2
+        sem_ch = base_ch
+        inst_ch = base_ch
+
+        def scaled_ch(level: int) -> int:
+            return max(8, int(round(base_ch * (ch_scale ** level))))
+
+        c1 = scaled_ch(0)
+        c2 = scaled_ch(1)
+        c3 = scaled_ch(2)
+        c4 = scaled_ch(3)
+        c5 = scaled_ch(4)
+        c6 = scaled_ch(5)
+
+        self.enc1 = ConvBlock(in_ch, c1, norm_layer)
+        self.down1 = Bottleneck(c1, c1 // 2, c2, norm_layer, s=2)
+        self.down2 = Bottleneck(c2, c2 // 2, c3, norm_layer, s=2)
+        self.down3 = Bottleneck(c3, c3 // 2, c4, norm_layer, s=2)
+        self.down4 = Bottleneck(c4, c4 // 2, c5, norm_layer, s=2)
+        self.down5 = Bottleneck(c5, c5 // 2, c6, norm_layer, s=2)
+
+        self.bridge = ASPPLite(c6, norm_layer)
+
+        self.up5 = self.make_up(c6, c5, norm_layer)
+        self.dec5 = ConvBlock(c5 + c5, c5, norm_layer)
+        self.up4 = self.make_up(c5, c4, norm_layer)
+        self.dec4 = ConvBlock(c4 + c4, c4, norm_layer)
+        self.up3 = self.make_up(c4, c3, norm_layer)
+        self.dec3 = ConvBlock(c3 + c3, c3, norm_layer)
+        self.up2 = self.make_up(c3, c2, norm_layer)
+        self.dec2 = ConvBlock(c2 + c2, c2, norm_layer)
+        self.up1 = self.make_up(c2, c1, norm_layer)
+        self.dec1 = ConvBlock(c1 + c1, fuse_ch, norm_layer)
+
+        self.detail_pool = nn.AvgPool2d(kernel_size=3, stride=1, padding=1)
+        self.detail_proj = nn.Sequential(
+            nn.Conv2d(in_ch, fuse_ch, 1, bias=False),
+            norm_layer(fuse_ch),
+            nn.SiLU(True),
+        )
+        self.detail_gate = nn.Sequential(
+            nn.Conv2d(fuse_ch, fuse_ch, 1, bias=True),
+            nn.Sigmoid(),
+        )
+
+        self.neck_geo = self.make_neck(fuse_ch, base_ch, norm_layer)
+        self.neck_sem = self.make_neck(fuse_ch, sem_ch, norm_layer)
+        self.neck_inst = self.make_neck(fuse_ch, inst_ch, norm_layer)
+
+        self.head_posz_pre = ConvBlock(base_ch, base_ch, norm_layer)
+        self.head_posz = nn.Conv2d(base_ch, 6, 3, padding=1)
+        self.head_cls_pre = ConvBlock(sem_ch, sem_ch, norm_layer)
+        self.head_cls = nn.Conv2d(sem_ch, num_classes, 1)
+        self.affemb_head = AffEmbHead(inst_ch, emb_dim, norm_layer)
+        self.latent_head = nn.Conv2d(inst_ch, latent_dim, 1)
+        self.sdf_head = nn.Conv2d(latent_dim, 1, 1)
+        self.sdf_logvar_head = nn.Conv2d(inst_ch, 1, 1)
+        self.out_pos_scale = out_pos_scale
+
+    def make_up(self, in_ch: int, out_ch: int, norm_layer: Callable[[int], nn.Module]) -> nn.Module:
+        """Create a 2x upsampling block with optional pixel shuffle."""
+        if self.use_pixelshuffle:
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch * 4, 3, padding=1, bias=False),
+                nn.PixelShuffle(2),
+                nn.SiLU(True),
+            )
+        return nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            conv3x3(in_ch, out_ch),
+            norm_layer(out_ch),
+            nn.SiLU(True),
+        )
+
+    def make_neck(self, in_ch: int, mid_ch: int, norm_layer: Callable[[int], nn.Module]) -> nn.Module:
+        """Create lightweight convolutional neck for head branches."""
+        return nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, 3, padding=1, groups=in_ch, bias=False),
+            norm_layer(in_ch),
+            nn.SiLU(True),
+            nn.Conv2d(in_ch, mid_ch, 1, bias=False),
+            norm_layer(mid_ch),
+            nn.SiLU(True),
+        )
+
+    def forward(
+        self,
+        ctx_1x: torch.Tensor,
+        mask_1x: torch.Tensor,
+        point_map_1x: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Run FPN-style head on full resolution features."""
+        out_hw = ctx_1x.shape[-2:]
+        if self.head_downsample > 1:
+            low_hw = (max(1, out_hw[0] // self.head_downsample), max(1, out_hw[1] // self.head_downsample))
+            ctx_1x = F.interpolate(ctx_1x, size=low_hw, mode="bilinear", align_corners=False)
+            mask_1x = F.interpolate(mask_1x, size=low_hw, mode="bilinear", align_corners=False)
+            point_map_1x = F.interpolate(point_map_1x, size=low_hw, mode="bilinear", align_corners=False)
+
+        x4_in = torch.cat((ctx_1x, mask_1x, point_map_1x), dim=1)
+        detail = x4_in - self.detail_pool(x4_in)
+        e1 = self.enc1(x4_in)
+        e2 = self.down1(e1)
+        e3 = self.down2(e2)
+        e4 = self.down3(e3)
+        e5 = self.down4(e4)
+        e6 = self.down5(e5)
+
+        b = self.bridge(e6)
+
+        u5 = self.up5(b)
+        if u5.shape[-2:] != e5.shape[-2:]:
+            u5 = F.interpolate(u5, size=e5.shape[-2:], mode="bilinear", align_corners=False)
+        d5 = self.dec5(torch.cat((u5, e5), dim=1))
+
+        u4 = self.up4(d5)
+        if u4.shape[-2:] != e4.shape[-2:]:
+            u4 = F.interpolate(u4, size=e4.shape[-2:], mode="bilinear", align_corners=False)
+        d4 = self.dec4(torch.cat((u4, e4), dim=1))
+
+        u3 = self.up3(d4)
+        if u3.shape[-2:] != e3.shape[-2:]:
+            u3 = F.interpolate(u3, size=e3.shape[-2:], mode="bilinear", align_corners=False)
+        d3 = self.dec3(torch.cat((u3, e3), dim=1))
+
+        u2 = self.up2(d3)
+        if u2.shape[-2:] != e2.shape[-2:]:
+            u2 = F.interpolate(u2, size=e2.shape[-2:], mode="bilinear", align_corners=False)
+        d2 = self.dec2(torch.cat((u2, e2), dim=1))
+
+        u1 = self.up1(d2)
+        if u1.shape[-2:] != e1.shape[-2:]:
+            u1 = F.interpolate(u1, size=e1.shape[-2:], mode="bilinear", align_corners=False)
+        x = self.dec1(torch.cat((u1, e1), dim=1))
+        detail = self.detail_proj(detail)
+        x = x + detail * self.detail_gate(x)
+        x_geo = self.neck_geo(x)
+        x_sem = self.neck_sem(x)
+        x_inst = self.neck_inst(x)
+
+        out_posz = self.head_posz(self.head_posz_pre(x_geo))
+        cls_logits = self.head_cls(self.head_cls_pre(x_sem))
+        affemb_out = self.affemb_head(x_inst)
+        latent_map = self.latent_head(x_inst)
+        sdf_map = self.sdf_head(latent_map)
+        sdf_logvar = self.sdf_logvar_head(x_inst)
+
+        if self.head_downsample > 1:
+            cls_logits = F.interpolate(cls_logits, size=out_hw, mode="bilinear", align_corners=False)
+            aff_logits = F.interpolate(affemb_out["aff_logits"], size=out_hw, mode="bilinear", align_corners=False)
+            emb = F.interpolate(affemb_out["emb"], size=out_hw, mode="bilinear", align_corners=False)
+            latent_map = F.interpolate(latent_map, size=out_hw, mode="bilinear", align_corners=False)
+            sdf_map = F.interpolate(sdf_map, size=out_hw, mode="bilinear", align_corners=False)
+            sdf_logvar = F.interpolate(sdf_logvar, size=out_hw, mode="bilinear", align_corners=False)
+            emb = F.normalize(emb, dim=1, eps=1e-6)
+            affemb_out = {"aff_logits": aff_logits, "emb": emb}
+
+        mu_raw = out_posz[:, 0:3]
+        lv_raw = out_posz[:, 3:6]
+        log_z = mu_raw[:, 2:3] * self.out_pos_scale
+        mu_pos = torch.cat([mu_raw[:, 0:2], log_z], dim=1)
+        lv_pos = lv_raw.clamp(-8.0, 4.0)
+        sdf_logvar = sdf_logvar.clamp(-8.0, 4.0)
+
+        if self.latent_l2_norm:
+            latent_map = F.normalize(latent_map, dim=1, eps=1e-6)
+
+        return {
+            "pos_mu": mu_pos,
+            "pos_logvar": lv_pos,
+            "cls_logits": cls_logits,
+            "latent_map": latent_map,
+            "sdf_map": sdf_map,
+            "sdf_logvar": sdf_logvar,
+            **affemb_out,
+        }
+
+
 class DummyMultiTaskHead(nn.Module):
     """Dummy multi-task head for memory profiling."""
 
@@ -810,6 +1017,195 @@ class PanopticStereoMultiHead(nn.Module):
             out["pose_valid"] = v_pred
         return out
 
+
+class PanopticStereoMultiHeadLatent(PanopticStereoMultiHead):
+    """Panoptic stereo model with latent map head (no rotation outputs)."""
+
+    def __init__(
+        self,
+        levels: int = 4,
+        norm_layer: Callable[[int], nn.Module] = make_gn(16),
+        l2_normalize_feature: bool = True,
+        use_ctx_aspp: bool = True,
+        lookup_mode: str = "1d",
+        radius_w: int = 4,
+        radius_h: int = 0,
+        hidden_ch: int = 96,
+        context_ch: int = 96,
+        num_classes: int = 1,
+        rot_repr: str = "r6d",
+        emb_dim: int = 16,
+        latent_dim: int = 16,
+        latent_l2_norm: bool = True,
+        head_base_ch: int = 96,
+        head_ch_scale: float = 1.35,
+        head_downsample: int = 4,
+        point_map_norm_mean: Optional[Sequence[float]] = None,
+        point_map_norm_std: Optional[Sequence[float]] = None,
+        point_map_norm_eps: float = 1e-6,
+    ) -> None:
+        super().__init__(
+            levels=levels,
+            norm_layer=norm_layer,
+            l2_normalize_feature=l2_normalize_feature,
+            use_ctx_aspp=use_ctx_aspp,
+            lookup_mode=lookup_mode,
+            radius_w=radius_w,
+            radius_h=radius_h,
+            hidden_ch=hidden_ch,
+            context_ch=context_ch,
+            num_classes=num_classes,
+            rot_repr=rot_repr,
+            emb_dim=emb_dim,
+            use_dummy_head=False,
+            head_base_ch=head_base_ch,
+            head_ch_scale=head_ch_scale,
+            head_downsample=head_downsample,
+            point_map_norm_mean=point_map_norm_mean,
+            point_map_norm_std=point_map_norm_std,
+            point_map_norm_eps=point_map_norm_eps,
+        )
+        self.pose_head = LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(
+            norm_layer=norm_layer,
+            num_classes=num_classes,
+            ctx_ch=self.context_1x_ch,
+            use_pixelshuffle=True,
+            emb_dim=emb_dim,
+            latent_dim=latent_dim,
+            latent_l2_norm=latent_l2_norm,
+            head_base_ch=head_base_ch,
+            head_ch_scale=head_ch_scale,
+            head_downsample=head_downsample,
+            out_pos_scale=1.0,
+        )
+
+    def forward(
+        self,
+        stereo: torch.Tensor,
+        K_pair_1x: torch.Tensor,
+        baseline_mm: Union[float, torch.Tensor],
+        iters: int = 8,
+        disp_init: Optional[torch.Tensor] = None,
+        *,
+        Wk_1_4: Optional[torch.Tensor] = None,
+        wfg_1_4: Optional[torch.Tensor] = None,
+        min_px: int = 10,
+        min_wsum: float = 1e-6,
+    ) -> Dict[str, torch.Tensor]:
+        stuff = self.extract(stereo)
+        featL, featR = stuff["featL_1_4"], stuff["featR_1_4"]
+        hidden, context0 = stuff["hidden0"], stuff["context0"]
+        B, _, H4, W4 = featL.shape
+
+        corr_full = torch.einsum("bchi,bchj->bjhi", featL, featR)
+        corr_pyr = build_corr_pyramid(corr_full, num_levels=self.levels)
+
+        sc_disp = torch.zeros(B, 1, H4, W4, device=featL.device, dtype=featL.dtype) if disp_init is None else disp_init
+        disp_preds: List[torch.Tensor] = []
+        disp_log_var_preds: List[torch.Tensor] = []
+
+        for _ in range(iters):
+            if self.lookup_mode == "1d":
+                corr_nb = sample_corr_pyramid_bilinear(corr_pyr, disp_1_4=sc_disp, radius=self.radius_w)
+            else:
+                corr_nb = sample_corr_pyramid_bilinear_2d(
+                    corr_pyr, disp_1_4=sc_disp, radius_w=self.radius_w, radius_h=self.radius_h
+                )
+            hidden, delta, disp_log_var = self.update(hidden, context0, corr_nb, sc_disp)
+            disp = sc_disp + delta
+            disp_preds.append(disp)
+            disp_log_var_preds.append(disp_log_var)
+            sc_disp = disp.detach()
+
+        point_map_cur, K_pair_14, point_map_conf = disparity_to_pointmap_from_Kpair_with_conf(
+            disp_preds[-1],
+            disp_log_var_preds[-1],
+            K_pair_1x=K_pair_1x,
+            baseline_mm=baseline_mm,
+            downsample=4,
+            eps=1e-6,
+        )
+        depth_1_4 = point_map_cur[:, 2:3]
+        if self.use_ctx1x_for_upsample:
+            ctx1x = stuff["context_1x"]
+            ctx1x_s2d = F.pixel_unshuffle(ctx1x, 4)
+            h_up = self.up_guidance_fuse(torch.cat([context0, ctx1x_s2d], dim=1))
+        else:
+            h_up = context0
+
+        disp_1x = self.upsampler(disp_preds[-1], h_up, scale_factor=4.0)
+        disp_log_var_1x = self.upsampler(disp_log_var_preds[-1], h_up, scale_factor=1.0) + (2.0 * math.log(4.0))
+        point_map_1x, _, point_map_conf_1x = disparity_to_pointmap_from_Kpair_with_conf(
+            disp_1x,
+            disp_log_var_1x,
+            K_pair_1x=K_pair_1x,
+            baseline_mm=baseline_mm,
+            downsample=1,
+            eps=1e-6,
+        )
+        point_map_1x_norm = normalize_point_map(
+            point_map_1x,
+            eps=self.point_map_norm_eps,
+            mean=self.point_map_norm_mean,
+            std=self.point_map_norm_std,
+        )
+
+        head_out = self.pose_head(
+            ctx_1x=stuff["context_1x"],
+            mask_1x=point_map_conf_1x,
+            point_map_1x=point_map_1x_norm,
+        )
+        pos_mu_norm = head_out["pos_mu"]
+        pos_logvar_norm = head_out["pos_logvar"]
+        pos_mu = denormalize_pos_mu(pos_mu_norm)
+        pos_logvar = denormalize_pos_logvar(pos_logvar_norm, pos_mu_norm)
+
+        if torch.jit.is_scripting():
+            out = torch.jit.annotate(Dict[str, torch.Tensor], {})
+            out["featL_1_4"] = featL
+            out["featR_1_4"] = featR
+            out["hidden0"] = hidden
+            out["context0"] = context0
+            out["context_1x"] = stuff["context_1x"]
+            out["depth_1_4"] = depth_1_4
+            out["left_mask_1_4"] = point_map_conf
+            out["point_map_conf"] = point_map_conf
+            out["disp_1x"] = disp_1x
+            out["disp_log_var_1x"] = disp_log_var_1x
+            out["point_map_1x"] = point_map_1x
+            out["point_map_conf_1x"] = point_map_conf_1x
+            out["sem_logits"] = head_out["cls_logits"]
+            out["pos_mu"] = pos_mu
+            out["pos_logvar"] = pos_logvar
+            out["pos_mu_norm"] = pos_mu_norm
+            out["pos_logvar_norm"] = pos_logvar_norm
+            out["cls_logits"] = head_out["cls_logits"]
+            out["aff_logits"] = head_out["aff_logits"]
+            out["emb"] = head_out["emb"]
+            out["latent_map"] = head_out["latent_map"]
+            out["sdf_map"] = head_out["sdf_map"]
+            out["sdf_logvar"] = head_out["sdf_logvar"]
+            return out
+
+        out: Dict[str, torch.Tensor] = {
+            **stuff,
+            "disp_preds": disp_preds,
+            "disp_log_var_preds": disp_log_var_preds,
+            "depth_1_4": depth_1_4,
+            "left_mask_1_4": point_map_conf,
+            "point_map_conf": point_map_conf,
+            "disp_1x": disp_1x,
+            "disp_log_var_1x": disp_log_var_1x,
+            "point_map_1x": point_map_1x,
+            "point_map_conf_1x": point_map_conf_1x,
+            "sem_logits": head_out["cls_logits"],
+            "pos_mu": pos_mu,
+            "pos_logvar": pos_logvar,
+            "pos_mu_norm": pos_mu_norm,
+            "pos_logvar_norm": pos_logvar_norm,
+        }
+        out.update({k: v for k, v in head_out.items() if k not in ("pos_mu", "pos_logvar")})
+        return out
 
 def pos_mu_to_pointmap(
     pos_mu: torch.Tensor,

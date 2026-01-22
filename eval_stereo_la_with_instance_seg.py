@@ -98,6 +98,12 @@ def make_eval_dataloader(
         "semantic_seg",
         "instance_seg",
     )
+    w_sdf = float(cfg.get("loss", {}).get("w_sdf", 0.0))
+    w_sdf_pose = float(cfg.get("loss", {}).get("w_sdf_pose", 0.0))
+    w_sdf_pose_rot = float(cfg.get("loss", {}).get("w_sdf_pose_rot", w_sdf_pose))
+    w_sdf_pose_trans = float(cfg.get("loss", {}).get("w_sdf_pose_trans", w_sdf_pose))
+    if w_sdf > 0.0 or w_sdf_pose > 0.0 or w_sdf_pose_rot > 0.0 or w_sdf_pose_trans > 0.0:
+        out_list = out_list + ("SDFs", "SDFs_meta")
     if ds_cfg['name'] ==  "LASyntheticDataset3PerObj": 
         dataset = LASyntheticDataset3PerIns(
             out_list=out_list,
