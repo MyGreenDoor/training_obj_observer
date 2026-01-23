@@ -6,6 +6,13 @@ def load_npz(npz_path: str):
     z = np.load(npz_path, allow_pickle=False)
     sdf = z["sdf"]
     meta = json.loads(z["meta"].tobytes().decode("utf-8"))
+    print("signed_policy:", meta.get("signed_policy"))
+    print("signed_used:", meta.get("signed_used"))
+    print("sign_convention:", meta.get("sign_convention"))
+    print("watertight:", meta.get("watertight_report"))
+
+    print("any sdf<0:", np.any(sdf < 0))
+    print("any signbit:", np.any(np.signbit(sdf)))  # -0.0 も拾う
     return sdf, meta
 
 def quick_stats(sdf: np.ndarray):
@@ -34,7 +41,7 @@ def show_slices(sdf: np.ndarray, title: str = ""):
     plt.tight_layout()
     plt.show()
 
-npz_path = "/mnt/ssd2tb/new_format_sdf/auto_generated/0002/00020000/stl/0002000000001.npz"
+npz_path = r"E:\CAD_for_2nd_phase_LA\new_format_sdf\auto_generated\0000\00000001\sdf\0000000100001.npz"
 sdf, meta = load_npz(npz_path)
 quick_stats(sdf)
 show_slices(sdf, title=npz_path)

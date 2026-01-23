@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# python stl_to_sdf_npz.py  --root_dir /mnt/ssd2tb/new_format --dst_dir /mnt/ssd2tb/new_format_sdf --normalize_to_cube --repair --merge_digits 6 --morph_close_iters 1 --res 128 --workers 10
+# python stl_to_sdf_npz.py  --root_dir /mnt/ssd2tb/new_format --dst_dir /mnt/ssd2tb/new_format_sdf --normalize_to_cube --repair --merge_digits 6 --morph_close_iters 1 --res 128 --workers 10 --signed_policy force
 
 
 import argparse
 import json
 import os
+import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -54,25 +55,146 @@ def watertight_report(mesh: trimesh.Trimesh) -> Dict:
         "n_nonmanifold_edges": n_nonmanifold,
     }
 
-
-def repair_mesh_inplace(mesh: trimesh.Trimesh, fill_holes: bool = True, merge_digits: Optional[int] = None) -> None:
+def drop_faces_touching_nonmanifold(mesh: trimesh.Trimesh) -> int:
     """
-    watertight 判定を改善しやすい軽修復．
-    ※形状が変わる可能性はあるので，必要なら --repair を切る．
+    non-manifold edge（count>2）に触れている face を削除する．
+    戻り値は削除face数．
     """
-    # validate=True で重複/退化face除去，頂点整理などを行う（trimesh 4.x の推奨系）
-    mesh.process(validate=True)
+    inv = np.asarray(mesh.edges_unique_inverse)
+    edges_u = np.asarray(mesh.edges_unique)
+    counts = np.bincount(inv, minlength=int(edges_u.shape[0]))
 
-    if merge_digits is not None:
-        # 近接頂点の溶接を強めたいとき用（スケール依存なので調整可能）
-        mesh.merge_vertices(digits_vertex=int(merge_digits))
-    else:
-        mesh.merge_vertices()
+    nm_edges = edges_u[counts > 2]
+    if nm_edges.shape[0] == 0:
+        return 0
 
-    trimesh.repair.fix_normals(mesh)
+    nm_set = {tuple(e) for e in np.sort(nm_edges, axis=1)}
 
+    f = np.asarray(mesh.faces, dtype=np.int64)
+    e0 = np.sort(f[:, [0, 1]], axis=1)
+    e1 = np.sort(f[:, [1, 2]], axis=1)
+    e2 = np.sort(f[:, [2, 0]], axis=1)
+
+    bad = np.fromiter((tuple(a) in nm_set for a in e0), count=f.shape[0], dtype=bool)
+    bad |= np.fromiter((tuple(a) in nm_set for a in e1), count=f.shape[0], dtype=bool)
+    bad |= np.fromiter((tuple(a) in nm_set for a in e2), count=f.shape[0], dtype=bool)
+
+    n_bad = int(bad.sum())
+    if n_bad > 0:
+        mesh.update_faces(~bad)
+        mesh.remove_unreferenced_vertices()
+    return n_bad
+
+
+def _sanitize_vertices_faces(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    area_eps_rel: float = 1e-12,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    warns: List[str] = []
+
+    v = np.asarray(vertices, dtype=np.float64)
+    f = np.asarray(faces, dtype=np.int64)
+
+    V = v.shape[0]
+    F = f.shape[0]
+    if V == 0 or F == 0:
+        raise ValueError("Empty vertices/faces.")
+
+    # (1) face index が範囲内か
+    in_range = (f >= 0).all(axis=1) & (f < V).all(axis=1)
+    if not in_range.all():
+        bad = int((~in_range).sum())
+        warns.append(f"sanitize: drop {bad}/{F} faces (out-of-range indices)")
+        f = f[in_range]
+        if f.shape[0] == 0:
+            raise ValueError("All faces dropped (out-of-range).")
+
+    # (2) NaN/Inf 頂点を除去（それに触れるfaceも落とす）
+    finite_v = np.isfinite(v).all(axis=1)
+    if not finite_v.all():
+        badv = int((~finite_v).sum())
+        warns.append(f"sanitize: found {badv}/{V} non-finite vertices (NaN/Inf). Removing.")
+        old_to_new = -np.ones((V,), dtype=np.int64)
+        keep = np.where(finite_v)[0]
+        old_to_new[keep] = np.arange(keep.shape[0], dtype=np.int64)
+
+        f2 = old_to_new[f]
+        okf = (f2 >= 0).all(axis=1)
+        dropf = int((~okf).sum())
+        if dropf > 0:
+            warns.append(f"sanitize: drop {dropf}/{f.shape[0]} faces touching non-finite vertices")
+
+        f = f2[okf]
+        v = v[finite_v]
+        if f.shape[0] == 0:
+            raise ValueError("All faces dropped (non-finite vertices).")
+
+    # (3) 同一頂点を含む退化faceを落とす
+    deg = (f[:, 0] == f[:, 1]) | (f[:, 1] == f[:, 2]) | (f[:, 2] == f[:, 0])
+    if deg.any():
+        drop = int(deg.sum())
+        warns.append(f"sanitize: drop {drop}/{f.shape[0]} degenerate faces (repeated indices)")
+        f = f[~deg]
+        if f.shape[0] == 0:
+            raise ValueError("All faces dropped (degenerate).")
+
+    # (4) 面積ほぼ0の三角形を落とす（ゼロ割の温床）
+    tri = v[f]  # (F,3,3)
+    e1 = tri[:, 1] - tri[:, 0]
+    e2 = tri[:, 2] - tri[:, 0]
+    area2 = np.linalg.norm(np.cross(e1, e2), axis=1)  # 2*area
+
+    scale = float(np.ptp(v, axis=0).max() if v.shape[0] > 0 else 1.0)
+    area_eps = area_eps_rel * max(scale * scale, 1e-30)
+    ok = area2 > area_eps
+    if not ok.all():
+        drop = int((~ok).sum())
+        warns.append(f"sanitize: drop {drop}/{f.shape[0]} near-zero-area faces (eps={area_eps:g})")
+        f = f[ok]
+        if f.shape[0] == 0:
+            raise ValueError("All faces dropped (zero-area).")
+
+    return v, f, warns
+
+
+def repair_mesh_inplace(mesh: trimesh.Trimesh, fill_holes: bool = True, merge_digits: Optional[int] = None) -> List[str]:
+    """
+    mesh.process(validate=True) を使わない安全修復．
+    戻り値：warning文字列リスト（metaに積む用）
+    """
+    warns: List[str] = []
+
+    v, f, w = _sanitize_vertices_faces(mesh.vertices, mesh.faces)
+    warns += w
+
+    # キャッシュ不整合を避けるため作り直す
+    mesh.vertices = v
+    mesh.faces = f
+
+    # いったん完全に新規Trimeshに置換する方がさらに安全
+    tmp = trimesh.Trimesh(vertices=v, faces=f, process=False)
+    mesh.vertices = tmp.vertices
+    mesh.faces = tmp.faces
+
+    # STL割れ対策
+    try:
+        if merge_digits is not None:
+            mesh.merge_vertices(digits_vertex=int(merge_digits))
+        else:
+            mesh.merge_vertices()
+    except Exception as e:
+        warns.append(f"repair: merge_vertices failed ({type(e).__name__}: {e})")
+
+    # 小穴埋め（効く範囲は限定的）
     if fill_holes:
-        trimesh.repair.fill_holes(mesh)
+        try:
+            trimesh.repair.fill_holes(mesh)
+        except Exception as e:
+            warns.append(f"repair: fill_holes failed ({type(e).__name__}: {e})")
+
+    # ★重要：fix_normals / process(validate=True) は呼ばない
+    return warns
 
 
 def compute_cube_bounds(mesh: trimesh.Trimesh, padding: float) -> Tuple[np.ndarray, np.ndarray, float]:
@@ -183,7 +305,7 @@ def compute_sdf_edt(
         transform = {"center": center.tolist(), "scale": float(scale)}
 
     if repair:
-        repair_mesh_inplace(mesh, fill_holes=True, merge_digits=merge_digits)
+        warns += repair_mesh_inplace(mesh, fill_holes=True, merge_digits=merge_digits)
 
     rep = watertight_report(mesh)
     print(rep)
@@ -296,6 +418,11 @@ def compute_sdf_edt(
     return sdf, meta, warns
 
 
+def replace_dirname(path: Path, src: str = "stl", dst: str = "sdf") -> Path:
+    parts = [dst if p == src else p for p in path.parts]
+    return Path(*parts)
+
+
 def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, params: Dict) -> Dict:
     """
     worker側．返り値は main が表示するための情報．
@@ -305,7 +432,8 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
     dst_dir = Path(dst_dir_str)
 
     rel = stl_path.relative_to(root_dir)
-    out_path = (dst_dir / rel).with_suffix(".npz")
+    rel_out = replace_dirname(rel, src="stl", dst="sdf")
+    out_path = (dst_dir / rel_out).with_suffix(".npz")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if out_path.exists() and (not params["overwrite"]):
@@ -332,7 +460,12 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
         meta["source_abspath"] = str(stl_path)
 
         meta_bytes = np.bytes_(json.dumps(meta, ensure_ascii=False).encode("utf-8"))
-
+        # signed を強制するなら，signed_used=False は失敗扱い
+        if params["signed_policy"] == "force" and (not meta.get("signed_used", False)):
+            raise RuntimeError(
+                "signed_policy=force but signed_used=False "
+                f"(likely labeling failed). watertight_report={meta.get('watertight_report')}"
+            )
         # 主要値はトップレベルにも置く（読むとき楽）
         np.savez_compressed(
             out_path,
@@ -445,6 +578,17 @@ def main():
 
             for i, fut in enumerate(as_completed(futs), start=1):
                 r = fut.result()
+                if r["status"] == "fail":
+                    print(f"[{i}/{len(futs)}] FAIL: {r['rel']}\n{r['msg']}")
+
+                    # まだ開始していないジョブをキャンセル
+                    for f in futs:
+                        f.cancel()
+
+                    # Python 3.9+ なら，未開始futureをまとめて破棄できる
+                    ex.shutdown(wait=False, cancel_futures=True)
+
+                    sys.exit(1)
                 if r["status"] == "ok":
                     n_ok += 1
                     if not args.quiet:
