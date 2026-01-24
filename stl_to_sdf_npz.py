@@ -326,6 +326,94 @@ def signed_mask_via_propagation(surface: np.ndarray) -> Tuple[np.ndarray, np.nda
     return inside, outside
 
 
+def reconstruct_sign_from_voxels(
+    mesh: trimesh.Trimesh,
+    grid_min: np.ndarray,
+    voxel_size: float,
+    res: int,
+    morph_close_iters: int,
+) -> Tuple[Optional[np.ndarray], List[str]]:
+    """
+    Reconstruct inside mask from voxelized surface and flood fill.
+    """
+    warns: List[str] = []
+    try:
+        from scipy.ndimage import binary_closing, generate_binary_structure
+    except Exception as e:
+        warns.append(f"sign reconstruct failed: scipy unavailable ({type(e).__name__}: {e}).")
+        return None, warns
+
+    surf = voxel_surface_mask_from_trimesh(mesh, cube_min=grid_min, voxel_size=voxel_size, res=res)
+    if morph_close_iters > 0:
+        struct = generate_binary_structure(3, 1)
+        for _ in range(int(morph_close_iters)):
+            surf = binary_closing(surf, structure=struct)
+
+    inside, _ = signed_mask_via_propagation(surf)
+    if int(inside.sum()) > 0:
+        return inside, warns
+
+    try:
+        vox_filled = mesh.voxelized(pitch=float(voxel_size), method="subdivide").fill()
+        occ_pts = np.asarray(vox_filled.points)
+        ijk = np.rint((occ_pts - grid_min) / float(voxel_size)).astype(np.int32)
+        valid = (
+            (ijk[:, 0] >= 0) & (ijk[:, 0] < res) &
+            (ijk[:, 1] >= 0) & (ijk[:, 1] < res) &
+            (ijk[:, 2] >= 0) & (ijk[:, 2] < res)
+        )
+        ijk = ijk[valid]
+        occ = np.zeros((res, res, res), dtype=bool)
+        if ijk.shape[0] > 0:
+            occ[ijk[:, 0], ijk[:, 1], ijk[:, 2]] = True
+        if int(occ.sum()) == 0:
+            warns.append("sign reconstruct failed: fill() produced empty occupancy.")
+            return None, warns
+        warns.append("sign reconstruct: used voxelized(...).fill() occupancy.")
+        return occ, warns
+    except Exception as e:
+        warns.append(f"sign reconstruct failed: fill() error ({type(e).__name__}: {e}).")
+        return None, warns
+
+
+def cleanup_negative_islands(
+    sdf: np.ndarray,
+    voxel_size: float,
+    near_surface_thresh_vox: float = 1.5,
+) -> Tuple[np.ndarray, int, List[str]]:
+    """
+    Flip negative components that do not touch the surface (|sdf| > threshold).
+    """
+    warns: List[str] = []
+    try:
+        from scipy.ndimage import generate_binary_structure, label, minimum
+    except Exception as e:
+        warns.append(f"sign cleanup skipped: scipy unavailable ({type(e).__name__}: {e}).")
+        return sdf, 0, warns
+
+    neg = sdf < 0
+    if not np.any(neg):
+        return sdf, 0, warns
+
+    struct = generate_binary_structure(3, 1)
+    labels, num = label(neg, structure=struct)
+    if num == 0:
+        return sdf, 0, warns
+
+    abs_sdf = np.abs(sdf, dtype=sdf.dtype)
+    mins = minimum(abs_sdf, labels=labels, index=np.arange(1, num + 1))
+    thresh = float(near_surface_thresh_vox) * float(voxel_size)
+    keep = mins <= thresh
+    remove_labels = np.where(~keep)[0] + 1
+    if remove_labels.size == 0:
+        return sdf, 0, warns
+
+    mask_remove = np.isin(labels, remove_labels)
+    sdf = sdf.copy()
+    sdf[mask_remove] = np.abs(sdf[mask_remove])
+    return sdf, int(remove_labels.size), warns
+
+
 def compute_sdf_mesh_distance_open3d(
     mesh: trimesh.Trimesh,
     grid_min: np.ndarray,
@@ -544,9 +632,9 @@ def compute_sdf(
 
     if distance_method == "mesh":
         if morph_close_iters > 0:
-            warns.append("morph_close_iters ignored for distance_method=mesh.")
+            warns.append("morph_close_iters is used only when voxel sign fallback is used.")
         try:
-            sdf, signed_used, w = compute_sdf_mesh_distance_open3d(
+            sdf_open3d, signed_used_open3d, w = compute_sdf_mesh_distance_open3d(
                 mesh=mesh,
                 grid_min=grid_min,
                 voxel_size=voxel_size,
@@ -556,7 +644,48 @@ def compute_sdf(
                 out_sdf=sdf_out,
             )
             warns += w
-            surface_meta = {"source": "open3d_distance", "morph_close_iters": int(morph_close_iters)}
+            sign_source = "open3d"
+            if want_signed:
+                if bool(signed_used_open3d):
+                    sdf, removed, w2 = cleanup_negative_islands(
+                        sdf_open3d,
+                        voxel_size=voxel_size,
+                        near_surface_thresh_vox=1.5,
+                    )
+                    warns += w2
+                    signed_used = True
+                    if removed > 0:
+                        warns.append(f"sign cleanup: removed {removed} negative islands.")
+                        sign_source = "open3d_clean"
+                    else:
+                        sign_source = "open3d"
+                else:
+                    inside, w2 = reconstruct_sign_from_voxels(
+                        mesh=mesh,
+                        grid_min=grid_min,
+                        voxel_size=voxel_size,
+                        res=res,
+                        morph_close_iters=morph_close_iters,
+                    )
+                    warns += w2
+                    if inside is not None:
+                        sdf = sdf_open3d.copy()
+                        np.abs(sdf_open3d, out=sdf)
+                        sdf[inside] = -sdf[inside]
+                        signed_used = True
+                        sign_source = "voxel_flood"
+                    else:
+                        sdf = sdf_open3d
+                        signed_used = False
+            else:
+                sdf = sdf_open3d
+                signed_used = False
+                sign_source = "unsigned"
+            surface_meta = {
+                "source": "open3d_distance",
+                "morph_close_iters": int(morph_close_iters),
+                "sign_source": sign_source,
+            }
         except Exception as e:
             warns.append(f"open3d distance failed ({type(e).__name__}: {e}). Fallback to edt.")
             sdf, info, w = compute_sdf_edt(

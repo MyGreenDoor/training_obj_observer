@@ -361,8 +361,8 @@ def main():
     ap.add_argument(
         "--min_component_faces",
         type=int,
-        default=10,
-        help="Remove connected components with fewer faces (10 disables).",
+        default=0,
+        help="Remove connected components with fewer faces (0 disables).",
     )
 
     # 互換のため残す（内部的に restore_size と同義にする）
