@@ -128,6 +128,35 @@ def count_mesh_components(mesh: trimesh.Trimesh) -> int:
         return 1
 
 
+def filter_components_by_faces(
+    mesh: trimesh.Trimesh,
+    min_faces: int,
+) -> trimesh.Trimesh:
+    """
+    Remove small connected components by face count.
+    """
+    if min_faces <= 0:
+        return mesh
+    try:
+        from trimesh.graph import connected_components
+        n_faces = int(len(mesh.faces))
+        if n_faces == 0:
+            return mesh
+        comps = connected_components(mesh.face_adjacency, nodes=np.arange(n_faces))
+        keep_faces = np.zeros((n_faces,), dtype=bool)
+        for comp in comps:
+            if len(comp) >= min_faces:
+                keep_faces[np.asarray(comp, dtype=np.int64)] = True
+        if keep_faces.all():
+            return mesh
+        new_mesh = mesh.copy()
+        new_mesh.update_faces(keep_faces)
+        new_mesh.remove_unreferenced_vertices()
+        return new_mesh
+    except Exception:
+        return mesh
+
+
 def iter_npz_files(root_dir: Path):
     for p in root_dir.rglob("*"):
         if p.is_file() and p.suffix.lower() == ".npz":
@@ -263,6 +292,7 @@ def convert_one_npz(npz_path: Path, out_path: Path, args: argparse.Namespace) ->
                     verts_world = verts_world / scale + center
 
         mesh = trimesh.Trimesh(vertices=verts_world, faces=faces, process=bool(args.process))
+        mesh = filter_components_by_faces(mesh, min_faces=int(args.min_component_faces))
         mesh.export(str(out_path))
 
         return {
@@ -272,6 +302,7 @@ def convert_one_npz(npz_path: Path, out_path: Path, args: argparse.Namespace) ->
             "level": float(level),
             "method": str(method),
             "signed_used": bool(signed_used),
+            "faces": int(len(mesh.faces)),
         }
     except Exception as e:
         return {"status": "fail", "npz": str(npz_path), "out": str(out_path), "msg": f"{type(e).__name__}: {e}"}
@@ -327,6 +358,12 @@ def main():
         default=1,
         help="Upsample SDF grid by integer factor before marching cubes (trilinear).",
     )
+    ap.add_argument(
+        "--min_component_faces",
+        type=int,
+        default=10,
+        help="Remove connected components with fewer faces (10 disables).",
+    )
 
     # 互換のため残す（内部的に restore_size と同義にする）
     ap.add_argument(
@@ -376,7 +413,7 @@ def main():
             raise RuntimeError(r["msg"])
         print(f"OK: {npz_path} -> {out_path}")
         print(
-            f"  level={r['level']} method={r['method']} signed_used(meta)={r['signed_used']}"
+            f"  level={r['level']} method={r['method']} signed_used(meta)={r['signed_used']} faces={r['faces']}"
         )
         return
 
