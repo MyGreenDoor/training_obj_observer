@@ -41,7 +41,7 @@ def show_slices(sdf: np.ndarray, title: str = ""):
     plt.tight_layout()
     plt.show()
 
-npz_path = r"E:\CAD_for_2nd_phase_LA\new_format_sdf\auto_generated\0000\00000001\sdf\0000000100001.npz"
+npz_path = r"/mnt/ssd2tb/new_format_sdf/auto_generated/0002/00020002/sdf/0002000200011.npz"
 sdf, meta = load_npz(npz_path)
 quick_stats(sdf)
 show_slices(sdf, title=npz_path)

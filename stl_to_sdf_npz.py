@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# python stl_to_sdf_npz.py  --root_dir /mnt/ssd2tb/new_format --dst_dir /mnt/ssd2tb/new_format_sdf --normalize_to_cube --repair --merge_digits 6 --morph_close_iters 1 --res 128 --workers 10 --signed_policy force
-
+"""
+python stl_to_sdf_npz.py  --root_dir /mnt/ssd2tb/new_format --dst_dir /mnt/ssd2tb/new_format_sdf --normalize_to_cube \
+--repair --merge_digits 6 --morph_close_iters 1 --res 128 --workers 10 --distance_method mesh --dtype f16
+"""
 
 import argparse
 import json
@@ -15,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import trimesh
 
+MAX_POINTS_PER_CHUNK = 1_000_000
 
 def _ensure_trimesh(mesh):
     if isinstance(mesh, trimesh.Scene):
@@ -214,6 +217,63 @@ def compute_cube_bounds(mesh: trimesh.Trimesh, padding: float) -> Tuple[np.ndarr
     return cube_min, cube_max, cube_size
 
 
+def compute_grid_from_mesh(
+    mesh: trimesh.Trimesh,
+    res: int,
+    padding: float,
+    center_override: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, float]:
+    """
+    Build a uniform grid centered at mesh bbox center (or override).
+    Returns (grid_min, grid_max, voxel_size, grid_center, max_extent).
+    """
+    if res < 2:
+        raise ValueError("res must be >= 2 to build a grid.")
+
+    bmin, bmax = mesh.bounds
+    center = 0.5 * (bmin + bmax)
+    if center_override is not None:
+        center = np.asarray(center_override, dtype=np.float64)
+
+    extent = (bmax - bmin)
+    max_extent = float(extent.max() if extent.max() > 0 else 1.0)
+    pad = float(padding) * max_extent
+    half = 0.5 * max_extent + pad
+
+    voxel_size = float((2.0 * half) / float(res - 1))
+    grid_min = center - half
+    grid_max = grid_min + voxel_size * float(res - 1)
+    grid_center = 0.5 * (grid_min + grid_max)
+    return grid_min, grid_max, voxel_size, grid_center, max_extent
+
+
+def build_grid_axes(grid_min: np.ndarray, voxel_size: float, res: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    idx = np.arange(res, dtype=np.float64)
+    xs = grid_min[0] + idx * float(voxel_size)
+    ys = grid_min[1] + idx * float(voxel_size)
+    zs = grid_min[2] + idx * float(voxel_size)
+    return xs, ys, zs
+
+
+def iter_grid_chunks(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    max_points: int = MAX_POINTS_PER_CHUNK,
+):
+    plane = int(ys.size) * int(zs.size)
+    if plane <= 0:
+        return
+    chunk = max(1, int(max_points // plane))
+    for i0 in range(0, int(xs.size), chunk):
+        i1 = min(int(xs.size), i0 + chunk)
+        xi = xs[i0:i1]
+        xg, yg, zg = np.meshgrid(xi, ys, zs, indexing="ij")
+        pts = np.stack((xg, yg, zg), axis=-1).reshape(-1, 3)
+        block_shape = (int(i1 - i0), int(ys.size), int(zs.size))
+        yield i0, i1, pts, block_shape
+
+
 def voxel_surface_mask_from_trimesh(
     mesh: trimesh.Trimesh,
     cube_min: np.ndarray,
@@ -227,7 +287,7 @@ def voxel_surface_mask_from_trimesh(
     pts = np.asarray(vox.points)  # (K,3) voxel centers（surface寄り）
 
     # index = round((p - cube_min) / voxel_size)
-    ijk = np.floor((pts - cube_min) / float(voxel_size) + 0.5).astype(np.int32)
+    ijk = np.rint((pts - cube_min) / float(voxel_size)).astype(np.int32)
 
     valid = (
         (ijk[:, 0] >= 0) & (ijk[:, 0] < res) &
@@ -266,56 +326,97 @@ def signed_mask_via_propagation(surface: np.ndarray) -> Tuple[np.ndarray, np.nda
     return inside, outside
 
 
+def compute_sdf_mesh_distance_open3d(
+    mesh: trimesh.Trimesh,
+    grid_min: np.ndarray,
+    voxel_size: float,
+    res: int,
+    want_signed: bool,
+    out_dtype: np.dtype,
+    out_sdf: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, bool, List[str]]:
+    """
+    Compute distance using Open3D RaycastingScene (often more memory stable).
+    """
+    warns: List[str] = []
+    try:
+        import open3d as o3d
+    except Exception as e:
+        raise RuntimeError("open3d is required for mesh_backend=open3d.") from e
+
+    if out_sdf is None:
+        sdf = np.empty((res, res, res), dtype=out_dtype)
+    else:
+        sdf = out_sdf
+
+    # Build Open3D triangle mesh
+    v = np.asarray(mesh.vertices, dtype=np.float32)
+    f = np.asarray(mesh.faces, dtype=np.int32)
+    legacy = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(v.astype(np.float64)),
+        o3d.utility.Vector3iVector(f),
+    )
+    mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(legacy)
+    if "positions" in mesh_t.vertex:
+        mesh_t.vertex["positions"] = mesh_t.vertex["positions"].to(o3d.core.Dtype.Float32)
+    if "indices" in mesh_t.triangle and mesh_t.triangle["indices"].dtype != o3d.core.Dtype.Int32:
+        mesh_t.triangle["indices"] = mesh_t.triangle["indices"].to(o3d.core.Dtype.Int32)
+
+    scene = o3d.t.geometry.RaycastingScene()
+    _ = scene.add_triangles(mesh_t)
+
+    has_signed = hasattr(scene, "compute_signed_distance")
+    has_distance = hasattr(scene, "compute_distance")
+    if want_signed and not has_signed:
+        warns.append("open3d: compute_signed_distance unavailable. Fallback to unsigned.")
+        want_signed = False
+    if not has_signed and not has_distance:
+        raise RuntimeError("open3d RaycastingScene has no distance API.")
+
+    xs, ys, zs = build_grid_axes(grid_min, voxel_size, res)
+    neg_count = 0
+    pos_count = 0
+
+    for i0, i1, pts, block_shape in iter_grid_chunks(xs, ys, zs, max_points=MAX_POINTS_PER_CHUNK):
+        t = o3d.core.Tensor(pts, dtype=o3d.core.Dtype.Float32)
+        if want_signed and has_signed:
+            vals = scene.compute_signed_distance(t).numpy()
+        else:
+            if has_distance:
+                vals = scene.compute_distance(t).numpy()
+            else:
+                vals = np.abs(scene.compute_signed_distance(t).numpy())
+
+        neg_count += int((vals < 0).sum())
+        pos_count += int((vals > 0).sum())
+        sdf[i0:i1, :, :] = vals.reshape(block_shape).astype(out_dtype, copy=False)
+        del t, pts, vals
+
+    signed_used = bool(want_signed and (neg_count > 0) and (pos_count > 0))
+    if want_signed and not signed_used:
+        warns.append("open3d: Signed labeling failed. Fallback to unsigned.")
+        np.abs(sdf, out=sdf)
+    return sdf, signed_used, warns
+
+
 def compute_sdf_edt(
     mesh: trimesh.Trimesh,
     res: int,
-    padding: float,
-    normalize_to_cube: bool,
-    trunc: Optional[float],
-    signed_policy: str,  # auto, force, off
+    grid_min: np.ndarray,
+    voxel_size: float,
+    want_signed: bool,
     out_dtype: np.dtype,
     morph_close_iters: int,
-    repair: bool,
-    merge_digits: Optional[int],
 ) -> Tuple[np.ndarray, Dict, List[str]]:
     """
-    1) mesh(optional normalize)
-    2) 等方cube bboxを作る
-    3) surface voxel mask を作る（trimesh.voxelized）
-    4) EDTで距離場
-    5) watertightなら propagation で inside/outside 推定して符号付け
+    EDT-based SDF using surface voxel mask.
     """
     from scipy.ndimage import distance_transform_edt, binary_closing, generate_binary_structure
 
     warns: List[str] = []
 
-    # normalize_to_cube（最大辺長を1にして中心原点へ）
-    transform = None
-    if normalize_to_cube:
-        v = np.asarray(mesh.vertices, dtype=np.float64)
-        vmin = v.min(axis=0)
-        vmax = v.max(axis=0)
-        center = 0.5 * (vmin + vmax)
-        extent = float((vmax - vmin).max())
-        if extent <= 0:
-            raise ValueError("Degenerate mesh bbox extent.")
-        scale = 1.0 / extent
-        v2 = (v - center) * scale
-        mesh = trimesh.Trimesh(vertices=v2, faces=np.asarray(mesh.faces), process=False)
-        transform = {"center": center.tolist(), "scale": float(scale)}
-
-    if repair:
-        warns += repair_mesh_inplace(mesh, fill_holes=True, merge_digits=merge_digits)
-
-    rep = watertight_report(mesh)
-    print(rep)
-
-    # cube bounds + voxel_size
-    cube_min, cube_max, cube_size = compute_cube_bounds(mesh, padding=padding)
-    voxel_size = float(cube_size / float(res - 1))
-
     # surface mask
-    surf = voxel_surface_mask_from_trimesh(mesh, cube_min=cube_min, voxel_size=voxel_size, res=res)
+    surf = voxel_surface_mask_from_trimesh(mesh, cube_min=grid_min, voxel_size=voxel_size, res=res)
 
     # 低解像度でshellが漏れる対策（必要なら）
     if morph_close_iters > 0:
@@ -326,31 +427,15 @@ def compute_sdf_edt(
     # EDT（surfaceが0，その他が1で距離を計算）
     dist = distance_transform_edt(~surf, sampling=(voxel_size, voxel_size, voxel_size)).astype(out_dtype, copy=False)
 
-    # signed/unsigned の決定
-    want_signed: bool
-    if signed_policy == "off":
-        want_signed = False
-    elif signed_policy == "force":
-        want_signed = True
-    else:
-        # auto
-        want_signed = bool(rep["is_watertight"])
-
-    if signed_policy == "auto" and not rep["is_watertight"]:
-        warns.append(
-            f"Non-watertight by trimesh check (auto->unsigned) "
-            f"(boundary_edges={rep['n_boundary_edges']}, nonmanifold_edges={rep['n_nonmanifold_edges']})"
-        )
-
     if want_signed:
         inside, outside = signed_mask_via_propagation(surf)
 
         if inside.sum() == 0:
             # watertight なら fill で占有（内部）を作って符号付けに使う
             try:
-                vox_filled = mesh.voxelized(pitch=float(voxel_size), method="subdivide").fill()  # :contentReference[oaicite:1]{index=1}
+                vox_filled = mesh.voxelized(pitch=float(voxel_size), method="subdivide").fill()
                 occ_pts = np.asarray(vox_filled.points)  # filled voxel centers
-                ijk = np.floor((occ_pts - cube_min) / float(voxel_size) + 0.5).astype(np.int32)
+                ijk = np.rint((occ_pts - grid_min) / float(voxel_size)).astype(np.int32)
 
                 valid = (
                     (ijk[:, 0] >= 0) & (ijk[:, 0] < res) &
@@ -384,29 +469,146 @@ def compute_sdf_edt(
         sdf = dist
         signed_used = False
 
+    return sdf, {"signed_used": bool(signed_used)}, warns
+
+
+def compute_sdf(
+    mesh: trimesh.Trimesh,
+    res: int,
+    padding: float,
+    normalize_to_cube: bool,
+    trunc: Optional[float],
+    signed_policy: str,  # auto, force, off
+    out_dtype: np.dtype,
+    morph_close_iters: int,
+    repair: bool,
+    merge_digits: Optional[int],
+    distance_method: str,  # mesh, edt
+    sdf_out: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict, List[str]]:
+    """
+    Build SDF volume and metadata.
+    """
+    warns: List[str] = []
+
+    # normalize_to_cube（最大辺長を1にして中心原点へ）
+    transform = None
+    if normalize_to_cube:
+        v = np.asarray(mesh.vertices, dtype=np.float64)
+        vmin = v.min(axis=0)
+        vmax = v.max(axis=0)
+        center = 0.5 * (vmin + vmax)
+        extent = float((vmax - vmin).max())
+        if extent <= 0:
+            raise ValueError("Degenerate mesh bbox extent.")
+        scale = 1.0 / extent
+        v2 = (v - center) * scale
+        mesh = trimesh.Trimesh(vertices=v2, faces=np.asarray(mesh.faces), process=False)
+        transform = {"center": center.tolist(), "scale": float(scale)}
+
+    if repair:
+        warns += repair_mesh_inplace(mesh, fill_holes=True, merge_digits=merge_digits)
+
+    rep = watertight_report(mesh)
+    print(rep)
+
+    # decide signed policy
+    if signed_policy == "off":
+        want_signed = False
+    elif signed_policy == "force":
+        want_signed = True
+    else:
+        want_signed = bool(rep["is_watertight"])
+
+    if signed_policy == "auto" and not rep["is_watertight"]:
+        warns.append(
+            f"Non-watertight by trimesh check (auto->unsigned) "
+            f"(boundary_edges={rep['n_boundary_edges']}, nonmanifold_edges={rep['n_nonmanifold_edges']})"
+        )
+
+    # grid (centered; normalize_to_cube -> center at 0)
+    center_override = np.zeros(3, dtype=np.float64) if normalize_to_cube else None
+    grid_min, grid_max, voxel_size, grid_center, _ = compute_grid_from_mesh(
+        mesh, res=res, padding=padding, center_override=center_override
+    )
+
+    vol_bytes = int(res) ** 3 * np.dtype(out_dtype).itemsize
+    if vol_bytes >= (1 << 30):
+        warns.append(
+            f"SDF volume size ≈ {vol_bytes / (1 << 30):.2f} GiB. "
+            "Consider lower res or dtype=f16."
+        )
+
+    if (res % 2) == 0:
+        warns.append("res is even: grid center falls between voxels. Use odd res to place a voxel center at origin.")
+
+    if distance_method == "mesh":
+        if morph_close_iters > 0:
+            warns.append("morph_close_iters ignored for distance_method=mesh.")
+        try:
+            sdf, signed_used, w = compute_sdf_mesh_distance_open3d(
+                mesh=mesh,
+                grid_min=grid_min,
+                voxel_size=voxel_size,
+                res=res,
+                want_signed=want_signed,
+                out_dtype=out_dtype,
+                out_sdf=sdf_out,
+            )
+            warns += w
+            surface_meta = {"source": "open3d_distance", "morph_close_iters": int(morph_close_iters)}
+        except Exception as e:
+            warns.append(f"open3d distance failed ({type(e).__name__}: {e}). Fallback to edt.")
+            sdf, info, w = compute_sdf_edt(
+                mesh=mesh,
+                res=res,
+                grid_min=grid_min,
+                voxel_size=voxel_size,
+                want_signed=want_signed,
+                out_dtype=out_dtype,
+                morph_close_iters=morph_close_iters,
+            )
+            warns += w
+            signed_used = bool(info.get("signed_used", False))
+            surface_meta = {"source": "trimesh.voxelized", "morph_close_iters": int(morph_close_iters)}
+    else:
+        sdf, info, w = compute_sdf_edt(
+            mesh=mesh,
+            res=res,
+            grid_min=grid_min,
+            voxel_size=voxel_size,
+            want_signed=want_signed,
+            out_dtype=out_dtype,
+            morph_close_iters=morph_close_iters,
+        )
+        warns += w
+        signed_used = bool(info.get("signed_used", False))
+        surface_meta = {"source": "trimesh.voxelized", "morph_close_iters": int(morph_close_iters)}
+
     if trunc is not None:
         t = float(trunc)
         np.clip(sdf, -t, t, out=sdf)
 
     meta = {
         "version": 2,
-        "method": "edt_voxel",
+        "method": "mesh_distance" if distance_method == "mesh" else "edt_voxel",
+        "distance_method": str(distance_method),
         "res": int(res),
         "indexing": "ij",
         "padding": float(padding),
         "normalize_to_cube": bool(normalize_to_cube),
         "trunc": None if trunc is None else float(trunc),
-        "bbox_min": cube_min.astype(np.float32).tolist(),
-        "bbox_max": cube_max.astype(np.float32).tolist(),
+        "bbox_min": grid_min.astype(np.float32).tolist(),
+        "bbox_max": grid_max.astype(np.float32).tolist(),
         "voxel_size": float(voxel_size),
+        "grid_center": grid_center.astype(np.float32).tolist(),
+        "center_index": float((res - 1) * 0.5),
+        "center_is_voxel": bool((res % 2) == 1),
         "watertight_report": rep,
         "signed_policy": signed_policy,
         "signed_used": bool(signed_used),
         "sign_convention": "inside_negative" if signed_used else "unsigned",
-        "surface_voxel": {
-            "source": "trimesh.voxelized",
-            "morph_close_iters": int(morph_close_iters),
-        },
+        "surface_voxel": surface_meta,
         "repair": {
             "enabled": bool(repair),
             "merge_digits": None if merge_digits is None else int(merge_digits),
@@ -439,11 +641,18 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
     if out_path.exists() and (not params["overwrite"]):
         return {"status": "skip", "rel": str(rel), "out": str(out_path), "warns": [], "msg": "exists"}
 
+    mesh = None
+    sdf = None
+    meta = None
     try:
         mesh = trimesh.load(str(stl_path), force="mesh", process=False)
         mesh = _ensure_trimesh(mesh)
 
-        sdf, meta, warns = compute_sdf_edt(
+        pre_warns: List[str] = []
+
+        distance_method = params["distance_method"]
+
+        sdf, meta, warns = compute_sdf(
             mesh=mesh,
             res=params["res"],
             padding=params["padding"],
@@ -454,7 +663,10 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
             morph_close_iters=params["morph_close_iters"],
             repair=params["repair"],
             merge_digits=params["merge_digits"],
+            distance_method=distance_method,
+            sdf_out=None,
         )
+        warns = pre_warns + warns
 
         meta["source_relpath"] = str(rel).replace(os.sep, "/")
         meta["source_abspath"] = str(stl_path)
@@ -483,6 +695,10 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
     except Exception as e:
         tb = traceback.format_exc(limit=10)
         return {"status": "fail", "rel": str(rel), "out": str(out_path), "warns": [], "msg": f"{type(e).__name__}: {e}\n{tb}"}
+    finally:
+        mesh = None
+        sdf = None
+        meta = None
 
 
 def main():
@@ -504,6 +720,13 @@ def main():
     parser.add_argument("--quiet", action="store_true")
 
     # EDT用補助
+    parser.add_argument(
+        "--distance_method",
+        choices=["mesh", "edt"],
+        default="mesh",
+        help="Distance computation method: mesh (direct distance) or edt (voxel surface + EDT).",
+    )
+    # memory-related tuning arguments removed for speed-first workflow
     parser.add_argument(
         "--morph_close_iters",
         type=int,
@@ -536,7 +759,10 @@ def main():
     stl_list = list(iter_stl_files(root_dir))
     if not args.quiet:
         print(f"Found {len(stl_list)} STL files under: {root_dir}")
-        print(f"workers={args.workers}, res={args.res}, signed_policy={args.signed_policy}, dtype={args.dtype}")
+        print(
+            f"workers={args.workers}, res={args.res}, signed_policy={args.signed_policy}, "
+            f"dtype={args.dtype}, distance_method={args.distance_method}"
+        )
 
     params = {
         "res": int(args.res),
@@ -546,6 +772,7 @@ def main():
         "trunc": None if args.trunc is None else float(args.trunc),
         "out_dtype": out_dtype,
         "overwrite": bool(args.overwrite),
+        "distance_method": str(args.distance_method),
         "morph_close_iters": int(args.morph_close_iters),
         "repair": bool(args.repair),
         "merge_digits": None if args.merge_digits is None else int(args.merge_digits),
@@ -571,7 +798,7 @@ def main():
                 print(f"[{i}/{len(stl_list)}] FAIL: {r['rel']}\n{r['msg']}")
     else:
         # multiprocessing
-        with ProcessPoolExecutor(max_workers=int(args.workers)) as ex:
+        with ProcessPoolExecutor(max_workers=int(max(1, args.workers))) as ex:
             futs = []
             for p in stl_list:
                 futs.append(ex.submit(process_one_stl, str(p), str(root_dir), str(dst_dir), params))
