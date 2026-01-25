@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-python stl_to_sdf_npz.py  --root_dir /mnt/ssd2tb/new_format --dst_dir /mnt/ssd2tb/new_format_sdf --normalize_to_cube \
---repair --merge_digits 6 --morph_close_iters 1 --res 128 --workers 10 --distance_method mesh --dtype f16
+python stl_to_sdf_npz.py  --root_dir /mnt/ssd2tb/new_format/original --dst_dir /mnt/ssd2tb/new_format_sdf --normalize_to_cube --repair --merge_digits 6 --morph_close_iters 1 --res 128 \
+    --workers 10 --distance_method mesh --mesh_backend open3d  --sign_occupancy --sign_occupancy_mode any   --sdf_supersample 2 --sdf_supersample_mode mean
 """
+
 
 import argparse
 import json
@@ -757,7 +758,7 @@ def compute_sdf_mesh_distance_open3d(
     try:
         import open3d as o3d
     except Exception as e:
-        raise RuntimeError("open3d is required for mesh_backend=open3d.") from e
+        raise RuntimeError("open3d is required.") from e
 
     if out_sdf is None:
         sdf = np.empty((res, res, res), dtype=out_dtype)
@@ -1002,65 +1003,18 @@ def compute_sdf(
         if morph_close_iters > 0:
             warns.append("morph_close_iters is used only when voxel sign fallback is used.")
         try:
-            dual_pass = int(sdf_supersample) > 1 and int(sdf_downsample) > 1
-            if dual_pass:
-                warns.append(
-                    "sdf: dual-pass enabled (supersample>1 and downsample>1). "
-                    "Compute two volumes and combine by minabs."
-                )
-                sdf_down, signed_used_down, w = compute_sdf_mesh_distance_open3d(
-                    mesh=mesh,
-                    grid_min=grid_min,
-                    voxel_size=voxel_size,
-                    res=res,
-                    want_signed=want_signed,
-                    out_dtype=out_dtype,
-                    out_sdf=sdf_out,
-                    supersample=1,
-                    supersample_mode=str(sdf_supersample_mode),
-                    downsample=int(sdf_downsample),
-                    downsample_mode=str(sdf_downsample_mode),
-                )
-                warns += w
-                sdf_ss, signed_used_ss, w2 = compute_sdf_mesh_distance_open3d(
-                    mesh=mesh,
-                    grid_min=grid_min,
-                    voxel_size=voxel_size,
-                    res=res,
-                    want_signed=want_signed,
-                    out_dtype=out_dtype,
-                    out_sdf=None,
-                    supersample=int(sdf_supersample),
-                    supersample_mode=str(sdf_supersample_mode),
-                    downsample=1,
-                    downsample_mode=str(sdf_downsample_mode),
-                )
-                warns += w2
-                # Combine by minabs to preserve thin features while reducing noise.
-                abs_down = np.abs(sdf_down)
-                abs_ss = np.abs(sdf_ss)
-                use_ss = abs_ss < abs_down
-                sdf_down[use_ss] = sdf_ss[use_ss]
-                sdf_open3d = sdf_down
-                neg_count = int((sdf_open3d < 0).sum())
-                pos_count = int((sdf_open3d > 0).sum())
-                signed_used_open3d = bool(want_signed and (neg_count > 0) and (pos_count > 0))
-                sdf_ss = None
-            else:
-                sdf_open3d, signed_used_open3d, w = compute_sdf_mesh_distance_open3d(
-                    mesh=mesh,
-                    grid_min=grid_min,
-                    voxel_size=voxel_size,
-                    res=res,
-                    want_signed=want_signed,
-                    out_dtype=out_dtype,
-                    out_sdf=sdf_out,
-                    supersample=int(sdf_supersample),
-                    supersample_mode=str(sdf_supersample_mode),
-                    downsample=int(sdf_downsample),
-                    downsample_mode=str(sdf_downsample_mode),
-                )
-                warns += w
+            sdf_open3d, signed_used_open3d, w = compute_sdf_mesh_distance_open3d(
+                mesh=mesh,
+                grid_min=grid_min,
+                voxel_size=voxel_size,
+                res=res,
+                want_signed=want_signed,
+                out_dtype=out_dtype,
+                out_sdf=sdf_out,
+                supersample=int(sdf_supersample),
+                supersample_mode=str(sdf_supersample_mode),
+            )
+            warns += w
             sign_source = "open3d"
             if want_signed:
                 if bool(sign_occupancy):
@@ -1139,9 +1093,6 @@ def compute_sdf(
                 "sign_source": sign_source,
                 "sdf_supersample": int(sdf_supersample),
                 "sdf_supersample_mode": str(sdf_supersample_mode),
-                "sdf_downsample": int(sdf_downsample),
-                "sdf_downsample_mode": str(sdf_downsample_mode),
-                "sdf_dual_pass": bool(int(sdf_supersample) > 1 and int(sdf_downsample) > 1),
                 "sign_occupancy_mode": str(sign_occupancy_mode),
             }
         except Exception as e:
@@ -1234,36 +1185,20 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
     sdf = None
     meta = None
     try:
-        mesh_backend = str(params.get("mesh_backend", "open3d"))
         pre_warns: List[str] = []
-        if mesh_backend == "open3d":
-            if params.get("distance_method", "mesh") != "mesh":
-                raise RuntimeError("mesh_backend=open3d requires distance_method=mesh.")
-            mesh = load_mesh_open3d(stl_path)
-            if params.get("o3d_clean", False) or int(params.get("o3d_subdivide", 0)) > 0:
-                mesh, w = open3d_remesh_for_stability(
-                    mesh,
-                    subdivide_iters=int(params.get("o3d_subdivide", 0)),
-                )
-                pre_warns += w
-            if params.get("meshfix", False):
-                pre_warns.append("meshfix skipped: trimesh backend required.")
-            if params.get("repair", False):
-                pre_warns.append("repair skipped: trimesh backend required.")
-            if params.get("merge_digits") is not None:
-                pre_warns.append("merge_digits skipped: trimesh backend required.")
-        else:
-            mesh = trimesh.load(str(stl_path), force="mesh", process=False)
-            mesh = _ensure_trimesh(mesh)
-            if params.get("o3d_clean", False) or int(params.get("o3d_subdivide", 0)) > 0:
-                mesh, w = open3d_remesh_for_stability(
-                    mesh,
-                    subdivide_iters=int(params.get("o3d_subdivide", 0)),
-                )
-                pre_warns += w
-            if params.get("meshfix", False):
-                mesh, w = meshfix_watertight(mesh)
-                pre_warns += w
+        if params.get("distance_method", "mesh") != "mesh":
+            raise RuntimeError("distance_method must be 'mesh' with open3d backend.")
+        mesh = load_mesh_open3d(stl_path)
+        if params.get("o3d_clean", False) or int(params.get("o3d_subdivide", 0)) > 0:
+            mesh, w = open3d_remesh_for_stability(
+                mesh,
+                subdivide_iters=int(params.get("o3d_subdivide", 0)),
+            )
+            pre_warns += w
+        if params.get("repair", False):
+            pre_warns.append("repair skipped: trimesh backend required.")
+        if params.get("merge_digits") is not None:
+            pre_warns.append("merge_digits skipped: trimesh backend required.")
 
         if int(params.get("min_component_faces", 0)) > 0 or bool(params.get("keep_largest_component", False)):
             mesh, w = filter_mesh_components(
@@ -1274,8 +1209,6 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
             pre_warns += w
 
         distance_method = params["distance_method"]
-        repair_flag = bool(params.get("repair", False)) if mesh_backend != "open3d" else False
-        merge_digits = params.get("merge_digits", None) if mesh_backend != "open3d" else None
 
         sdf, meta, warns = compute_sdf(
             mesh=mesh,
@@ -1286,18 +1219,14 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
             signed_policy=params["signed_policy"],
             out_dtype=params["out_dtype"],
             morph_close_iters=params["morph_close_iters"],
-            repair=repair_flag,
-            merge_digits=merge_digits,
+            repair=bool(params.get("repair", False)),
+            merge_digits=params.get("merge_digits", None),
             distance_method=distance_method,
             sdf_out=None,
             sign_occupancy=bool(params.get("sign_occupancy", False)),
             sdf_supersample=int(params.get("sdf_supersample", 1)),
             sdf_supersample_mode=str(params.get("sdf_supersample_mode", "mean")),
             sign_occupancy_mode=str(params.get("sign_occupancy_mode", "center")),
-            watertight_voxelize=bool(params.get("watertight_voxelize", False)),
-            wt_voxel_scale=int(params.get("wt_voxel_scale", 1)),
-            sdf_downsample=int(params.get("sdf_downsample", 1)),
-            sdf_downsample_mode=str(params.get("sdf_downsample_mode", "minabs")),
         )
         warns = pre_warns + warns
 
@@ -1305,15 +1234,11 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
             meta["repair"] = {}
         meta["repair"]["o3d_clean"] = bool(params.get("o3d_clean", False))
         meta["repair"]["o3d_subdivide"] = int(params.get("o3d_subdivide", 0))
-        meta["repair"]["meshfix"] = bool(params.get("meshfix", False) and mesh_backend == "trimesh")
-        meta["repair"]["watertight_voxelize"] = bool(params.get("watertight_voxelize", False))
-        meta["repair"]["wt_voxel_scale"] = int(params.get("wt_voxel_scale", 1))
         meta["repair"]["min_component_faces"] = int(params.get("min_component_faces", 0))
         meta["repair"]["keep_largest_component"] = bool(params.get("keep_largest_component", False))
 
         meta["source_relpath"] = str(rel).replace(os.sep, "/")
         meta["source_abspath"] = str(stl_path)
-        meta["mesh_backend"] = str(mesh_backend)
 
         meta_bytes = np.bytes_(json.dumps(meta, ensure_ascii=False).encode("utf-8"))
         # signed を強制するなら，signed_used=False は失敗扱い
@@ -1362,12 +1287,6 @@ def main():
     parser.add_argument("--dtype", choices=["f16", "f32"], default="f32")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument(
-        "--mesh_backend",
-        choices=["open3d", "trimesh"],
-        default="open3d",
-        help="Mesh loading backend. open3d avoids trimesh usage.",
-    )
 
     # EDT用補助
     parser.add_argument(
@@ -1393,22 +1312,6 @@ def main():
         type=int,
         default=0,
         help="Open3D midpoint subdivision iterations (0 disables).",
-    )
-    parser.add_argument(
-        "--meshfix",
-        action="store_true",
-        help="Apply pymeshfix to enforce watertightness (may alter geometry).",
-    )
-    parser.add_argument(
-        "--watertight_voxelize",
-        action="store_true",
-        help="Build a watertight proxy mesh by voxel occupancy + marching cubes (topology-robust).",
-    )
-    parser.add_argument(
-        "--wt_voxel_scale",
-        type=int,
-        default=1,
-        help="Voxel scale for watertight proxy (>=1). Larger preserves thin parts but slower.",
     )
     parser.add_argument(
         "--min_component_faces",
@@ -1444,18 +1347,6 @@ def main():
         default="mean",
         help="Reduction for supersampled SDF: mean (smooth) or minabs (conservative).",
     )
-    parser.add_argument(
-        "--sdf_downsample",
-        type=int,
-        default=1,
-        help="Compute SDF at higher res (factor) then downsample to target res.",
-    )
-    parser.add_argument(
-        "--sdf_downsample_mode",
-        choices=["minabs"],
-        default="minabs",
-        help="Downsample reduction mode.",
-    )
 
     # 修復（watertight改善用）
     parser.add_argument("--repair", action="store_true", help="Apply light mesh repair (process+merge+fill_holes).")
@@ -1486,13 +1377,11 @@ def main():
             f"workers={args.workers}, res={args.res}, signed_policy={args.signed_policy}, "
             f"dtype={args.dtype}, distance_method={args.distance_method}, "
             f"o3d_clean={bool(args.o3d_clean)}, o3d_subdivide={int(args.o3d_subdivide)}, "
-            f"meshfix={bool(args.meshfix)}, watertight_voxelize={bool(args.watertight_voxelize)}, "
-            f"wt_voxel_scale={int(args.wt_voxel_scale)}, min_component_faces={int(args.min_component_faces)}, "
+            f"min_component_faces={int(args.min_component_faces)}, "
             f"keep_largest_component={bool(args.keep_largest_component)}, "
             f"sign_occupancy={bool(args.sign_occupancy)}, "
-            f"sign_occupancy_mode={args.sign_occupancy_mode}, mesh_backend={args.mesh_backend}, "
-            f"sdf_supersample={int(args.sdf_supersample)}, sdf_supersample_mode={args.sdf_supersample_mode}, "
-            f"sdf_downsample={int(args.sdf_downsample)}, sdf_downsample_mode={args.sdf_downsample_mode}"
+            f"sign_occupancy_mode={args.sign_occupancy_mode}, "
+            f"sdf_supersample={int(args.sdf_supersample)}, sdf_supersample_mode={args.sdf_supersample_mode}"
         )
 
     params = {
@@ -1503,14 +1392,10 @@ def main():
         "trunc": None if args.trunc is None else float(args.trunc),
         "out_dtype": out_dtype,
         "overwrite": bool(args.overwrite),
-        "mesh_backend": str(args.mesh_backend),
         "distance_method": str(args.distance_method),
         "morph_close_iters": int(args.morph_close_iters),
         "o3d_clean": bool(args.o3d_clean),
         "o3d_subdivide": int(args.o3d_subdivide),
-        "meshfix": bool(args.meshfix),
-        "watertight_voxelize": bool(args.watertight_voxelize),
-        "wt_voxel_scale": int(max(1, args.wt_voxel_scale)),
         "min_component_faces": int(args.min_component_faces),
         "keep_largest_component": bool(args.keep_largest_component),
         "sign_occupancy": bool(args.sign_occupancy),
@@ -1519,8 +1404,6 @@ def main():
         "merge_digits": None if args.merge_digits is None else int(args.merge_digits),
         "sdf_supersample": int(max(1, args.sdf_supersample)),
         "sdf_supersample_mode": str(args.sdf_supersample_mode),
-        "sdf_downsample": int(max(1, args.sdf_downsample)),
-        "sdf_downsample_mode": str(args.sdf_downsample_mode),
     }
 
     n_ok = n_skip = n_fail = 0
