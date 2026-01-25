@@ -64,7 +64,7 @@ def load_mesh_open3d(stl_path: Path) -> MeshData:
     try:
         import open3d as o3d
     except Exception as e:
-        raise RuntimeError("open3d is required for --mesh_backend open3d.") from e
+        raise RuntimeError("open3d is required.") from e
     mesh = o3d.io.read_triangle_mesh(str(stl_path))
     if mesh is None:
         raise ValueError(f"Open3D failed to load: {stl_path}")
@@ -131,43 +131,6 @@ def open3d_remesh_for_stability(
     mesh2 = make_mesh(vertices=v2, faces=f2, like=mesh)
     return mesh2, warns
 
-
-def meshfix_watertight(mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, List[str]]:
-    """
-    Apply pymeshfix to enforce watertightness. This may alter geometry.
-    """
-    warns: List[str] = []
-    try:
-        from pymeshfix import MeshFix
-    except Exception as e:
-        raise RuntimeError("pymeshfix is required for --meshfix.") from e
-
-    v = np.asarray(mesh.vertices, dtype=np.float64)
-    f = np.asarray(mesh.faces, dtype=np.int32)
-    before_faces = int(f.shape[0])
-    mf = MeshFix(v, f)
-    try:
-        mf.repair(verbose=False)
-    except TypeError:
-        mf.repair()
-
-    v2 = getattr(mf, "v", None)
-    f2 = getattr(mf, "f", None)
-    if v2 is None or f2 is None:
-        raise RuntimeError("pymeshfix returned empty mesh.")
-    f2 = np.asarray(f2, dtype=np.int64)
-    after_faces = int(f2.shape[0])
-    if after_faces == 0:
-        warns.append("meshfix: produced empty mesh, fallback to original.")
-        return mesh, warns
-    if before_faces >= 200 and after_faces < max(50, int(0.1 * before_faces)):
-        warns.append(
-            f"meshfix: faces {before_faces} -> {after_faces} (too small), fallback to original."
-        )
-        return mesh, warns
-    mesh2 = trimesh.Trimesh(vertices=np.asarray(v2), faces=f2, process=False)
-    warns.append(f"meshfix: applied (faces {before_faces} -> {after_faces})")
-    return mesh2, warns
 
 
 def iter_stl_files(root_dir: Path):
@@ -776,66 +739,6 @@ def open3d_occupancy_sign(
 
 
 
-def build_watertight_mesh_via_occupancy(
-    mesh: trimesh.Trimesh,
-    grid_min: np.ndarray,
-    voxel_size: float,
-    res: int,
-    scale: int,
-    occupancy_mode: str,
-) -> Tuple[Optional[trimesh.Trimesh], List[str]]:
-    """
-    Build a watertight proxy mesh by voxel occupancy + marching cubes.
-    This trades geometric fidelity for topological robustness.
-    """
-    warns: List[str] = []
-    scale = int(max(1, scale))
-    res_wt = int(res) * scale
-    voxel_size_wt = float(voxel_size) / float(scale)
-    if res_wt < 2:
-        warns.append("watertight voxelize skipped: res*scale < 2.")
-        return None, warns
-    try:
-        from skimage import measure
-    except Exception as e:
-        warns.append(f"watertight voxelize failed: scikit-image unavailable ({type(e).__name__}: {e}).")
-        return None, warns
-
-    inside, w = open3d_occupancy_sign(
-        mesh=mesh,
-        grid_min=grid_min,
-        voxel_size=voxel_size_wt,
-        res=res_wt,
-        supersample=1,
-        mode=occupancy_mode,
-    )
-    warns += w
-    if inside is None:
-        warns.append("watertight voxelize failed: occupancy is None.")
-        return None, warns
-    if not np.any(inside):
-        warns.append("watertight voxelize failed: occupancy is empty.")
-        return None, warns
-
-    try:
-        verts, faces, normals, values = measure.marching_cubes(
-            volume=inside.astype(np.float32, copy=False),
-            level=0.5,
-            spacing=(voxel_size_wt, voxel_size_wt, voxel_size_wt),
-            method="lewiner",
-            step_size=1,
-            allow_degenerate=False,
-        )
-    except Exception as e:
-        warns.append(f"watertight voxelize failed: marching_cubes error ({type(e).__name__}: {e}).")
-        return None, warns
-
-    verts_world = verts.astype(np.float64, copy=False) + grid_min[None, :]
-    mesh_wt = make_mesh(vertices=verts_world, faces=faces, like=mesh)
-    warns.append(f"watertight voxelize: res={res_wt}, scale={scale}, faces={int(len(faces))}")
-    return mesh_wt, warns
-
-
 def compute_sdf_mesh_distance_open3d(
     mesh,
     grid_min: np.ndarray,
@@ -846,8 +749,6 @@ def compute_sdf_mesh_distance_open3d(
     out_sdf: Optional[np.ndarray] = None,
     supersample: int = 1,
     supersample_mode: str = "mean",
-    downsample: int = 1,
-    downsample_mode: str = "minabs",
 ) -> Tuple[np.ndarray, bool, List[str]]:
     """
     Compute distance using Open3D RaycastingScene (often more memory stable).
@@ -882,13 +783,6 @@ def compute_sdf_mesh_distance_open3d(
         want_signed = False
     if not has_signed and not has_distance:
         raise RuntimeError("open3d RaycastingScene has no distance API.")
-
-    down = int(max(1, downsample))
-    if down > 1 and supersample > 1:
-        warns.append("supersample with downsample>1 is expensive; consider supersample=1.")
-    if down > 1 and str(downsample_mode).lower() not in ("minabs",):
-        warns.append(f"downsample_mode '{downsample_mode}' unsupported. Fallback to 'minabs'.")
-        downsample_mode = "minabs"
 
     xs, ys, zs = build_grid_axes(grid_min, voxel_size, res)
     neg_count = 0
@@ -935,44 +829,12 @@ def compute_sdf_mesh_distance_open3d(
             return vals_acc / float(offsets.shape[0])
         return vals_acc
 
-    if down <= 1:
-        for i0, i1, pts, block_shape in iter_grid_chunks(xs, ys, zs, max_points=MAX_POINTS_PER_CHUNK):
-            vals = eval_distance(pts)
-            neg_count += int((vals < 0).sum())
-            pos_count += int((vals > 0).sum())
-            sdf[i0:i1, :, :] = vals.reshape(block_shape).astype(out_dtype, copy=False)
-            del pts, vals
-    else:
-        res_hi = int(res) * int(down)
-        voxel_hi = float(voxel_size) / float(down)
-        xs_hi, ys_hi, zs_hi = build_grid_axes(grid_min, voxel_hi, res_hi)
-        if res_hi != ys_hi.size or res_hi != zs_hi.size:
-            raise RuntimeError("downsample grid size mismatch.")
-        for i in range(int(res)):
-            xi0 = i * down
-            xi1 = xi0 + down
-            xs_block = xs_hi[xi0:xi1]
-            slab = np.empty((down, res_hi, res_hi), dtype=np.float32)
-            for j0, j1, pts, block_shape in iter_grid_chunks(xs_block, ys_hi, zs_hi, max_points=MAX_POINTS_PER_CHUNK):
-                vals = eval_distance(pts)
-                slab[j0:j1, :, :] = vals.reshape(block_shape).astype(np.float32, copy=False)
-                del pts, vals
-            # minabs pooling
-            if downsample_mode == "minabs":
-                reshaped = slab.reshape(down, res, down, res, down)
-                pooled = (
-                    reshaped.transpose(0, 2, 4, 1, 3)
-                    .reshape(down * down * down, res, res)
-                )
-                abs_vals = np.abs(pooled)
-                idx = np.argmin(abs_vals, axis=0)
-                out = np.take_along_axis(pooled, idx[None, ...], axis=0)[0]
-            else:
-                out = slab[0, ::down, ::down]
-            neg_count += int((out < 0).sum())
-            pos_count += int((out > 0).sum())
-            sdf[i, :, :] = out.astype(out_dtype, copy=False)
-            del slab, out
+    for i0, i1, pts, block_shape in iter_grid_chunks(xs, ys, zs, max_points=MAX_POINTS_PER_CHUNK):
+        vals = eval_distance(pts)
+        neg_count += int((vals < 0).sum())
+        pos_count += int((vals > 0).sum())
+        sdf[i0:i1, :, :] = vals.reshape(block_shape).astype(out_dtype, copy=False)
+        del pts, vals
 
     signed_used = bool(want_signed and (neg_count > 0) and (pos_count > 0))
     if want_signed and not signed_used:
@@ -1073,10 +935,6 @@ def compute_sdf(
     sdf_supersample: int = 1,
     sdf_supersample_mode: str = "mean",
     sign_occupancy_mode: str = "center",
-    watertight_voxelize: bool = False,
-    wt_voxel_scale: int = 1,
-    sdf_downsample: int = 1,
-    sdf_downsample_mode: str = "minabs",
 ) -> Tuple[np.ndarray, Dict, List[str]]:
     """
     Build SDF volume and metadata.
@@ -1112,21 +970,6 @@ def compute_sdf(
     grid_min, grid_max, voxel_size, grid_center, _ = compute_grid_from_mesh(
         mesh, res=res, padding=padding, center_override=center_override
     )
-
-    if bool(watertight_voxelize):
-        mesh_wt, w = build_watertight_mesh_via_occupancy(
-            mesh=mesh,
-            grid_min=grid_min,
-            voxel_size=voxel_size,
-            res=res,
-            scale=int(wt_voxel_scale),
-            occupancy_mode=str(sign_occupancy_mode),
-        )
-        warns += w
-        if mesh_wt is not None:
-            mesh = mesh_wt
-        else:
-            warns.append("watertight voxelize: fallback to original mesh.")
 
     rep = watertight_report(mesh)
     print(rep)
