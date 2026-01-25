@@ -3,7 +3,7 @@
 """
 python sdf_npz_to_stl.py --npz xxx.npz --out yyy.stl --restore_size --mc_auto --mc_methods lorensen
 
-python sdf_npz_to_stl.py --root_dir /mnt/ssd2tb/new_format_sdf --dst_dir /mnt/ssd2tb/new_format_sdf --mc_auto --mc_methods lorensen
+python sdf_npz_to_stl.py --root_dir /mnt/ssd2tb/new_format_sdf --dst_dir /mnt/ssd2tb/new_format_sdf_stl --mc_auto --mc_methods lorensen
 """
 
 
@@ -84,9 +84,9 @@ def parse_level_offsets(text: Optional[str], signed_used: bool) -> List[float]:
     """
     if text is None:
         if signed_used:
-            offsets = [-0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3]
+            offsets = [-0.5, -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4]
         else:
-            offsets = [-0.3, -0.2, -0.1, 0.0, 0.1, 0.2]
+            offsets = [-0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4]
     else:
         parts = [p.strip() for p in text.split(",")]
         offsets = [float(p) for p in parts if p]

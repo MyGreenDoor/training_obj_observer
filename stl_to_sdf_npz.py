@@ -11,6 +11,7 @@ import os
 import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -18,6 +19,30 @@ import numpy as np
 import trimesh
 
 MAX_POINTS_PER_CHUNK = 1_000_000
+
+
+@dataclass
+class MeshData:
+    vertices: np.ndarray
+    faces: np.ndarray
+
+
+def is_trimesh(mesh) -> bool:
+    return isinstance(mesh, trimesh.Trimesh)
+
+
+def get_vertices_faces(mesh) -> Tuple[np.ndarray, np.ndarray]:
+    if isinstance(mesh, MeshData):
+        return mesh.vertices, mesh.faces
+    return np.asarray(mesh.vertices), np.asarray(mesh.faces)
+
+
+def make_mesh(vertices: np.ndarray, faces: np.ndarray, like=None):
+    v = np.asarray(vertices, dtype=np.float64)
+    f = np.asarray(faces, dtype=np.int64)
+    if is_trimesh(like):
+        return trimesh.Trimesh(vertices=v, faces=f, process=False)
+    return MeshData(vertices=v, faces=f)
 
 def _ensure_trimesh(mesh):
     if isinstance(mesh, trimesh.Scene):
@@ -32,28 +57,164 @@ def _ensure_trimesh(mesh):
     return mesh
 
 
+def load_mesh_open3d(stl_path: Path) -> MeshData:
+    """
+    Load STL using Open3D and return MeshData.
+    """
+    try:
+        import open3d as o3d
+    except Exception as e:
+        raise RuntimeError("open3d is required for --mesh_backend open3d.") from e
+    mesh = o3d.io.read_triangle_mesh(str(stl_path))
+    if mesh is None:
+        raise ValueError(f"Open3D failed to load: {stl_path}")
+    if len(mesh.triangles) == 0 or len(mesh.vertices) == 0:
+        raise ValueError(f"Open3D loaded empty mesh: {stl_path}")
+    v = np.asarray(mesh.vertices, dtype=np.float64)
+    f = np.asarray(mesh.triangles, dtype=np.int64)
+    return MeshData(vertices=v, faces=f)
+
+
+def build_open3d_legacy_mesh(vertices: np.ndarray, faces: np.ndarray):
+    """
+    Build Open3D legacy TriangleMesh from vertices/faces.
+    """
+    import open3d as o3d
+    v = np.asarray(vertices, dtype=np.float64)
+    f = np.asarray(faces, dtype=np.int32)
+    return o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(v),
+        o3d.utility.Vector3iVector(f),
+    )
+
+
+def open3d_remesh_for_stability(
+    mesh,
+    subdivide_iters: int,
+) -> Tuple[object, List[str]]:
+    """
+    Apply light Open3D cleanup and optional midpoint subdivision.
+    This does not increase geometric accuracy; it improves numerical stability.
+    """
+    warns: List[str] = []
+    try:
+        import open3d as o3d
+    except Exception as e:
+        raise RuntimeError("open3d is required for --o3d_clean/--o3d_subdivide.") from e
+
+    v, f = get_vertices_faces(mesh)
+    m = build_open3d_legacy_mesh(v, f)
+
+    before_faces = int(len(m.triangles))
+    if hasattr(m, "remove_degenerate_triangles"):
+        m.remove_degenerate_triangles()
+    if hasattr(m, "remove_duplicated_triangles"):
+        m.remove_duplicated_triangles()
+    if hasattr(m, "remove_duplicated_vertices"):
+        m.remove_duplicated_vertices()
+    if hasattr(m, "remove_non_manifold_edges"):
+        m.remove_non_manifold_edges()
+    if hasattr(m, "remove_unreferenced_vertices"):
+        m.remove_unreferenced_vertices()
+    after_faces = int(len(m.triangles))
+    if after_faces != before_faces:
+        warns.append(f"open3d cleanup: faces {before_faces} -> {after_faces}")
+
+    iters = int(max(0, subdivide_iters))
+    if iters > 0:
+        for _ in range(iters):
+            m = m.subdivide_midpoint(number_of_iterations=1)
+        warns.append(f"open3d subdivide_midpoint: iters={iters}")
+
+    v2 = np.asarray(m.vertices, dtype=np.float64)
+    f2 = np.asarray(m.triangles, dtype=np.int64)
+    mesh2 = make_mesh(vertices=v2, faces=f2, like=mesh)
+    return mesh2, warns
+
+
+def meshfix_watertight(mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, List[str]]:
+    """
+    Apply pymeshfix to enforce watertightness. This may alter geometry.
+    """
+    warns: List[str] = []
+    try:
+        from pymeshfix import MeshFix
+    except Exception as e:
+        raise RuntimeError("pymeshfix is required for --meshfix.") from e
+
+    v = np.asarray(mesh.vertices, dtype=np.float64)
+    f = np.asarray(mesh.faces, dtype=np.int32)
+    before_faces = int(f.shape[0])
+    mf = MeshFix(v, f)
+    try:
+        mf.repair(verbose=False)
+    except TypeError:
+        mf.repair()
+
+    v2 = getattr(mf, "v", None)
+    f2 = getattr(mf, "f", None)
+    if v2 is None or f2 is None:
+        raise RuntimeError("pymeshfix returned empty mesh.")
+    f2 = np.asarray(f2, dtype=np.int64)
+    after_faces = int(f2.shape[0])
+    if after_faces == 0:
+        warns.append("meshfix: produced empty mesh, fallback to original.")
+        return mesh, warns
+    if before_faces >= 200 and after_faces < max(50, int(0.1 * before_faces)):
+        warns.append(
+            f"meshfix: faces {before_faces} -> {after_faces} (too small), fallback to original."
+        )
+        return mesh, warns
+    mesh2 = trimesh.Trimesh(vertices=np.asarray(v2), faces=f2, process=False)
+    warns.append(f"meshfix: applied (faces {before_faces} -> {after_faces})")
+    return mesh2, warns
+
+
 def iter_stl_files(root_dir: Path):
     for p in root_dir.rglob("*"):
         if p.is_file() and p.suffix.lower() == ".stl":
             yield p
 
 
-def watertight_report(mesh: trimesh.Trimesh) -> Dict:
+def edge_stats_from_faces(faces: np.ndarray) -> Tuple[int, int]:
     """
-    trimesh 4.x で安定して取れる情報を使って report を作る．
-    edges_unique_inverse を bincount して boundary/nonmanifold を数える．
+    Count boundary and non-manifold edges from faces.
     """
-    inv = np.asarray(mesh.edges_unique_inverse)
-    m = int(np.asarray(mesh.edges_unique).shape[0])
-    counts = np.bincount(inv, minlength=m)
-
+    f = np.asarray(faces, dtype=np.int64)
+    if f.size == 0:
+        return 0, 0
+    e0 = f[:, [0, 1]]
+    e1 = f[:, [1, 2]]
+    e2 = f[:, [2, 0]]
+    edges = np.concatenate([e0, e1, e2], axis=0)
+    edges = np.sort(edges, axis=1)
+    _, counts = np.unique(edges, axis=0, return_counts=True)
     n_boundary = int((counts == 1).sum())
     n_nonmanifold = int((counts > 2).sum())
+    return n_boundary, n_nonmanifold
+
+
+def watertight_report(mesh) -> Dict:
+    """
+    Build watertight report from mesh connectivity.
+    """
+    v, f = get_vertices_faces(mesh)
+    n_boundary, n_nonmanifold = edge_stats_from_faces(f)
+    is_watertight = bool((n_boundary == 0) and (n_nonmanifold == 0))
+
+    if is_trimesh(mesh):
+        return {
+            "is_watertight": bool(mesh.is_watertight),
+            "is_winding_consistent": bool(mesh.is_winding_consistent),
+            "is_volume": bool(mesh.is_volume),
+            "n_boundary_edges": n_boundary,
+            "n_nonmanifold_edges": n_nonmanifold,
+        }
 
     return {
-        "is_watertight": bool(mesh.is_watertight),
-        "is_winding_consistent": bool(mesh.is_winding_consistent),
-        "is_volume": bool(mesh.is_volume),
+        "is_watertight": is_watertight,
+        "is_winding_consistent": bool(is_watertight),
+        "is_volume": bool(is_watertight),
         "n_boundary_edges": n_boundary,
         "n_nonmanifold_edges": n_nonmanifold,
     }
@@ -200,12 +361,130 @@ def repair_mesh_inplace(mesh: trimesh.Trimesh, fill_holes: bool = True, merge_di
     return warns
 
 
-def compute_cube_bounds(mesh: trimesh.Trimesh, padding: float) -> Tuple[np.ndarray, np.ndarray, float]:
+def face_components_from_faces(faces: np.ndarray) -> List[np.ndarray]:
+    """
+    Compute connected components (face adjacency) from faces.
+    """
+    f = np.asarray(faces, dtype=np.int64)
+    n_faces = int(f.shape[0])
+    if n_faces == 0:
+        return []
+
+    e0 = f[:, [0, 1]]
+    e1 = f[:, [1, 2]]
+    e2 = f[:, [2, 0]]
+    edges = np.concatenate([e0, e1, e2], axis=0)
+    edges = np.sort(edges, axis=1)
+    face_ids = np.repeat(np.arange(n_faces, dtype=np.int64), 3)
+
+    order = np.lexsort((edges[:, 1], edges[:, 0]))
+    edges_sorted = edges[order]
+    face_sorted = face_ids[order]
+
+    parent = np.arange(n_faces, dtype=np.int64)
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    start = 0
+    while start < edges_sorted.shape[0]:
+        end = start + 1
+        while end < edges_sorted.shape[0] and (edges_sorted[end] == edges_sorted[start]).all():
+            end += 1
+        if end - start >= 2:
+            base = int(face_sorted[start])
+            for k in range(start + 1, end):
+                union(base, int(face_sorted[k]))
+        start = end
+
+    comps: Dict[int, List[int]] = {}
+    for i in range(n_faces):
+        r = int(find(i))
+        comps.setdefault(r, []).append(i)
+    return [np.asarray(v, dtype=np.int64) for v in comps.values()]
+
+
+def filter_mesh_components(
+    mesh,
+    min_faces: int = 0,
+    keep_largest: bool = False,
+) -> Tuple[object, List[str]]:
+    """
+    Remove small disconnected components by face count.
+    """
+    warns: List[str] = []
+    v, f = get_vertices_faces(mesh)
+    n_faces = int(f.shape[0])
+    if n_faces == 0:
+        return mesh, warns
+    if int(min_faces) <= 0 and not bool(keep_largest):
+        return mesh, warns
+    if is_trimesh(mesh):
+        try:
+            from trimesh.graph import connected_components
+            comps = connected_components(mesh.face_adjacency, nodes=np.arange(n_faces))
+        except Exception as e:
+            warns.append(f"component filter fallback: {type(e).__name__}: {e}")
+            comps = face_components_from_faces(f)
+    else:
+        comps = face_components_from_faces(f)
+    if len(comps) <= 1:
+        return mesh, warns
+
+    sizes = [len(c) for c in comps]
+    keep_faces = np.zeros((n_faces,), dtype=bool)
+    if bool(keep_largest):
+        idx = int(np.argmax(sizes))
+        keep_faces[np.asarray(comps[idx], dtype=np.int64)] = True
+        if int(min_faces) > 0 and sizes[idx] < int(min_faces):
+            warns.append(
+                f"component filter: largest has {sizes[idx]} faces < min_faces={int(min_faces)}, kept anyway."
+            )
+    else:
+        for comp, size in zip(comps, sizes):
+            if int(size) >= int(min_faces):
+                keep_faces[np.asarray(comp, dtype=np.int64)] = True
+        if not keep_faces.any():
+            warns.append("component filter: no component meets min_faces; keeping original mesh.")
+            return mesh, warns
+
+    if keep_faces.all():
+        return mesh, warns
+
+    if is_trimesh(mesh):
+        new_mesh = mesh.copy()
+        new_mesh.update_faces(keep_faces)
+        new_mesh.remove_unreferenced_vertices()
+        warns.append(f"component filter: faces {n_faces} -> {int(len(new_mesh.faces))}")
+        return new_mesh, warns
+
+    new_faces = f[keep_faces]
+    used = np.unique(new_faces)
+    index_map = np.full((v.shape[0],), -1, dtype=np.int64)
+    index_map[used] = np.arange(used.shape[0], dtype=np.int64)
+    new_vertices = v[used]
+    new_faces = index_map[new_faces]
+    warns.append(f"component filter: faces {n_faces} -> {int(new_faces.shape[0])}")
+    return MeshData(vertices=new_vertices, faces=new_faces), warns
+
+
+def compute_cube_bounds(mesh, padding: float) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     等方な立方体bboxを作る（最大辺長基準）．
     cube_size = max_extent + 2*pad，pad = padding*max_extent
     """
-    bmin, bmax = mesh.bounds
+    v, _ = get_vertices_faces(mesh)
+    bmin = v.min(axis=0)
+    bmax = v.max(axis=0)
     center = 0.5 * (bmin + bmax)
     extent = (bmax - bmin)
     max_extent = float(extent.max() if extent.max() > 0 else 1.0)
@@ -218,7 +497,7 @@ def compute_cube_bounds(mesh: trimesh.Trimesh, padding: float) -> Tuple[np.ndarr
 
 
 def compute_grid_from_mesh(
-    mesh: trimesh.Trimesh,
+    mesh,
     res: int,
     padding: float,
     center_override: Optional[np.ndarray] = None,
@@ -230,7 +509,9 @@ def compute_grid_from_mesh(
     if res < 2:
         raise ValueError("res must be >= 2 to build a grid.")
 
-    bmin, bmax = mesh.bounds
+    v, _ = get_vertices_faces(mesh)
+    bmin = v.min(axis=0)
+    bmax = v.max(axis=0)
     center = 0.5 * (bmin + bmax)
     if center_override is not None:
         center = np.asarray(center_override, dtype=np.float64)
@@ -272,6 +553,19 @@ def iter_grid_chunks(
         pts = np.stack((xg, yg, zg), axis=-1).reshape(-1, 3)
         block_shape = (int(i1 - i0), int(ys.size), int(zs.size))
         yield i0, i1, pts, block_shape
+
+
+def build_supersample_offsets(voxel_size: float, supersample: int) -> Optional[np.ndarray]:
+    """
+    Build sub-voxel offsets for supersampling (centered within each voxel).
+    """
+    ss = int(max(1, supersample))
+    if ss <= 1:
+        return None
+    offs_1d = (np.arange(ss, dtype=np.float32) + 0.5) / float(ss) - 0.5
+    offsets = np.stack(np.meshgrid(offs_1d, offs_1d, offs_1d, indexing="ij"), axis=-1).reshape(-1, 3)
+    offsets *= float(voxel_size)
+    return offsets
 
 
 def voxel_surface_mask_from_trimesh(
@@ -414,14 +708,146 @@ def cleanup_negative_islands(
     return sdf, int(remove_labels.size), warns
 
 
-def compute_sdf_mesh_distance_open3d(
+def open3d_occupancy_sign(
+    mesh,
+    grid_min: np.ndarray,
+    voxel_size: float,
+    res: int,
+    supersample: int = 1,
+    mode: str = "center",
+) -> Tuple[Optional[np.ndarray], List[str]]:
+    """
+    Compute inside mask using Open3D RaycastingScene.compute_occupancy.
+    """
+    warns: List[str] = []
+    try:
+        import open3d as o3d
+    except Exception as e:
+        warns.append(f"occupancy sign failed: open3d unavailable ({type(e).__name__}: {e}).")
+        return None, warns
+
+    v, f = get_vertices_faces(mesh)
+    legacy = build_open3d_legacy_mesh(v, f)
+    mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(legacy)
+    if "positions" in mesh_t.vertex:
+        mesh_t.vertex["positions"] = mesh_t.vertex["positions"].to(o3d.core.Dtype.Float32)
+    if "indices" in mesh_t.triangle and mesh_t.triangle["indices"].dtype != o3d.core.Dtype.Int32:
+        mesh_t.triangle["indices"] = mesh_t.triangle["indices"].to(o3d.core.Dtype.Int32)
+
+    scene = o3d.t.geometry.RaycastingScene()
+    _ = scene.add_triangles(mesh_t)
+    if not hasattr(scene, "compute_occupancy"):
+        warns.append("occupancy sign failed: compute_occupancy not available.")
+        return None, warns
+
+    ss = int(max(1, supersample))
+    mode = str(mode).lower()
+    if mode not in ("center", "any", "majority"):
+        warns.append(f"occupancy sign: unknown mode '{mode}', fallback to 'center'.")
+        mode = "center"
+    offsets = build_supersample_offsets(voxel_size, ss) if (ss > 1 and mode != "center") else None
+
+    xs, ys, zs = build_grid_axes(grid_min, voxel_size, res)
+    inside = np.zeros((res, res, res), dtype=bool)
+    for i0, i1, pts, block_shape in iter_grid_chunks(xs, ys, zs, max_points=MAX_POINTS_PER_CHUNK):
+        if offsets is None:
+            t = o3d.core.Tensor(pts, dtype=o3d.core.Dtype.Float32)
+            occ = scene.compute_occupancy(t).numpy().reshape(block_shape).astype(bool)
+            inside[i0:i1, :, :] = occ
+            del t, pts, occ
+        else:
+            count = None
+            for off in offsets:
+                t = o3d.core.Tensor(pts + off[None, :], dtype=o3d.core.Dtype.Float32)
+                occ = scene.compute_occupancy(t).numpy().reshape(block_shape).astype(np.uint16, copy=False)
+                if count is None:
+                    count = occ
+                else:
+                    count += occ
+                del t, occ
+            if mode == "any":
+                inside[i0:i1, :, :] = count > 0
+            else:
+                thresh = int(offsets.shape[0] // 2) + 1
+                inside[i0:i1, :, :] = count >= thresh
+            del pts, count
+    return inside, warns
+
+
+
+
+def build_watertight_mesh_via_occupancy(
     mesh: trimesh.Trimesh,
+    grid_min: np.ndarray,
+    voxel_size: float,
+    res: int,
+    scale: int,
+    occupancy_mode: str,
+) -> Tuple[Optional[trimesh.Trimesh], List[str]]:
+    """
+    Build a watertight proxy mesh by voxel occupancy + marching cubes.
+    This trades geometric fidelity for topological robustness.
+    """
+    warns: List[str] = []
+    scale = int(max(1, scale))
+    res_wt = int(res) * scale
+    voxel_size_wt = float(voxel_size) / float(scale)
+    if res_wt < 2:
+        warns.append("watertight voxelize skipped: res*scale < 2.")
+        return None, warns
+    try:
+        from skimage import measure
+    except Exception as e:
+        warns.append(f"watertight voxelize failed: scikit-image unavailable ({type(e).__name__}: {e}).")
+        return None, warns
+
+    inside, w = open3d_occupancy_sign(
+        mesh=mesh,
+        grid_min=grid_min,
+        voxel_size=voxel_size_wt,
+        res=res_wt,
+        supersample=1,
+        mode=occupancy_mode,
+    )
+    warns += w
+    if inside is None:
+        warns.append("watertight voxelize failed: occupancy is None.")
+        return None, warns
+    if not np.any(inside):
+        warns.append("watertight voxelize failed: occupancy is empty.")
+        return None, warns
+
+    try:
+        verts, faces, normals, values = measure.marching_cubes(
+            volume=inside.astype(np.float32, copy=False),
+            level=0.5,
+            spacing=(voxel_size_wt, voxel_size_wt, voxel_size_wt),
+            method="lewiner",
+            step_size=1,
+            allow_degenerate=False,
+        )
+    except Exception as e:
+        warns.append(f"watertight voxelize failed: marching_cubes error ({type(e).__name__}: {e}).")
+        return None, warns
+
+    verts_world = verts.astype(np.float64, copy=False) + grid_min[None, :]
+    mesh_wt = make_mesh(vertices=verts_world, faces=faces, like=mesh)
+    warns.append(f"watertight voxelize: res={res_wt}, scale={scale}, faces={int(len(faces))}")
+    return mesh_wt, warns
+
+
+def compute_sdf_mesh_distance_open3d(
+    mesh,
     grid_min: np.ndarray,
     voxel_size: float,
     res: int,
     want_signed: bool,
     out_dtype: np.dtype,
     out_sdf: Optional[np.ndarray] = None,
+    supersample: int = 1,
+    supersample_mode: str = "mean",
+    downsample: int = 1,
+    downsample_mode: str = "minabs",
 ) -> Tuple[np.ndarray, bool, List[str]]:
     """
     Compute distance using Open3D RaycastingScene (often more memory stable).
@@ -438,12 +864,8 @@ def compute_sdf_mesh_distance_open3d(
         sdf = out_sdf
 
     # Build Open3D triangle mesh
-    v = np.asarray(mesh.vertices, dtype=np.float32)
-    f = np.asarray(mesh.faces, dtype=np.int32)
-    legacy = o3d.geometry.TriangleMesh(
-        o3d.utility.Vector3dVector(v.astype(np.float64)),
-        o3d.utility.Vector3iVector(f),
-    )
+    v, f = get_vertices_faces(mesh)
+    legacy = build_open3d_legacy_mesh(v, f)
     mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(legacy)
     if "positions" in mesh_t.vertex:
         mesh_t.vertex["positions"] = mesh_t.vertex["positions"].to(o3d.core.Dtype.Float32)
@@ -461,24 +883,96 @@ def compute_sdf_mesh_distance_open3d(
     if not has_signed and not has_distance:
         raise RuntimeError("open3d RaycastingScene has no distance API.")
 
+    down = int(max(1, downsample))
+    if down > 1 and supersample > 1:
+        warns.append("supersample with downsample>1 is expensive; consider supersample=1.")
+    if down > 1 and str(downsample_mode).lower() not in ("minabs",):
+        warns.append(f"downsample_mode '{downsample_mode}' unsupported. Fallback to 'minabs'.")
+        downsample_mode = "minabs"
+
     xs, ys, zs = build_grid_axes(grid_min, voxel_size, res)
     neg_count = 0
     pos_count = 0
 
-    for i0, i1, pts, block_shape in iter_grid_chunks(xs, ys, zs, max_points=MAX_POINTS_PER_CHUNK):
-        t = o3d.core.Tensor(pts, dtype=o3d.core.Dtype.Float32)
-        if want_signed and has_signed:
-            vals = scene.compute_signed_distance(t).numpy()
-        else:
-            if has_distance:
-                vals = scene.compute_distance(t).numpy()
-            else:
-                vals = np.abs(scene.compute_signed_distance(t).numpy())
+    ss = int(max(1, supersample))
+    mode = str(supersample_mode).lower()
+    if mode not in ("mean", "minabs"):
+        warns.append(f"supersample_mode '{mode}' is unsupported. Fallback to 'mean'.")
+        mode = "mean"
+    offsets = build_supersample_offsets(voxel_size, ss)
 
-        neg_count += int((vals < 0).sum())
-        pos_count += int((vals > 0).sum())
-        sdf[i0:i1, :, :] = vals.reshape(block_shape).astype(out_dtype, copy=False)
-        del t, pts, vals
+    def eval_distance(pts: np.ndarray) -> np.ndarray:
+        if offsets is None:
+            t = o3d.core.Tensor(pts, dtype=o3d.core.Dtype.Float32)
+            if want_signed and has_signed:
+                vals = scene.compute_signed_distance(t).numpy()
+            else:
+                if has_distance:
+                    vals = scene.compute_distance(t).numpy()
+                else:
+                    vals = np.abs(scene.compute_signed_distance(t).numpy())
+            return vals
+        vals_acc = None
+        for off in offsets:
+            t = o3d.core.Tensor(pts + off[None, :], dtype=o3d.core.Dtype.Float32)
+            if want_signed and has_signed:
+                v = scene.compute_signed_distance(t).numpy()
+            else:
+                if has_distance:
+                    v = scene.compute_distance(t).numpy()
+                else:
+                    v = np.abs(scene.compute_signed_distance(t).numpy())
+            if vals_acc is None:
+                vals_acc = v
+            else:
+                if mode == "mean":
+                    vals_acc += v
+                else:
+                    mask = np.abs(v) < np.abs(vals_acc)
+                    vals_acc[mask] = v[mask]
+            del t, v
+        if mode == "mean":
+            return vals_acc / float(offsets.shape[0])
+        return vals_acc
+
+    if down <= 1:
+        for i0, i1, pts, block_shape in iter_grid_chunks(xs, ys, zs, max_points=MAX_POINTS_PER_CHUNK):
+            vals = eval_distance(pts)
+            neg_count += int((vals < 0).sum())
+            pos_count += int((vals > 0).sum())
+            sdf[i0:i1, :, :] = vals.reshape(block_shape).astype(out_dtype, copy=False)
+            del pts, vals
+    else:
+        res_hi = int(res) * int(down)
+        voxel_hi = float(voxel_size) / float(down)
+        xs_hi, ys_hi, zs_hi = build_grid_axes(grid_min, voxel_hi, res_hi)
+        if res_hi != ys_hi.size or res_hi != zs_hi.size:
+            raise RuntimeError("downsample grid size mismatch.")
+        for i in range(int(res)):
+            xi0 = i * down
+            xi1 = xi0 + down
+            xs_block = xs_hi[xi0:xi1]
+            slab = np.empty((down, res_hi, res_hi), dtype=np.float32)
+            for j0, j1, pts, block_shape in iter_grid_chunks(xs_block, ys_hi, zs_hi, max_points=MAX_POINTS_PER_CHUNK):
+                vals = eval_distance(pts)
+                slab[j0:j1, :, :] = vals.reshape(block_shape).astype(np.float32, copy=False)
+                del pts, vals
+            # minabs pooling
+            if downsample_mode == "minabs":
+                reshaped = slab.reshape(down, res, down, res, down)
+                pooled = (
+                    reshaped.transpose(0, 2, 4, 1, 3)
+                    .reshape(down * down * down, res, res)
+                )
+                abs_vals = np.abs(pooled)
+                idx = np.argmin(abs_vals, axis=0)
+                out = np.take_along_axis(pooled, idx[None, ...], axis=0)[0]
+            else:
+                out = slab[0, ::down, ::down]
+            neg_count += int((out < 0).sum())
+            pos_count += int((out > 0).sum())
+            sdf[i, :, :] = out.astype(out_dtype, copy=False)
+            del slab, out
 
     signed_used = bool(want_signed and (neg_count > 0) and (pos_count > 0))
     if want_signed and not signed_used:
@@ -499,6 +993,8 @@ def compute_sdf_edt(
     """
     EDT-based SDF using surface voxel mask.
     """
+    if not is_trimesh(mesh):
+        raise RuntimeError("EDT SDF requires trimesh backend.")
     from scipy.ndimage import distance_transform_edt, binary_closing, generate_binary_structure
 
     warns: List[str] = []
@@ -561,7 +1057,7 @@ def compute_sdf_edt(
 
 
 def compute_sdf(
-    mesh: trimesh.Trimesh,
+    mesh,
     res: int,
     padding: float,
     normalize_to_cube: bool,
@@ -573,6 +1069,14 @@ def compute_sdf(
     merge_digits: Optional[int],
     distance_method: str,  # mesh, edt
     sdf_out: Optional[np.ndarray] = None,
+    sign_occupancy: bool = False,
+    sdf_supersample: int = 1,
+    sdf_supersample_mode: str = "mean",
+    sign_occupancy_mode: str = "center",
+    watertight_voxelize: bool = False,
+    wt_voxel_scale: int = 1,
+    sdf_downsample: int = 1,
+    sdf_downsample_mode: str = "minabs",
 ) -> Tuple[np.ndarray, Dict, List[str]]:
     """
     Build SDF volume and metadata.
@@ -582,7 +1086,7 @@ def compute_sdf(
     # normalize_to_cube（最大辺長を1にして中心原点へ）
     transform = None
     if normalize_to_cube:
-        v = np.asarray(mesh.vertices, dtype=np.float64)
+        v, f = get_vertices_faces(mesh)
         vmin = v.min(axis=0)
         vmax = v.max(axis=0)
         center = 0.5 * (vmin + vmax)
@@ -591,11 +1095,38 @@ def compute_sdf(
             raise ValueError("Degenerate mesh bbox extent.")
         scale = 1.0 / extent
         v2 = (v - center) * scale
-        mesh = trimesh.Trimesh(vertices=v2, faces=np.asarray(mesh.faces), process=False)
+        mesh = make_mesh(vertices=v2, faces=f, like=mesh)
         transform = {"center": center.tolist(), "scale": float(scale)}
 
     if repair:
-        warns += repair_mesh_inplace(mesh, fill_holes=True, merge_digits=merge_digits)
+        if not is_trimesh(mesh):
+            warns.append("repair skipped: trimesh backend required.")
+        else:
+            warns += repair_mesh_inplace(mesh, fill_holes=True, merge_digits=merge_digits)
+
+    if distance_method == "edt" and not is_trimesh(mesh):
+        raise RuntimeError("distance_method=edt requires trimesh backend.")
+
+    # grid (centered; normalize_to_cube -> center at 0)
+    center_override = np.zeros(3, dtype=np.float64) if normalize_to_cube else None
+    grid_min, grid_max, voxel_size, grid_center, _ = compute_grid_from_mesh(
+        mesh, res=res, padding=padding, center_override=center_override
+    )
+
+    if bool(watertight_voxelize):
+        mesh_wt, w = build_watertight_mesh_via_occupancy(
+            mesh=mesh,
+            grid_min=grid_min,
+            voxel_size=voxel_size,
+            res=res,
+            scale=int(wt_voxel_scale),
+            occupancy_mode=str(sign_occupancy_mode),
+        )
+        warns += w
+        if mesh_wt is not None:
+            mesh = mesh_wt
+        else:
+            warns.append("watertight voxelize: fallback to original mesh.")
 
     rep = watertight_report(mesh)
     print(rep)
@@ -614,12 +1145,6 @@ def compute_sdf(
             f"(boundary_edges={rep['n_boundary_edges']}, nonmanifold_edges={rep['n_nonmanifold_edges']})"
         )
 
-    # grid (centered; normalize_to_cube -> center at 0)
-    center_override = np.zeros(3, dtype=np.float64) if normalize_to_cube else None
-    grid_min, grid_max, voxel_size, grid_center, _ = compute_grid_from_mesh(
-        mesh, res=res, padding=padding, center_override=center_override
-    )
-
     vol_bytes = int(res) ** 3 * np.dtype(out_dtype).itemsize
     if vol_bytes >= (1 << 30):
         warns.append(
@@ -634,19 +1159,97 @@ def compute_sdf(
         if morph_close_iters > 0:
             warns.append("morph_close_iters is used only when voxel sign fallback is used.")
         try:
-            sdf_open3d, signed_used_open3d, w = compute_sdf_mesh_distance_open3d(
-                mesh=mesh,
-                grid_min=grid_min,
-                voxel_size=voxel_size,
-                res=res,
-                want_signed=want_signed,
-                out_dtype=out_dtype,
-                out_sdf=sdf_out,
-            )
-            warns += w
+            dual_pass = int(sdf_supersample) > 1 and int(sdf_downsample) > 1
+            if dual_pass:
+                warns.append(
+                    "sdf: dual-pass enabled (supersample>1 and downsample>1). "
+                    "Compute two volumes and combine by minabs."
+                )
+                sdf_down, signed_used_down, w = compute_sdf_mesh_distance_open3d(
+                    mesh=mesh,
+                    grid_min=grid_min,
+                    voxel_size=voxel_size,
+                    res=res,
+                    want_signed=want_signed,
+                    out_dtype=out_dtype,
+                    out_sdf=sdf_out,
+                    supersample=1,
+                    supersample_mode=str(sdf_supersample_mode),
+                    downsample=int(sdf_downsample),
+                    downsample_mode=str(sdf_downsample_mode),
+                )
+                warns += w
+                sdf_ss, signed_used_ss, w2 = compute_sdf_mesh_distance_open3d(
+                    mesh=mesh,
+                    grid_min=grid_min,
+                    voxel_size=voxel_size,
+                    res=res,
+                    want_signed=want_signed,
+                    out_dtype=out_dtype,
+                    out_sdf=None,
+                    supersample=int(sdf_supersample),
+                    supersample_mode=str(sdf_supersample_mode),
+                    downsample=1,
+                    downsample_mode=str(sdf_downsample_mode),
+                )
+                warns += w2
+                # Combine by minabs to preserve thin features while reducing noise.
+                abs_down = np.abs(sdf_down)
+                abs_ss = np.abs(sdf_ss)
+                use_ss = abs_ss < abs_down
+                sdf_down[use_ss] = sdf_ss[use_ss]
+                sdf_open3d = sdf_down
+                neg_count = int((sdf_open3d < 0).sum())
+                pos_count = int((sdf_open3d > 0).sum())
+                signed_used_open3d = bool(want_signed and (neg_count > 0) and (pos_count > 0))
+                sdf_ss = None
+            else:
+                sdf_open3d, signed_used_open3d, w = compute_sdf_mesh_distance_open3d(
+                    mesh=mesh,
+                    grid_min=grid_min,
+                    voxel_size=voxel_size,
+                    res=res,
+                    want_signed=want_signed,
+                    out_dtype=out_dtype,
+                    out_sdf=sdf_out,
+                    supersample=int(sdf_supersample),
+                    supersample_mode=str(sdf_supersample_mode),
+                    downsample=int(sdf_downsample),
+                    downsample_mode=str(sdf_downsample_mode),
+                )
+                warns += w
             sign_source = "open3d"
             if want_signed:
-                if bool(signed_used_open3d):
+                if bool(sign_occupancy):
+                    inside, w2 = open3d_occupancy_sign(
+                        mesh=mesh,
+                        grid_min=grid_min,
+                        voxel_size=voxel_size,
+                        res=res,
+                        supersample=int(sdf_supersample),
+                        mode=str(sign_occupancy_mode),
+                    )
+                    warns += w2
+                    if inside is not None:
+                        sdf = sdf_open3d.copy()
+                        np.abs(sdf_open3d, out=sdf)
+                        sdf[inside] = -sdf[inside]
+                        sdf, removed, w3 = cleanup_negative_islands(
+                            sdf,
+                            voxel_size=voxel_size,
+                            near_surface_thresh_vox=1.5,
+                        )
+                        warns += w3
+                        signed_used = True
+                        if removed > 0:
+                            warns.append(f"sign cleanup: removed {removed} negative islands.")
+                            sign_source = "open3d_occupancy_clean"
+                        else:
+                            sign_source = "open3d_occupancy"
+                    else:
+                        sdf = sdf_open3d
+                        signed_used = bool(signed_used_open3d)
+                elif bool(signed_used_open3d):
                     sdf, removed, w2 = cleanup_negative_islands(
                         sdf_open3d,
                         voxel_size=voxel_size,
@@ -660,23 +1263,29 @@ def compute_sdf(
                     else:
                         sign_source = "open3d"
                 else:
-                    inside, w2 = reconstruct_sign_from_voxels(
-                        mesh=mesh,
-                        grid_min=grid_min,
-                        voxel_size=voxel_size,
-                        res=res,
-                        morph_close_iters=morph_close_iters,
-                    )
-                    warns += w2
-                    if inside is not None:
-                        sdf = sdf_open3d.copy()
-                        np.abs(sdf_open3d, out=sdf)
-                        sdf[inside] = -sdf[inside]
-                        signed_used = True
-                        sign_source = "voxel_flood"
-                    else:
+                    if not is_trimesh(mesh):
+                        warns.append("sign reconstruct skipped: trimesh backend required.")
                         sdf = sdf_open3d
                         signed_used = False
+                        sign_source = "unsigned"
+                    else:
+                        inside, w2 = reconstruct_sign_from_voxels(
+                            mesh=mesh,
+                            grid_min=grid_min,
+                            voxel_size=voxel_size,
+                            res=res,
+                            morph_close_iters=morph_close_iters,
+                        )
+                        warns += w2
+                        if inside is not None:
+                            sdf = sdf_open3d.copy()
+                            np.abs(sdf_open3d, out=sdf)
+                            sdf[inside] = -sdf[inside]
+                            signed_used = True
+                            sign_source = "voxel_flood"
+                        else:
+                            sdf = sdf_open3d
+                            signed_used = False
             else:
                 sdf = sdf_open3d
                 signed_used = False
@@ -685,8 +1294,16 @@ def compute_sdf(
                 "source": "open3d_distance",
                 "morph_close_iters": int(morph_close_iters),
                 "sign_source": sign_source,
+                "sdf_supersample": int(sdf_supersample),
+                "sdf_supersample_mode": str(sdf_supersample_mode),
+                "sdf_downsample": int(sdf_downsample),
+                "sdf_downsample_mode": str(sdf_downsample_mode),
+                "sdf_dual_pass": bool(int(sdf_supersample) > 1 and int(sdf_downsample) > 1),
+                "sign_occupancy_mode": str(sign_occupancy_mode),
             }
         except Exception as e:
+            if not is_trimesh(mesh):
+                raise RuntimeError(f"open3d distance failed ({type(e).__name__}: {e}).") from e
             warns.append(f"open3d distance failed ({type(e).__name__}: {e}). Fallback to edt.")
             sdf, info, w = compute_sdf_edt(
                 mesh=mesh,
@@ -774,12 +1391,48 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
     sdf = None
     meta = None
     try:
-        mesh = trimesh.load(str(stl_path), force="mesh", process=False)
-        mesh = _ensure_trimesh(mesh)
-
+        mesh_backend = str(params.get("mesh_backend", "open3d"))
         pre_warns: List[str] = []
+        if mesh_backend == "open3d":
+            if params.get("distance_method", "mesh") != "mesh":
+                raise RuntimeError("mesh_backend=open3d requires distance_method=mesh.")
+            mesh = load_mesh_open3d(stl_path)
+            if params.get("o3d_clean", False) or int(params.get("o3d_subdivide", 0)) > 0:
+                mesh, w = open3d_remesh_for_stability(
+                    mesh,
+                    subdivide_iters=int(params.get("o3d_subdivide", 0)),
+                )
+                pre_warns += w
+            if params.get("meshfix", False):
+                pre_warns.append("meshfix skipped: trimesh backend required.")
+            if params.get("repair", False):
+                pre_warns.append("repair skipped: trimesh backend required.")
+            if params.get("merge_digits") is not None:
+                pre_warns.append("merge_digits skipped: trimesh backend required.")
+        else:
+            mesh = trimesh.load(str(stl_path), force="mesh", process=False)
+            mesh = _ensure_trimesh(mesh)
+            if params.get("o3d_clean", False) or int(params.get("o3d_subdivide", 0)) > 0:
+                mesh, w = open3d_remesh_for_stability(
+                    mesh,
+                    subdivide_iters=int(params.get("o3d_subdivide", 0)),
+                )
+                pre_warns += w
+            if params.get("meshfix", False):
+                mesh, w = meshfix_watertight(mesh)
+                pre_warns += w
+
+        if int(params.get("min_component_faces", 0)) > 0 or bool(params.get("keep_largest_component", False)):
+            mesh, w = filter_mesh_components(
+                mesh,
+                min_faces=int(params.get("min_component_faces", 0)),
+                keep_largest=bool(params.get("keep_largest_component", False)),
+            )
+            pre_warns += w
 
         distance_method = params["distance_method"]
+        repair_flag = bool(params.get("repair", False)) if mesh_backend != "open3d" else False
+        merge_digits = params.get("merge_digits", None) if mesh_backend != "open3d" else None
 
         sdf, meta, warns = compute_sdf(
             mesh=mesh,
@@ -790,15 +1443,34 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
             signed_policy=params["signed_policy"],
             out_dtype=params["out_dtype"],
             morph_close_iters=params["morph_close_iters"],
-            repair=params["repair"],
-            merge_digits=params["merge_digits"],
+            repair=repair_flag,
+            merge_digits=merge_digits,
             distance_method=distance_method,
             sdf_out=None,
+            sign_occupancy=bool(params.get("sign_occupancy", False)),
+            sdf_supersample=int(params.get("sdf_supersample", 1)),
+            sdf_supersample_mode=str(params.get("sdf_supersample_mode", "mean")),
+            sign_occupancy_mode=str(params.get("sign_occupancy_mode", "center")),
+            watertight_voxelize=bool(params.get("watertight_voxelize", False)),
+            wt_voxel_scale=int(params.get("wt_voxel_scale", 1)),
+            sdf_downsample=int(params.get("sdf_downsample", 1)),
+            sdf_downsample_mode=str(params.get("sdf_downsample_mode", "minabs")),
         )
         warns = pre_warns + warns
 
+        if "repair" not in meta:
+            meta["repair"] = {}
+        meta["repair"]["o3d_clean"] = bool(params.get("o3d_clean", False))
+        meta["repair"]["o3d_subdivide"] = int(params.get("o3d_subdivide", 0))
+        meta["repair"]["meshfix"] = bool(params.get("meshfix", False) and mesh_backend == "trimesh")
+        meta["repair"]["watertight_voxelize"] = bool(params.get("watertight_voxelize", False))
+        meta["repair"]["wt_voxel_scale"] = int(params.get("wt_voxel_scale", 1))
+        meta["repair"]["min_component_faces"] = int(params.get("min_component_faces", 0))
+        meta["repair"]["keep_largest_component"] = bool(params.get("keep_largest_component", False))
+
         meta["source_relpath"] = str(rel).replace(os.sep, "/")
         meta["source_abspath"] = str(stl_path)
+        meta["mesh_backend"] = str(mesh_backend)
 
         meta_bytes = np.bytes_(json.dumps(meta, ensure_ascii=False).encode("utf-8"))
         # signed を強制するなら，signed_used=False は失敗扱い
@@ -847,6 +1519,12 @@ def main():
     parser.add_argument("--dtype", choices=["f16", "f32"], default="f32")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--mesh_backend",
+        choices=["open3d", "trimesh"],
+        default="open3d",
+        help="Mesh loading backend. open3d avoids trimesh usage.",
+    )
 
     # EDT用補助
     parser.add_argument(
@@ -861,6 +1539,79 @@ def main():
         type=int,
         default=0,
         help="Optional morphological closing iterations on surface voxels to reduce leaks (default: 0).",
+    )
+    parser.add_argument(
+        "--o3d_clean",
+        action="store_true",
+        help="Apply Open3D mesh cleanup before SDF (remove degenerate/duplicated/non-manifold).",
+    )
+    parser.add_argument(
+        "--o3d_subdivide",
+        type=int,
+        default=0,
+        help="Open3D midpoint subdivision iterations (0 disables).",
+    )
+    parser.add_argument(
+        "--meshfix",
+        action="store_true",
+        help="Apply pymeshfix to enforce watertightness (may alter geometry).",
+    )
+    parser.add_argument(
+        "--watertight_voxelize",
+        action="store_true",
+        help="Build a watertight proxy mesh by voxel occupancy + marching cubes (topology-robust).",
+    )
+    parser.add_argument(
+        "--wt_voxel_scale",
+        type=int,
+        default=1,
+        help="Voxel scale for watertight proxy (>=1). Larger preserves thin parts but slower.",
+    )
+    parser.add_argument(
+        "--min_component_faces",
+        type=int,
+        default=0,
+        help="Drop disconnected components with fewer faces (0 disables).",
+    )
+    parser.add_argument(
+        "--keep_largest_component",
+        action="store_true",
+        help="Keep only the largest connected component.",
+    )
+    parser.add_argument(
+        "--sign_occupancy",
+        action="store_true",
+        help="Use Open3D occupancy to decide sign (slower but robust).",
+    )
+    parser.add_argument(
+        "--sign_occupancy_mode",
+        choices=["center", "any", "majority"],
+        default="center",
+        help="Occupancy decision from supersampled points: center/any/majority.",
+    )
+    parser.add_argument(
+        "--sdf_supersample",
+        type=int,
+        default=1,
+        help="Sub-voxel samples per axis for SDF (>=1). Increases compute but keeps memory stable.",
+    )
+    parser.add_argument(
+        "--sdf_supersample_mode",
+        choices=["mean", "minabs"],
+        default="mean",
+        help="Reduction for supersampled SDF: mean (smooth) or minabs (conservative).",
+    )
+    parser.add_argument(
+        "--sdf_downsample",
+        type=int,
+        default=1,
+        help="Compute SDF at higher res (factor) then downsample to target res.",
+    )
+    parser.add_argument(
+        "--sdf_downsample_mode",
+        choices=["minabs"],
+        default="minabs",
+        help="Downsample reduction mode.",
     )
 
     # 修復（watertight改善用）
@@ -890,7 +1641,15 @@ def main():
         print(f"Found {len(stl_list)} STL files under: {root_dir}")
         print(
             f"workers={args.workers}, res={args.res}, signed_policy={args.signed_policy}, "
-            f"dtype={args.dtype}, distance_method={args.distance_method}"
+            f"dtype={args.dtype}, distance_method={args.distance_method}, "
+            f"o3d_clean={bool(args.o3d_clean)}, o3d_subdivide={int(args.o3d_subdivide)}, "
+            f"meshfix={bool(args.meshfix)}, watertight_voxelize={bool(args.watertight_voxelize)}, "
+            f"wt_voxel_scale={int(args.wt_voxel_scale)}, min_component_faces={int(args.min_component_faces)}, "
+            f"keep_largest_component={bool(args.keep_largest_component)}, "
+            f"sign_occupancy={bool(args.sign_occupancy)}, "
+            f"sign_occupancy_mode={args.sign_occupancy_mode}, mesh_backend={args.mesh_backend}, "
+            f"sdf_supersample={int(args.sdf_supersample)}, sdf_supersample_mode={args.sdf_supersample_mode}, "
+            f"sdf_downsample={int(args.sdf_downsample)}, sdf_downsample_mode={args.sdf_downsample_mode}"
         )
 
     params = {
@@ -901,10 +1660,24 @@ def main():
         "trunc": None if args.trunc is None else float(args.trunc),
         "out_dtype": out_dtype,
         "overwrite": bool(args.overwrite),
+        "mesh_backend": str(args.mesh_backend),
         "distance_method": str(args.distance_method),
         "morph_close_iters": int(args.morph_close_iters),
+        "o3d_clean": bool(args.o3d_clean),
+        "o3d_subdivide": int(args.o3d_subdivide),
+        "meshfix": bool(args.meshfix),
+        "watertight_voxelize": bool(args.watertight_voxelize),
+        "wt_voxel_scale": int(max(1, args.wt_voxel_scale)),
+        "min_component_faces": int(args.min_component_faces),
+        "keep_largest_component": bool(args.keep_largest_component),
+        "sign_occupancy": bool(args.sign_occupancy),
+        "sign_occupancy_mode": str(args.sign_occupancy_mode),
         "repair": bool(args.repair),
         "merge_digits": None if args.merge_digits is None else int(args.merge_digits),
+        "sdf_supersample": int(max(1, args.sdf_supersample)),
+        "sdf_supersample_mode": str(args.sdf_supersample_mode),
+        "sdf_downsample": int(max(1, args.sdf_downsample)),
+        "sdf_downsample_mode": str(args.sdf_downsample_mode),
     }
 
     n_ok = n_skip = n_fail = 0
