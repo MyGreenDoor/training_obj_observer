@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 python stl_to_sdf_npz.py  --root_dir /mnt/ssd2tb/new_format/original --dst_dir /mnt/ssd2tb/new_format_sdf --normalize_to_cube --repair --merge_digits 6 --morph_close_iters 1 --res 128 \
-    --workers 10 --distance_method mesh --mesh_backend open3d  --sign_occupancy --sign_occupancy_mode any   --sdf_supersample 2 --sdf_supersample_mode mean
+    --workers 10 --distance_method mesh  --sign_occupancy --sign_occupancy_mode any   --sdf_supersample 2 --sdf_supersample_mode mean
 """
 
 
