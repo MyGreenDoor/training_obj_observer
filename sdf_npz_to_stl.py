@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-python sdf_npz_to_stl.py --npz xxx.npz --out yyy.stl --restore_size --mc_auto --mc_methods lorensen
+python sdf_npz_to_stl.py --npz xxx.npz --out yyy.stl --restore_size --mc_auto --mc_methods lorensen --to_original_scale
 
-python sdf_npz_to_stl.py --root_dir /mnt/ssd2tb/new_format_sdf --dst_dir /mnt/ssd2tb/new_format_sdf_stl --mc_auto --mc_methods lorensen
+python sdf_npz_to_stl.py --root_dir /mnt/ssd2tb/new_format_sdf --dst_dir /mnt/ssd2tb/new_format_sdf_stl --mc_auto --mc_methods lorensen --to_original_scale
 """
 
 
