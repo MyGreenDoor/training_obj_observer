@@ -944,18 +944,18 @@ def compute_sdf(
 
     # normalize_to_cube（最大辺長を1にして中心原点へ）
     transform = None
+    v, f = get_vertices_faces(mesh)
+    vmin = v.min(axis=0)
+    vmax = v.max(axis=0)
+    center = 0.5 * (vmin + vmax)
+    extent = float((vmax - vmin).max())
+    if extent <= 0:
+        raise ValueError("Degenerate mesh bbox extent.")
+    scale = 1.0 / extent
     if normalize_to_cube:
-        v, f = get_vertices_faces(mesh)
-        vmin = v.min(axis=0)
-        vmax = v.max(axis=0)
-        center = 0.5 * (vmin + vmax)
-        extent = float((vmax - vmin).max())
-        if extent <= 0:
-            raise ValueError("Degenerate mesh bbox extent.")
-        scale = 1.0 / extent
         v2 = (v - center) * scale
         mesh = make_mesh(vertices=v2, faces=f, like=mesh)
-        transform = {"center": center.tolist(), "scale": float(scale)}
+    transform = {"center": [0.0, 0.0, 0.0], "scale": float(scale)}
 
     if repair:
         if not is_trimesh(mesh):

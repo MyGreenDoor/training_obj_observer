@@ -24,6 +24,164 @@ import train_stereo_la_with_instance_seg as base
 import train_stereo_la as core
 
 
+def _ensure_sdf_meta_in_batch(batch: dict) -> dict:
+    """
+    Ensure SDFs_meta exists even if dataset only returns SDFs.
+    """
+    if not isinstance(batch, dict):
+        return batch
+    if "SDFs" not in batch:
+        return batch
+    if batch.get("SDFs_meta", None) is not None:
+        return batch
+
+    sdf_list = batch.get("SDFs", None)
+    if not isinstance(sdf_list, list):
+        return batch
+
+    meta_list = []
+    for sdf_objs in sdf_list:
+        if sdf_objs is None:
+            meta_list.append(None)
+            continue
+        if not isinstance(sdf_objs, list):
+            meta_list.append(None)
+            continue
+        meta_objs = []
+        for entry in sdf_objs:
+            meta = None
+            if isinstance(entry, dict):
+                if isinstance(entry.get("meta", None), dict):
+                    meta = entry["meta"]
+                elif "bbox_min" in entry and "bbox_max" in entry:
+                    meta = {"bbox_min": entry["bbox_min"], "bbox_max": entry["bbox_max"]}
+            if meta is None:
+                meta = {}
+            meta_objs.append(meta)
+        meta_list.append(meta_objs)
+
+    batch["SDFs_meta"] = meta_list
+    return batch
+
+
+class _BatchMetaLoader:
+    """
+    Wrap DataLoader to inject SDF meta when missing.
+    """
+    def __init__(self, loader):
+        self._loader = loader
+
+    def __len__(self):
+        return len(self._loader)
+
+    def __iter__(self):
+        for batch in self._loader:
+            yield _ensure_sdf_meta_in_batch(batch)
+
+
+def _extract_sdf_scale(meta, device, dtype) -> torch.Tensor:
+    """
+    Return scale factor to convert normalized SDF values to original units.
+    """
+    scale = 1.0
+    if isinstance(meta, dict):
+        if bool(meta.get("normalize_to_cube", False)):
+            tr = meta.get("transform", {}) if isinstance(meta.get("transform", {}), dict) else {}
+            raw = tr.get("scale", None)
+            if raw is not None:
+                try:
+                    raw = float(raw)
+                    if raw > 0.0:
+                        scale = 1.0 / raw
+                except Exception:
+                    pass
+    return torch.tensor(scale, device=device, dtype=dtype)
+
+
+def _build_sdf_targets_scaled(
+    batch: dict,
+    inst_gt_hw: torch.Tensor,
+    obj_coords: torch.Tensor,
+    device: torch.device,
+    cfg: dict,
+):
+    """
+    Build per-pixel SDF target map with scale correction from meta.
+    """
+    sdf_list = batch.get("SDFs", None)
+    sdf_meta_list = batch.get("SDFs_meta", None)
+    if sdf_list is None or sdf_meta_list is None:
+        return None, None
+    if not isinstance(sdf_list, list) or not isinstance(sdf_meta_list, list):
+        return None, None
+
+    B, H, W = inst_gt_hw.shape
+    if len(sdf_list) != B or len(sdf_meta_list) != B:
+        return None, None
+
+    max_points = int(cfg.get("loss", {}).get("sdf_max_points", 0))
+    sdf_gt = obj_coords.new_zeros((B, 1, H, W))
+    sdf_valid = torch.zeros((B, 1, H, W), device=device, dtype=torch.bool)
+
+    for b in range(B):
+        sdf_objs = sdf_list[b]
+        meta_objs = sdf_meta_list[b]
+        if sdf_objs is None or meta_objs is None:
+            continue
+        K = min(len(sdf_objs), len(meta_objs))
+        if K <= 0:
+            continue
+        inst_map = inst_gt_hw[b]
+        obj_coords_b = obj_coords[b].permute(1, 2, 0)
+        sdf_gt_flat = sdf_gt[b, 0].view(-1)
+        sdf_valid_flat = sdf_valid[b, 0].view(-1)
+
+        for k in range(K):
+            inst_id = k + 1
+            mask = inst_map == inst_id
+            if not mask.any():
+                continue
+            idx = torch.nonzero(mask, as_tuple=False)
+            if idx.numel() == 0:
+                continue
+            if max_points > 0 and idx.size(0) > max_points:
+                perm = torch.randperm(idx.size(0), device=device)[:max_points]
+                idx = idx[perm]
+            coords = obj_coords_b[idx[:, 0], idx[:, 1]]
+            bbox_min, bbox_max = base._extract_sdf_bounds(meta_objs[k], device, coords.dtype)
+            denom = (bbox_max - bbox_min).clamp_min(1e-6)
+            coords_norm = (coords - bbox_min) * (2.0 / denom) - 1.0
+            valid = (coords_norm.abs() <= 1.0).all(dim=1)
+            if not valid.any():
+                continue
+            coords_norm = coords_norm[valid]
+            idx = idx[valid]
+
+            sdf_entry = sdf_objs[k]
+            if isinstance(sdf_entry, dict) and "sdf" in sdf_entry:
+                sdf_entry = sdf_entry["sdf"]
+            sdf_vol = torch.as_tensor(sdf_entry, device=device, dtype=obj_coords.dtype)
+            if sdf_vol.dim() == 4 and sdf_vol.size(0) == 1:
+                sdf_vol = sdf_vol.squeeze(0)
+            if sdf_vol.dim() != 3:
+                raise ValueError("SDF volume must be 3D (D, H, W)")
+            sdf_vol = sdf_vol.unsqueeze(0).unsqueeze(0)
+            sdf_vals = base._sample_sdf_volume(sdf_vol, coords_norm)
+
+            scale = _extract_sdf_scale(meta_objs[k], device, sdf_vals.dtype)
+            sdf_vals = sdf_vals * scale
+
+            flat_idx = idx[:, 0] * W + idx[:, 1]
+            sdf_gt_flat[flat_idx] = sdf_vals
+            sdf_valid_flat[flat_idx] = True
+
+    return sdf_gt, sdf_valid
+
+
+# Override base SDF target builder to include scale in latent training.
+base._build_sdf_targets = _build_sdf_targets_scaled
+
+
 def build_model(cfg: dict, num_classes: int) -> torch.nn.Module:
     """Build the panoptic stereo model with latent head."""
     mcfg = cfg.get("model", {})
@@ -135,6 +293,8 @@ def main() -> None:
     )
     cfg.setdefault("data", {})
     cfg["data"]["n_classes"] = n_classes
+    train_loader = _BatchMetaLoader(train_loader)
+    val_loader = _BatchMetaLoader(val_loader)
 
     model = build_model(cfg, n_classes).to(device)
     if dist.is_initialized():
