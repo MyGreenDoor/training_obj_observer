@@ -210,3 +210,4 @@ __marimo__/
 *.pth
 /outputs/run_debug/*
 /evals*/*.png
+/evals*/*/*.png

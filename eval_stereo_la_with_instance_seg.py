@@ -104,7 +104,7 @@ def make_eval_dataloader(
     w_sdf_pose_trans = float(cfg.get("loss", {}).get("w_sdf_pose_trans", w_sdf_pose))
     if w_sdf > 0.0 or w_sdf_pose > 0.0 or w_sdf_pose_rot > 0.0 or w_sdf_pose_trans > 0.0:
         out_list = out_list + ("SDFs", "SDFs_meta")
-    if ds_cfg['name'] ==  "LASyntheticDataset3PerObj": 
+    if ds_cfg['name'] ==  "LASyntheticDataset3PerIns": 
         dataset = LASyntheticDataset3PerIns(
             out_list=out_list,
             with_data_path=True,
@@ -514,8 +514,8 @@ def main() -> None:
     ap.add_argument("--batch_size", type=int, default=-1, help="override batch size")
     ap.add_argument("--iters", type=int, default=-1, help="override cfg['model']['n_iter']")
     ap.add_argument("--amp", action="store_true")
-    ap.add_argument("--output", type=str, default="evals_panoptic/imgs/panoptic_results.json")
-    ap.add_argument("--eval_dir", type=str, default="evals_panoptic")
+    ap.add_argument("--output", type=str, default="evals_panoptic/panoptic_results.json")
+    ap.add_argument("--eval_dir", type=str, default="evals_panoptic/imgs")
     ap.add_argument("--save_images", action="store_true")
     ap.add_argument("--limit_batches", type=int, default=0, help="0=full loader, else limit iterator length")
     args = ap.parse_args()
