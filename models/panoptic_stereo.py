@@ -567,6 +567,7 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
         sdf_logvar = self.sdf_logvar_head(x_inst)
 
         if self.head_downsample > 1:
+            out_posz = F.interpolate(out_posz, size=out_hw, mode="bilinear", align_corners=False)
             cls_logits = F.interpolate(cls_logits, size=out_hw, mode="bilinear", align_corners=False)
             aff_logits = F.interpolate(affemb_out["aff_logits"], size=out_hw, mode="bilinear", align_corners=False)
             emb = F.interpolate(affemb_out["emb"], size=out_hw, mode="bilinear", align_corners=False)

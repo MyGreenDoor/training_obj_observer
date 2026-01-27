@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
@@ -79,25 +80,6 @@ class _BatchMetaLoader:
             yield _ensure_sdf_meta_in_batch(batch)
 
 
-def _extract_sdf_scale(meta, device, dtype) -> torch.Tensor:
-    """
-    Return scale factor to convert normalized SDF values to original units.
-    """
-    scale = 1.0
-    if isinstance(meta, dict):
-        if bool(meta.get("normalize_to_cube", False)):
-            tr = meta.get("transform", {}) if isinstance(meta.get("transform", {}), dict) else {}
-            raw = tr.get("scale", None)
-            if raw is not None:
-                try:
-                    raw = float(raw)
-                    if raw > 0.0:
-                        scale = 1.0 / raw
-                except Exception:
-                    pass
-    return torch.tensor(scale, device=device, dtype=dtype)
-
-
 def _build_sdf_targets_scaled(
     batch: dict,
     inst_gt_hw: torch.Tensor,
@@ -106,7 +88,7 @@ def _build_sdf_targets_scaled(
     cfg: dict,
 ):
     """
-    Build per-pixel SDF target map with scale correction from meta.
+    Build per-pixel SDF target map in normalized coordinate space.
     """
     sdf_list = batch.get("SDFs", None)
     sdf_meta_list = batch.get("SDFs_meta", None)
@@ -148,6 +130,7 @@ def _build_sdf_targets_scaled(
                 perm = torch.randperm(idx.size(0), device=device)[:max_points]
                 idx = idx[perm]
             coords = obj_coords_b[idx[:, 0], idx[:, 1]]
+            coords = base._normalize_obj_coords_for_sdf(meta_objs[k], coords, device, coords.dtype)
             bbox_min, bbox_max = base._extract_sdf_bounds(meta_objs[k], device, coords.dtype)
             denom = (bbox_max - bbox_min).clamp_min(1e-6)
             coords_norm = (coords - bbox_min) * (2.0 / denom) - 1.0
@@ -168,9 +151,6 @@ def _build_sdf_targets_scaled(
             sdf_vol = sdf_vol.unsqueeze(0).unsqueeze(0)
             sdf_vals = base._sample_sdf_volume(sdf_vol, coords_norm)
 
-            scale = _extract_sdf_scale(meta_objs[k], device, sdf_vals.dtype)
-            sdf_vals = sdf_vals * scale
-
             flat_idx = idx[:, 0] * W + idx[:, 1]
             sdf_gt_flat[flat_idx] = sdf_vals
             sdf_valid_flat[flat_idx] = True
@@ -178,8 +158,130 @@ def _build_sdf_targets_scaled(
     return sdf_gt, sdf_valid
 
 
-# Override base SDF target builder to include scale in latent training.
+def _build_sdf_hist_weights(
+    sdf_gt: torch.Tensor,
+    sdf_valid: torch.Tensor,
+    cfg: dict,
+) -> torch.Tensor:
+    """
+    Build per-pixel weights to flatten |SDF| histogram.
+    """
+    n_bins = int(cfg.get("loss", {}).get("sdf_hist_bins", 0))
+    if n_bins <= 0:
+        return None
+    abs_sdf = sdf_gt.abs()
+    valid = sdf_valid
+    abs_valid = abs_sdf[valid]
+    if abs_valid.numel() == 0:
+        return None
+
+    max_dist = float(cfg.get("loss", {}).get("sdf_hist_max", 0.0))
+    if max_dist <= 0.0:
+        max_dist = float(abs_valid.max().item())
+    max_dist = max(max_dist, 1e-6)
+
+    clipped = abs_sdf.clamp(max=max_dist)
+    bin_idx = torch.clamp((clipped / max_dist * n_bins).long(), max=n_bins - 1)
+    bin_idx_valid = bin_idx[valid]
+
+    counts = torch.bincount(bin_idx_valid, minlength=n_bins).to(dtype=abs_sdf.dtype)
+    smooth = float(cfg.get("loss", {}).get("sdf_hist_smooth", 1.0))
+    if smooth > 0.0:
+        counts = counts + smooth
+    inv = 1.0 / counts.clamp_min(1e-6)
+    w_valid = inv[bin_idx_valid]
+    w_mean = w_valid.mean().clamp_min(1e-6)
+    inv = inv / w_mean
+
+    weight_map = torch.zeros_like(abs_sdf)
+    weight_map[valid] = inv[bin_idx_valid]
+    return weight_map
+
+
+def _sdf_nll_laplace_weighted(
+    pred: torch.Tensor,
+    logvar: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    weight: torch.Tensor,
+    charb_eps: float = 0.0,
+) -> torch.Tensor:
+    """
+    Compute weighted heteroscedastic Laplace NLL for SDF maps.
+    """
+    r = pred - target
+    if charb_eps > 0.0:
+        abs_r = torch.sqrt(r * r + (charb_eps * charb_eps))
+    else:
+        abs_r = r.abs()
+    nll = abs_r * torch.exp(-0.5 * logvar) + 0.5 * logvar
+    valid_f = valid.to(nll.dtype)
+    w = weight.to(nll.dtype) * valid_f
+    return (nll * w).sum() / w.sum().clamp_min(1.0)
+
+
+def _compute_sdf_loss_weighted(
+    pred: dict,
+    batch: dict,
+    inst_gt_hw: torch.Tensor,
+    size_hw: tuple,
+    device: torch.device,
+    cfg: dict,
+) -> dict:
+    """Compute SDF loss with histogram-flattening weights."""
+    zero = pred["disp_1x"].new_tensor(0.0)
+    sdf_pred = pred.get("sdf_map", None)
+    if sdf_pred is None:
+        latent_map = pred.get("latent_map", None)
+        if latent_map is None:
+            return {"loss_sdf": zero, "sdf_valid_px": zero}
+        if latent_map.size(1) != 1:
+            raise ValueError("sdf_map missing and latent_map channel != 1")
+        sdf_pred = latent_map
+    sdf_logvar = pred.get("sdf_logvar", None)
+    if sdf_logvar is None:
+        return {"loss_sdf": zero, "sdf_valid_px": zero}
+
+    pos_map, rot_map = base._prepare_pose_maps(batch, size_hw, device)
+    if pos_map is None or rot_map is None:
+        return {"loss_sdf": zero, "sdf_valid_px": zero}
+    point_map = pred.get("point_map_1x", None)
+    if point_map is None:
+        return {"loss_sdf": zero, "sdf_valid_px": zero}
+    if point_map.shape[-2:] != size_hw:
+        point_map = F.interpolate(point_map, size=size_hw, mode="bilinear", align_corners=False)
+    if sdf_pred.shape[-2:] != size_hw:
+        sdf_pred = F.interpolate(sdf_pred, size=size_hw, mode="bilinear", align_corners=False)
+    if sdf_logvar.shape[-2:] != size_hw:
+        sdf_logvar = F.interpolate(sdf_logvar, size=size_hw, mode="bilinear", align_corners=False)
+
+    vec = point_map - pos_map
+    R = rot_map.permute(0, 3, 4, 1, 2)
+    vec = vec.permute(0, 2, 3, 1)
+    obj_coords = torch.einsum("bhwij,bhwj->bhwi", R.transpose(-1, -2), vec)
+    obj_coords = obj_coords.permute(0, 3, 1, 2)
+
+    sdf_gt, sdf_valid = base._build_sdf_targets(batch, inst_gt_hw, obj_coords, device, cfg)
+    if sdf_gt is None or sdf_valid is None:
+        return {"loss_sdf": zero, "sdf_valid_px": zero}
+    valid_px = sdf_valid.sum().to(dtype=zero.dtype)
+    if valid_px.item() <= 0:
+        return {"loss_sdf": zero, "sdf_valid_px": zero}
+
+    charb_eps = float(cfg.get("loss", {}).get("sdf_charb_eps", 0.0))
+    weight_map = _build_sdf_hist_weights(sdf_gt, sdf_valid, cfg)
+    if weight_map is None:
+        loss_sdf = base._sdf_nll_laplace_map(sdf_pred, sdf_logvar, sdf_gt, sdf_valid, charb_eps=charb_eps)
+    else:
+        loss_sdf = _sdf_nll_laplace_weighted(
+            sdf_pred, sdf_logvar, sdf_gt, sdf_valid, weight_map, charb_eps=charb_eps
+        )
+    return {"loss_sdf": loss_sdf, "sdf_valid_px": valid_px}
+
+
+# Override base SDF target builder to keep normalized SDF targets in latent training.
 base._build_sdf_targets = _build_sdf_targets_scaled
+base._compute_sdf_loss = _compute_sdf_loss_weighted
 
 
 def build_model(cfg: dict, num_classes: int) -> torch.nn.Module:
@@ -229,7 +331,7 @@ def build_model(cfg: dict, num_classes: int) -> torch.nn.Module:
         point_map_norm_std=point_map_norm_std,
     )
     sdf_pose_cfg = cfg.get("sdf_pose", {}) or {}
-    w_sdf_pose = float(cfg.get("loss", {}).get("w_sdf_pose", 0.0))
+    w_sdf_pose = float(cfg.get("loss", {}).get("w_sdf_pose", 1.0))
     w_sdf_pose_rot = float(cfg.get("loss", {}).get("w_sdf_pose_rot", w_sdf_pose))
     w_sdf_pose_trans = float(cfg.get("loss", {}).get("w_sdf_pose_trans", w_sdf_pose))
     if max(w_sdf_pose, w_sdf_pose_rot, w_sdf_pose_trans) > 0.0:
