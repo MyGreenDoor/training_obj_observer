@@ -22,6 +22,9 @@ from models.stereo_disparity import make_gn
 from utils import dist_utils
 from utils import rot_utils
 from losses import loss_functions
+from utils.logging_utils import draw_axes_on_images_bk
+from utils.projection import SilhouetteDepthRenderer
+import torchvision.utils as vutils
 
 import train_stereo_la_with_instance_seg as base
 import train_stereo_la as core
@@ -418,6 +421,102 @@ def _compute_sdf_pose_delta(
         "pose_R": R_pred,
         "pose_t": t_new,
     }
+
+
+def _log_pose_visuals_sdf(
+    writer: SummaryWriter,
+    step_value: int,
+    prefix: str,
+    stereo: torch.Tensor,
+    pred: dict,
+    inst_gt: torch.Tensor,
+    left_k: torch.Tensor,
+    batch: dict,
+    pos_gt: torch.Tensor,
+    rot_gt: torch.Tensor,
+    n_images: int,
+) -> None:
+    """Log pose and silhouette visualizations using SDF delta-pose outputs."""
+    if writer is None:
+        return
+    if "pose_R_sdf" not in pred or "pose_t_sdf" not in pred or "pose_valid_sdf" not in pred:
+        return
+
+    device = stereo.device
+    meshes_flat, valid_k = base._build_meshes_from_batch(batch, device)
+    if meshes_flat is None or valid_k.numel() == 0:
+        return
+
+    size_hw = pred["pos_mu"].shape[-2:]
+    inst_hw = base._downsample_label(inst_gt, size_hw)
+    wks, _ = base._build_instance_weight_map(inst_hw, valid_k)
+
+    R_pred = pred["pose_R_sdf"]
+    t_pred = pred["pose_t_sdf"]
+    v_pred = pred["pose_valid_sdf"].to(dtype=torch.bool)
+
+    image_size = (stereo.shape[-2], stereo.shape[-1])
+    origin_in = base._origin_in_image_from_t(pos_gt, left_k[:, 0], image_size)
+    valid_render = valid_k & origin_in
+    valid_pred = v_pred & valid_render
+    valid_gt = valid_render
+
+    T_pred = rot_utils.compose_T_from_Rt(R_pred, t_pred, valid_pred)
+    T_gt = rot_utils.compose_T_from_Rt(rot_gt, pos_gt, valid_gt)
+
+    meshes_flat = base._build_meshes_from_batch_filtered(batch, valid_render, device)
+    if meshes_flat is None:
+        return
+
+    renderer = SilhouetteDepthRenderer().to(device)
+    pred_r = renderer(
+        meshes_flat=meshes_flat,
+        T_cam_obj=T_pred,
+        K_left=left_k[:, 0],
+        valid_k=valid_render,
+        image_size=image_size,
+    )
+    gt_r = renderer(
+        meshes_flat=meshes_flat,
+        T_cam_obj=T_gt,
+        K_left=left_k[:, 0],
+        valid_k=valid_render,
+        image_size=image_size,
+    )
+    sil_pred = pred_r["silhouette"]
+    sil_gt = gt_r["silhouette"]
+
+    overlay_pred = base._overlay_mask_rgb(
+        stereo[:n_images, :3], sil_pred[:n_images], color=(0.0, 1.0, 0.0), alpha=0.45
+    )
+    overlay_gt = base._overlay_mask_rgb(
+        stereo[:n_images, :3], sil_gt[:n_images], color=(1.0, 0.0, 0.0), alpha=0.45
+    )
+    overlay_both = base._overlay_mask_rgb(overlay_gt, sil_pred[:n_images], color=(0.0, 1.0, 0.0), alpha=0.45)
+
+    axes_pred = draw_axes_on_images_bk(
+        overlay_pred,
+        left_k[:n_images, 0],
+        T_pred[:n_images],
+        axis_len=50,
+        valid=valid_pred[:n_images],
+    )
+    axes_gt = draw_axes_on_images_bk(
+        overlay_gt,
+        left_k[:n_images, 0],
+        T_gt[:n_images],
+        axis_len=50,
+        valid=valid_gt[:n_images],
+    )
+
+    grid = vutils.make_grid(
+        torch.cat([stereo[:n_images, :3], axes_pred, axes_gt, overlay_both], dim=0),
+        nrow=4,
+        normalize=True,
+        scale_each=True,
+    )
+    writer.add_image(f"{prefix}/vis_pose_sil_sdf", grid, step_value)
+
 
 def _build_sdf_targets_scaled(
     batch: dict,
@@ -990,6 +1089,19 @@ def train_one_epoch(
                         objs_in_left[..., :3, :3],
                         n_images=min(4, stereo.size(0)),
                     )
+                    _log_pose_visuals_sdf(
+                        writer,
+                        global_step,
+                        "train",
+                        stereo,
+                        pred,
+                        inst_gt,
+                        left_k,
+                        batch,
+                        objs_in_left[..., :3, 3],
+                        objs_in_left[..., :3, :3],
+                        n_images=min(4, stereo.size(0)),
+                    )
             window_cnt = core._reset_window_meter(window_sum, window_cnt)
 
     return total_loss.item() / max(1, len(loader))
@@ -1288,6 +1400,19 @@ def validate(
                     pred,
                     pos_gt_map,
                     rot_gt_map,
+                    inst_gt,
+                    left_k,
+                    batch,
+                    objs_in_left[..., :3, 3],
+                    objs_in_left[..., :3, :3],
+                    n_images=min(4, stereo.size(0)),
+                )
+                _log_pose_visuals_sdf(
+                    writer,
+                    epoch,
+                    "val",
+                    stereo,
+                    pred,
                     inst_gt,
                     left_k,
                     batch,
