@@ -23,6 +23,7 @@ from models.multi_head import (
     r6d_to_rotmat,
     rotvec_to_rotmat_map,
 )
+from models.sdf_pose_net import SDFPoseDeltaNet, SDFVolumeDecoder
 from utils import rot_utils
 from utils.normalization_utils import normalize_point_map, denormalize_pos_mu, denormalize_pos_logvar
 
@@ -759,6 +760,7 @@ class PanopticStereoMultiHead(nn.Module):
         point_map_norm_mean: Optional[Sequence[float]] = None,
         point_map_norm_std: Optional[Sequence[float]] = None,
         point_map_norm_eps: float = 1e-6,
+        sdf_pose_cfg: Optional[dict] = None,
     ) -> None:
         super().__init__()
         self.levels = levels
@@ -1044,6 +1046,7 @@ class PanopticStereoMultiHeadLatent(PanopticStereoMultiHead):
         point_map_norm_mean: Optional[Sequence[float]] = None,
         point_map_norm_std: Optional[Sequence[float]] = None,
         point_map_norm_eps: float = 1e-6,
+        sdf_pose_cfg: Optional[dict] = None,
     ) -> None:
         super().__init__(
             levels=levels,
@@ -1078,6 +1081,20 @@ class PanopticStereoMultiHeadLatent(PanopticStereoMultiHead):
             head_ch_scale=head_ch_scale,
             head_downsample=head_downsample,
             out_pos_scale=1.0,
+        )
+        sdf_pose_cfg = sdf_pose_cfg or {}
+        self.sdf_pose_net = SDFPoseDeltaNet(
+            in_ch=int(sdf_pose_cfg.get("in_ch", 2)),
+            base_ch=int(sdf_pose_cfg.get("base_ch", 16)),
+            num_down=int(sdf_pose_cfg.get("num_down", 4)),
+            hidden_ch=int(sdf_pose_cfg.get("hidden_ch", 128)),
+            out_scale_rot=float(sdf_pose_cfg.get("out_scale_rot", 0.5)),
+            out_scale_trans=float(sdf_pose_cfg.get("out_scale_trans", 0.02)),
+        )
+        self.sdf_decoder = SDFVolumeDecoder(
+            latent_dim=latent_dim,
+            base_ch=int(sdf_pose_cfg.get("decoder_base_ch", 32)),
+            base_res=int(sdf_pose_cfg.get("decoder_base_res", 4)),
         )
 
     def forward(
@@ -1207,6 +1224,10 @@ class PanopticStereoMultiHeadLatent(PanopticStereoMultiHead):
         }
         out.update({k: v for k, v in head_out.items() if k not in ("pos_mu", "pos_logvar")})
         return out
+
+    def predict_sdf_pose_delta(self, sdf_pairs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Predict pose deltas from paired SDF volumes."""
+        return self.sdf_pose_net(sdf_pairs)
 
 def pos_mu_to_pointmap(
     pos_mu: torch.Tensor,

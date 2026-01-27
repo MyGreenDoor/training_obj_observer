@@ -98,3 +98,7 @@ w_adds_update=0.0
 w_flow=10.0
 update_gamma=0.8
 update_warmup_steps=5000
+sdf_debug = false
+w_sdf = 1.0
+w_sdf_pose_rot = 1.0
+w_sdf_pose_trans = 1.0
