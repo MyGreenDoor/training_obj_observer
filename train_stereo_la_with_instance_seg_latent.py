@@ -1118,7 +1118,7 @@ def validate(
 ) -> Tuple[float, float]:
     """Validate the model with SDF losses enabled."""
     model.eval()
-    meters = base.DictMeters()
+    meters = core.DictMeters()
     meters.add_avg("L")
     meters.add_avg("L_sem")
     meters.add_avg("L_cls")
