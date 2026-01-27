@@ -1424,7 +1424,7 @@ def validate(
     loss_disp_avg = meters.get("L").avg
     loss_sem_avg = meters.get("L_sem").avg
     if writer is not None and dist_utils.is_main_process():
-        base.log_meters_to_tb(writer, meters, epoch, prefix="val")
+        core.log_meters_to_tb(writer, meters, epoch, prefix="val")
     return loss_disp_avg, loss_sem_avg
 
 
