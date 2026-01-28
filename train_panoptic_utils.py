@@ -366,7 +366,7 @@ def _compute_pose_losses_and_metrics(
     rot_gt_map_use = rot_gt_map
     r_gt_use = r_gt
     sym_axes, sym_orders = _prepare_symmetry_tensors(batch, device, valid_k_inst.shape[1])
-    if sym_axes is not None and sym_orders is not None and pred["rot_mat"].numel() > 0:
+    if sym_axes is not None and sym_orders is not None and r_pred is not None and pred["rot_mat"].numel() > 0:
         inst_gt = batch["instance_seg"].to(device, non_blocking=True)
         inst_gt_hw = _downsample_label(inst_gt, size_hw)
         inst_id_map = (inst_gt_hw - 1).clamp_min(0)
@@ -1827,8 +1827,8 @@ def _log_pose_visuals(
 
     image_size = (stereo.shape[-2], stereo.shape[-1])
     origin_in = _origin_in_image_from_t(t_gt, left_k[:, 0], image_size)
-    valid_render = valid_k & origin_in
-    valid_pred = v_pred & valid_render
+    valid_pred = v_pred & valid_k & origin_in
+    valid_render = valid_pred
     valid_gt = v_gt & valid_render
 
     # T_pred = rot_utils.compose_T_from_Rt(r_pred, t_pred, valid_pred)

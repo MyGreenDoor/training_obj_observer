@@ -312,8 +312,8 @@ def _log_pose_visuals_sdf(
 
     image_size = (stereo.shape[-2], stereo.shape[-1])
     origin_in = pan_utils._origin_in_image_from_t(pos_gt, left_k[:, 0], image_size)
-    valid_render = valid_k & origin_in
-    valid_pred = v_pred & valid_render
+    valid_pred = v_pred & valid_k & origin_in
+    valid_render = valid_pred
     valid_gt = valid_render
 
     T_pred = rot_utils.compose_T_from_Rt(R_pred, t_pred, valid_pred)
@@ -377,75 +377,6 @@ def _log_pose_visuals_sdf(
         scale_each=True,
     )
     writer.add_image(f"{prefix}/vis_pose_sil_sdf", grid, step_value)
-
-
-def _compute_pos_only_adds_metrics(
-    pred: Dict[str, torch.Tensor],
-    batch: Dict[str, Any],
-    sem_gt: torch.Tensor,
-    inst_gt_hw: torch.Tensor,
-    size_hw: Tuple[int, int],
-    left_k: torch.Tensor,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute ADD/ADD-S using GT rotations for translation-only predictions."""
-    zero = pred["disp_1x"].new_tensor(0.0)
-    if "pos_mu" not in pred:
-        return zero, zero, zero
-
-    pos_gt_map, rot_gt_map, _, _ = pan_utils._prepare_pose_targets(batch, sem_gt, size_hw, device)
-    if pos_gt_map is None or rot_gt_map is None:
-        return zero, zero, zero
-
-    valid_k = pan_utils._build_valid_k_from_inst(inst_gt_hw)
-    if valid_k.numel() == 0:
-        return zero, zero, zero
-    wks_inst, wfg_inst = pan_utils._build_instance_weight_map(inst_gt_hw, valid_k)
-
-    pos_map_pred = pan_utils.pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
-    r_pred, t_pred, v_pred, _, _ = rot_utils.pose_from_maps_auto(
-        rot_map=rot_gt_map,
-        pos_map=pos_map_pred,
-        Wk_1_4=wks_inst,
-        wfg=wfg_inst,
-        min_px=10,
-        min_wsum=1e-6,
-    )
-    r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
-        rot_map=rot_gt_map,
-        pos_map=pos_gt_map,
-        Wk_1_4=wks_inst,
-        wfg=wfg_inst,
-        min_px=10,
-        min_wsum=1e-6,
-    )
-    valid_inst = v_pred & v_gt & valid_k
-    if not valid_inst.any():
-        return zero, zero, valid_inst.sum().to(dtype=zero.dtype)
-
-    model_points, _ = pan_utils._build_model_points_from_batch(batch, device)
-    if model_points is None:
-        return zero, zero, valid_inst.sum().to(dtype=zero.dtype)
-
-    adds = pan_utils._adds_core_from_Rt_no_norm(
-        r_pred,
-        t_pred,
-        r_gt,
-        t_gt,
-        model_points,
-        use_symmetric=True,
-        valid_mask=valid_inst,
-    )
-    add = pan_utils._adds_core_from_Rt_no_norm(
-        r_pred,
-        t_pred,
-        r_gt,
-        t_gt,
-        model_points,
-        use_symmetric=False,
-        valid_mask=valid_inst,
-    )
-    return adds, add, valid_inst.sum().to(dtype=adds.dtype)
 
 
 def _prepare_pose_maps(
@@ -580,16 +511,25 @@ def _build_sdf_targets(
             sdf_entry = sdf_objs[k]
             if isinstance(sdf_entry, dict) and "sdf" in sdf_entry:
                 sdf_entry = sdf_entry["sdf"]
+            if sdf_entry is None:
+                continue
             sdf_vol = torch.as_tensor(sdf_entry, device=device, dtype=obj_coords.dtype)
             if sdf_vol.dim() == 4 and sdf_vol.size(0) == 1:
                 sdf_vol = sdf_vol.squeeze(0)
             if sdf_vol.dim() != 3:
-                raise ValueError("SDF volume must be 3D (D, H, W)")
+                continue
             sdf_vol = sdf_vol.unsqueeze(0).unsqueeze(0)
             sdf_vals = _sample_sdf_volume(sdf_vol, coords_norm)
 
             scale = _extract_sdf_scale(meta_objs[k], device, sdf_vals.dtype)
             sdf_vals = (sdf_vals * scale).to(dtype=sdf_gt.dtype)
+
+            finite = torch.isfinite(sdf_vals)
+            if not finite.all():
+                sdf_vals = sdf_vals[finite]
+                idx = idx[finite]
+            if sdf_vals.numel() == 0:
+                continue
 
             flat_idx = idx[:, 0] * W + idx[:, 1]
             sdf_gt_flat[flat_idx] = sdf_vals
@@ -717,6 +657,7 @@ def _compute_sdf_map_loss(
     sdf_gt, sdf_valid = _build_sdf_targets(batch, inst_gt_hw, obj_coords, device, cfg)
     if sdf_gt is None or sdf_valid is None:
         return {"loss_sdf": zero, "sdf_valid_px": zero}
+    sdf_valid = sdf_valid & torch.isfinite(sdf_gt)
     valid_px = sdf_valid.sum().to(dtype=zero.dtype)
     if valid_px.item() <= 0:
         return {"loss_sdf": zero, "sdf_valid_px": zero}
@@ -889,6 +830,9 @@ def _compute_implicit_sdf_loss(
             sdf_entry = sdf_objs[k]
             if isinstance(sdf_entry, dict) and "sdf" in sdf_entry:
                 sdf_entry = sdf_entry["sdf"]
+            if sdf_entry is None:
+                valid_use[b, k] = False
+                continue
             sdf_vol = torch.as_tensor(sdf_entry, device=device, dtype=latent_map.dtype)
             if sdf_vol.dim() == 4 and sdf_vol.size(0) == 1:
                 sdf_vol = sdf_vol.squeeze(0)
@@ -901,9 +845,13 @@ def _compute_implicit_sdf_loss(
             scale = _extract_sdf_scale(meta_objs[k], device, sdf_vals.dtype)
             sdf_vals = sdf_vals * scale
 
+            finite = torch.isfinite(sdf_vals)
+            if not finite.any():
+                valid_use[b, k] = False
+                continue
             x_obj[b, k] = pts
-            sdf_gt[b, k, :, 0] = sdf_vals
-            valid_pts[b, k] = True
+            sdf_gt[b, k, :, 0] = torch.nan_to_num(sdf_vals, nan=0.0, posinf=0.0, neginf=0.0)
+            valid_pts[b, k] = finite
 
     if not valid_use.any():
         return {"loss_sdf_implicit": zero, "valid_inst": zero}
@@ -1227,9 +1175,12 @@ def _build_extra_loss_fn(cfg: dict):
                                         use_symmetric=False,
                                         valid_mask=valid_inst,
                                     )
-                                    logs["L_adds"] = adds.detach()
-                                    logs["L_add"] = add.detach()
-                                    logs["L_adds_valid_inst"] = valid_inst.sum().detach()
+                                else:
+                                    adds = zero
+                                    add = zero
+                                logs["L_adds"] = adds.detach()
+                                logs["L_add"] = add.detach()
+                                logs["L_adds_valid_inst"] = valid_inst.sum().detach()
 
                 if writer is not None and dist_utils.is_main_process():
                     should_log = False
@@ -1268,25 +1219,12 @@ def _build_extra_loss_fn(cfg: dict):
             logs["L_sdf_consistency"] = loss_cons.detach()
             logs["L_sdf_consistency_valid_pts"] = cons_out["valid_pts"].detach()
 
-        if not has_pose_refine and log_pos_adds and "rot_mat" not in pred:
-            with torch.no_grad():
-                adds, add, valid_inst = _compute_pos_only_adds_metrics(
-                    pred=pred,
-                    batch=batch,
-                    sem_gt=sem_gt,
-                    inst_gt_hw=inst_gt_hw,
-                    size_hw=size_hw,
-                    left_k=left_k,
-                    device=device,
-                )
-            logs["L_adds"] = adds.detach()
-            logs["L_add"] = add.detach()
-            logs["L_adds_valid_inst"] = valid_inst.detach()
-
         if total.item() == 0.0 and not logs:
             return {}
         return {"loss": total, "logs": logs}
 
+    if log_pos_adds and not pose_refine_enabled:
+        raise ValueError("log_pos_adds requires pose_refine.enabled in latent training.")
     if not (w_sdf_map > 0.0 or use_implicit or use_consistency or log_pos_adds or pose_refine_enabled):
         return None
     return _extra_loss
@@ -1421,11 +1359,12 @@ def main() -> None:
 
     model = build_model(cfg, n_classes).to(device)
     if dist.is_initialized():
+        ddp_find_unused = bool(cfg.get("train", {}).get("ddp_find_unused", True))
         model = DDP(
             model,
             device_ids=[dist_utils.get_rank()],
             output_device=dist_utils.get_rank(),
-            find_unused_parameters=False,
+            find_unused_parameters=ddp_find_unused,
         )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
