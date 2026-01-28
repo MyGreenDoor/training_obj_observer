@@ -409,6 +409,7 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
     ) -> None:
         super().__init__()
         self.use_pixelshuffle = use_pixelshuffle
+        self.ctx_ch = int(ctx_ch)
         self.head_downsample = int(head_downsample)
         self.latent_l2_norm = bool(latent_l2_norm)
         if self.head_downsample < 1:
@@ -477,6 +478,23 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
         self.sdf_head = nn.Conv2d(latent_dim, 1, 1)
         self.sdf_logvar_head = nn.Conv2d(inst_ch, 1, 1)
         self.out_pos_scale = out_pos_scale
+        if self.head_downsample > 1:
+            guidance_in_ch = fuse_ch + (self.ctx_ch * (self.head_downsample ** 2))
+            self.up_guidance_fuse = nn.Sequential(
+                nn.Conv2d(guidance_in_ch, fuse_ch, kernel_size=1, bias=False),
+                norm_layer(fuse_ch),
+                nn.SiLU(True),
+            )
+            self.map_upsampler = ConvexUpsampler(context_ch=fuse_ch, up_factor=self.head_downsample, groups=16)
+            self.cls_upsampler = ConvexUpsampler(context_ch=fuse_ch, up_factor=self.head_downsample, groups=16)
+            self.aff_upsampler = ConvexUpsampler(context_ch=fuse_ch, up_factor=self.head_downsample, groups=16)
+            self.emb_upsampler = ConvexUpsampler(context_ch=fuse_ch, up_factor=self.head_downsample, groups=16)
+        else:
+            self.up_guidance_fuse = None
+            self.map_upsampler = None
+            self.cls_upsampler = None
+            self.aff_upsampler = None
+            self.emb_upsampler = None
 
     def make_up(self, in_ch: int, out_ch: int, norm_layer: Callable[[int], nn.Module]) -> nn.Module:
         """Create a 2x upsampling block with optional pixel shuffle."""
@@ -512,6 +530,7 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Run FPN-style head on full resolution features."""
         out_hw = ctx_1x.shape[-2:]
+        ctx_1x_full = ctx_1x
         if self.head_downsample > 1:
             low_hw = (max(1, out_hw[0] // self.head_downsample), max(1, out_hw[1] // self.head_downsample))
             ctx_1x = F.interpolate(ctx_1x, size=low_hw, mode="bilinear", align_corners=False)
@@ -562,17 +581,41 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
         out_posz = self.head_posz(self.head_posz_pre(x_geo))
         cls_logits = self.head_cls(self.head_cls_pre(x_sem))
         affemb_out = self.affemb_head(x_inst)
+        aff_logits = affemb_out["aff_logits"]
+        emb = affemb_out["emb"]
         latent_map = self.latent_head(x_inst)
         sdf_map = self.sdf_head(latent_map)
         sdf_logvar = self.sdf_logvar_head(x_inst)
 
         if self.head_downsample > 1:
-            cls_logits = F.interpolate(cls_logits, size=out_hw, mode="bilinear", align_corners=False)
-            aff_logits = F.interpolate(affemb_out["aff_logits"], size=out_hw, mode="bilinear", align_corners=False)
-            emb = F.interpolate(affemb_out["emb"], size=out_hw, mode="bilinear", align_corners=False)
-            latent_map = F.interpolate(latent_map, size=out_hw, mode="bilinear", align_corners=False)
-            sdf_map = F.interpolate(sdf_map, size=out_hw, mode="bilinear", align_corners=False)
-            sdf_logvar = F.interpolate(sdf_logvar, size=out_hw, mode="bilinear", align_corners=False)
+            can_unshuffle = (
+                ctx_1x_full.shape[-2] % self.head_downsample == 0
+                and ctx_1x_full.shape[-1] % self.head_downsample == 0
+                and self.up_guidance_fuse is not None
+                and self.map_upsampler is not None
+            )
+            if can_unshuffle:
+                ctx1x_s2d = F.pixel_unshuffle(ctx_1x_full, self.head_downsample)
+                h_up = self.up_guidance_fuse(torch.cat([x, ctx1x_s2d], dim=1))
+                reg_maps = torch.cat([out_posz, latent_map, sdf_map, sdf_logvar], dim=1)
+                reg_maps = self.map_upsampler(reg_maps, h_up, scale_factor=1.0)
+                ch_pos = out_posz.size(1)
+                ch_lat = latent_map.size(1)
+                out_posz, latent_map, sdf_map, sdf_logvar = torch.split(
+                    reg_maps, [ch_pos, ch_lat, 1, 1], dim=1
+                )
+                if self.cls_upsampler is not None and self.aff_upsampler is not None and self.emb_upsampler is not None:
+                    cls_logits = self.cls_upsampler(cls_logits, h_up, scale_factor=1.0)
+                    aff_logits = self.aff_upsampler(aff_logits, h_up, scale_factor=1.0)
+                    emb = self.emb_upsampler(emb, h_up, scale_factor=1.0)
+            else:
+                out_posz = F.interpolate(out_posz, size=out_hw, mode="bilinear", align_corners=False)
+                latent_map = F.interpolate(latent_map, size=out_hw, mode="bilinear", align_corners=False)
+                sdf_map = F.interpolate(sdf_map, size=out_hw, mode="bilinear", align_corners=False)
+                sdf_logvar = F.interpolate(sdf_logvar, size=out_hw, mode="bilinear", align_corners=False)
+                cls_logits = F.interpolate(cls_logits, size=out_hw, mode="bilinear", align_corners=False)
+                aff_logits = F.interpolate(aff_logits, size=out_hw, mode="bilinear", align_corners=False)
+                emb = F.interpolate(emb, size=out_hw, mode="bilinear", align_corners=False)
             emb = F.normalize(emb, dim=1, eps=1e-6)
             affemb_out = {"aff_logits": aff_logits, "emb": emb}
 
@@ -595,6 +638,80 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
             "sdf_logvar": sdf_logvar,
             **affemb_out,
         }
+
+
+class ImplicitSDFHead(nn.Module):
+    """Implicit SDF head with Fourier features and FiLM conditioning."""
+
+    def __init__(
+        self,
+        z_dim: int,
+        hidden_dim: int = 128,
+        n_layers: int = 4,
+        n_freqs: int = 6,
+        use_film: bool = True,
+        out_logvar: bool = False,
+        logvar_min: float = -8.0,
+        logvar_max: float = 4.0,
+    ) -> None:
+        super().__init__()
+        self.z_dim = int(z_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.n_layers = int(max(1, n_layers))
+        self.n_freqs = int(max(0, n_freqs))
+        self.use_film = bool(use_film)
+        self.out_logvar = bool(out_logvar)
+        self.logvar_min = float(logvar_min)
+        self.logvar_max = float(logvar_max)
+
+        in_dim = 3 * (1 + 2 * self.n_freqs) if self.n_freqs > 0 else 3
+        self.layers = nn.ModuleList()
+        for i in range(self.n_layers):
+            self.layers.append(nn.Linear(in_dim if i == 0 else self.hidden_dim, self.hidden_dim))
+        self.film = None
+        if self.use_film:
+            self.film = nn.ModuleList([nn.Linear(self.z_dim, self.hidden_dim * 2) for _ in range(self.n_layers)])
+        out_dim = 2 if self.out_logvar else 1
+        self.out = nn.Linear(self.hidden_dim, out_dim)
+
+    def _embed(self, x: torch.Tensor) -> torch.Tensor:
+        if self.n_freqs <= 0:
+            return x
+        freqs = torch.pow(2.0, torch.arange(self.n_freqs, device=x.device, dtype=x.dtype)) * math.pi
+        view_shape = (1,) * (x.dim() - 1) + (self.n_freqs, 1)
+        x_proj = x.unsqueeze(-2) * freqs.view(view_shape)
+        sin = torch.sin(x_proj).reshape(*x.shape[:-1], -1)
+        cos = torch.cos(x_proj).reshape(*x.shape[:-1], -1)
+        return torch.cat([x, sin, cos], dim=-1)
+
+    def forward(
+        self,
+        z_inst: torch.Tensor,
+        x_obj: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        B, K, N, _ = x_obj.shape
+        if x_obj.numel() == 0:
+            sdf = x_obj.new_zeros((B, K, N, 1))
+            if self.out_logvar:
+                return sdf, sdf.clone()
+            return sdf, None
+
+        x_flat = x_obj.view(B * K, N, 3)
+        z_flat = z_inst.view(B * K, self.z_dim)
+        h = self._embed(x_flat)
+        for i, layer in enumerate(self.layers):
+            h = layer(h)
+            if self.use_film and self.film is not None:
+                gamma_beta = self.film[i](z_flat)
+                gamma, beta = gamma_beta.chunk(2, dim=-1)
+                h = h * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+            h = F.silu(h)
+        out = self.out(h)
+        sdf = out[..., :1].view(B, K, N, 1)
+        if self.out_logvar:
+            logvar = out[..., 1:2].clamp(self.logvar_min, self.logvar_max).view(B, K, N, 1)
+            return sdf, logvar
+        return sdf, None
 
 
 class DummyMultiTaskHead(nn.Module):

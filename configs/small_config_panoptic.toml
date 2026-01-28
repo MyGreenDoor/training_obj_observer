@@ -35,10 +35,10 @@ min_lr = 1e-6
 name   = "LASyntheticDataset3PerObj"
 use_camera_list = ["D415", "ZED2", "ZEDmini"]
 target_scene_list = [
-    '00000001',
-    '01000121',
-    '01002222',
-    '02000014',
+#    '00000001',
+#    '01000121',
+#    '01002222',
+#    '02000014',
     '02000111'
 ]
 
@@ -46,7 +46,13 @@ target_scene_list = [
 [[data.val_datasets]]
 name   = "LASyntheticDataset3PerObj"
 use_camera_list = ["D415", "ZED2", "ZEDmini"]
-target_scene_list = ['00000004', '01000010','01000109','01002228','02000015','02000112']
+target_scene_list = [
+    #'00000004', 
+    #'01000010',
+    #'01000109',
+    #'01002228',
+    #'02000015',
+    '02000112']
 
 [model]
 # 特徴抽出・更新は既存通り
@@ -98,3 +104,4 @@ w_adds_update=0.0
 w_flow=10.0
 update_gamma=0.8
 update_warmup_steps=5000
+use_implicit_sdf = true

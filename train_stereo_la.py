@@ -8,16 +8,13 @@ Usage (single node, 4 GPUs):
       --config configs/example_config.toml --launcher pytorch
 """
 import argparse
-import math
 import os
 import platform
-import random
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import tomlkit
 
 import torch
 import torch.nn.functional as F
@@ -45,6 +42,21 @@ from utils.projection import SilhouetteDepthRenderer
 from pytorch3d.structures import Meshes
 from pytorch3d.ops import sample_points_from_meshes
 from losses import loss_functions
+from train_utils import (
+    DictMeters,
+    _flush_train_window_to_tb,
+    _init_window_meter,
+    _reset_window_meter,
+    _update_window_meter,
+    build_lr_scheduler,
+    disparity_nll_laplace_raft_style,
+    load_model_state as _load_model_state,
+    load_toml,
+    log_meters_to_tb,
+    seed_worker,
+    set_global_seed,
+    write_toml,
+)
 
 mp.set_start_method("spawn", force=True)
 supported = getattr(mp, "get_all_sharing_strategies", lambda: ["file_system"])()
@@ -52,7 +64,6 @@ strategy = "file_descriptor" if "file_descriptor" in supported else "file_system
 mp.set_sharing_strategy(strategy)
 
 # --- TOML read/write helpers ---
-_CFG_TEXT_CACHE = None  # original text of the config file
 _WARNED_SYMMETRY_KEYS = False  # Warn once when symmetry metadata is missing/empty.
 
 
@@ -164,68 +175,6 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     out['meshes'] = meshes_all_mm        # optional
 
     return out
-
-
-def set_global_seed(seed: int = 42) -> None:
-    """Set random seed for Python, NumPy, and PyTorch.
-
-    Args:
-        seed: Seed value to use for all RNGs.
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # 完全決定論モード（速度低下あり）
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
-    # さらに厳密にするなら（PyTorch 1.8+）
-    # torch.use_deterministic_algorithms(True)
-
-
-
-def seed_worker(worker_id: int) -> None:
-    """Seed DataLoader workers consistently.
-
-    Args:
-        worker_id: Worker index provided by DataLoader.
-    """
-    # DataLoader が割り当てた「そのワーカー固有の seed」
-    # （各 worker で異なる値になっている）
-    worker_info = torch.utils.data.get_worker_info()
-    base_seed = worker_info.seed  # 64bit
-    # Python/NumPy にも反映（NumPy は 32bit のため mod）
-    random.seed(base_seed)
-    np.random.seed(base_seed % (2**32))
-    
-
-def load_toml(config_path: str) -> dict:
-    """Load TOML config while caching its raw text.
-
-    Args:
-        config_path: Path to the TOML config file.
-
-    Returns:
-        Parsed config dictionary.
-    """
-    global _CFG_TEXT_CACHE
-    config_path = Path(config_path)
-    _CFG_TEXT_CACHE = config_path.read_text(encoding="utf-8")
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = tomlkit.load(f)
-    return cfg
-
-
-def write_toml(cfg: dict, out_path: Path) -> None:
-    """Write config data to a TOML file.
-
-    Args:
-        cfg: Config dictionary to write.
-        out_path: Destination path.
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        tomlkit.dump(cfg, f)
 
 
 def _build_filtering_transforms(for_train: bool) -> la_transforms.LACompose:
@@ -394,80 +343,6 @@ def build_model(cfg: dict, class_table: dict) -> SSCFlow2:
     return net
 
 
-def build_lr_scheduler(cfg, optimizer, steps_per_epoch: int, total_steps: int):
-    """Build LR scheduler from config.
-
-    Args:
-        cfg: Training configuration dictionary.
-        optimizer: Optimizer instance.
-        steps_per_epoch: Number of steps per epoch.
-        total_steps: Total steps for the entire training run.
-
-    Returns:
-        Tuple of (scheduler, step_when) where step_when in
-        {"step", "epoch", "epoch_metric"}.
-    """
-    scfg = cfg.get("lr_scheduler", {}) or {}
-    typ = scfg.get("type", "none").lower()
-    if typ in ("none", "", None):
-        return None, None
-
-    # 汎用値
-    base_lr = cfg["train"]["lr"]
-
-    if typ == "cosine":
-        # Linear warmup -> cosine decay to min_lr
-        warmup_steps = int(scfg.get("warmup_steps", 0) or scfg.get("warmup_ratio", 0.05) * total_steps)
-        min_lr = float(scfg.get("min_lr", 1e-6))
-        min_factor = min_lr / base_lr
-
-        def lr_lambda(step):
-            if warmup_steps > 0 and step < warmup_steps:
-                return (step + 1) / max(1, warmup_steps)
-            t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            t = min(max(t, 0.0), 1.0)
-            return min_factor + (1.0 - min_factor) * 0.5 * (1.0 + math.cos(math.pi * t))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        return scheduler, "step"
-
-    if typ == "onecycle":
-        pct_start = float(scfg.get("pct_start", 0.05))
-        anneal = str(scfg.get("anneal_strategy", "cos"))
-        div_factor = float(scfg.get("div_factor", 25.0))
-        final_div = float(scfg.get("final_div_factor", 1e4))
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=base_lr, total_steps=total_steps,
-            pct_start=pct_start, anneal_strategy=anneal,
-            div_factor=div_factor, final_div_factor=final_div
-        )
-        return scheduler, "step"
-
-    if typ == "multistep":
-        # 反復番号で指定（エポックではなく step 数）
-        # デフォは 60% / 85% の時点で減衰
-        ms = scfg.get("milestones")
-        if ms is None:
-            ms = [int(0.6 * total_steps), int(0.85 * total_steps)]
-        gamma = float(scfg.get("gamma", 0.1))
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=ms, gamma=gamma)
-        return scheduler, "step"
-
-    if typ == "plateau":
-        # val 指標が停滞したら縮小
-        factor = float(scfg.get("factor", 0.5))
-        patience = int(scfg.get("patience", 5))
-        min_lr = float(scfg.get("min_lr", 1e-6))
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, factor=factor, patience=patience, min_lr=min_lr
-        )
-        return scheduler, "epoch_metric"
-
-    # 未知タイプ
-    return None, None
-
-
-@torch.no_grad()
 def downsample_disp_and_mask_1_4(
     disp_1x: torch.Tensor,             # (B,1,H,W)
     valid_1x: Optional[torch.Tensor],  # (B,1,H,W) in {0,1} or None
@@ -515,73 +390,6 @@ def downsample_disp_and_mask_1_4(
     return disp_1_4, valid_1_4
 
 
-
-def disparity_nll_laplace_raft_style(
-    preds_1_4: List[torch.Tensor],        # [(B,1,64,64), ...]
-    logvars_1_4: List[torch.Tensor],      # [(B,1,64,64), ...] log(sigma^2)
-    gt_disp_1x: torch.Tensor,             # (B,1,256,256)
-    gt_valid_1x: Optional[torch.Tensor]=None,
-    gamma: float = 0.9,
-    charb_eps: float = 0.0,               # >0 で |r| をCharb化（擬似L1）
-) -> torch.Tensor:
-    """Compute Laplace NLL loss for disparity predictions.
-
-    Args:
-        preds_1_4: List of disparity predictions at 1/4 resolution.
-        logvars_1_4: List of log variance predictions matching preds_1_4.
-        gt_disp_1x: Ground-truth disparity at full resolution.
-        gt_valid_1x: Optional validity mask for GT disparity.
-        gamma: RAFT-style weighting factor for iterations.
-        charb_eps: Optional Charbonnier epsilon for robust loss.
-
-    Returns:
-        Scalar loss tensor.
-    """
-    assert len(preds_1_4) > 0
-    assert len(preds_1_4) == len(logvars_1_4)
-
-    h, w = preds_1_4[0].shape[-2:]
-    gt_1_4 = F.interpolate(gt_disp_1x, size=(h, w), mode="bilinear", align_corners=False) / 4.0
-
-    if gt_valid_1x is None:
-        valid_1_4 = torch.ones((gt_disp_1x.size(0), 1, h, w), device=gt_disp_1x.device, dtype=gt_disp_1x.dtype)
-    else:
-        if gt_valid_1x.dim() == 3:
-            v = (gt_valid_1x > 0).unsqueeze(1)
-        else:
-            v = (gt_valid_1x > 0)
-        valid_1_4 = F.interpolate(v.to(gt_disp_1x.dtype), size=(h, w), mode="nearest")
-
-    N = len(preds_1_4)
-    total = gt_disp_1x.new_tensor(0.0)
-    denom = gt_disp_1x.new_tensor(0.0)
-
-    for i in range(N):
-        w_i = gamma ** (N - 1 - i)
-        pred = preds_1_4[i]
-        logv = logvars_1_4[i]
-
-        r = pred - gt_1_4
-
-        # |r| or Charb(|r|)
-        if charb_eps > 0.0:
-            abs_r = torch.sqrt(r * r + (charb_eps * charb_eps))
-        else:
-            abs_r = r.abs()
-
-        # Laplace NLL with log_var = log(sigma^2):
-        # b = exp(0.5*logv)
-        # nll = |r|/b + log b = |r|*exp(-0.5*logv) + 0.5*logv
-        nll_map = abs_r * torch.exp(-0.5 * logv) + 0.5 * logv
-        nll_map = nll_map * valid_1_4
-
-        num = valid_1_4.sum().clamp_min(1e-6)
-        step = nll_map.sum() / num
-
-        total = total + w_i * step
-        denom = denom + w_i
-
-    return total / denom
 
 def flow_loss_raft_style(
     preds_flow: torch.Tensor,               # (B,T,2,H,W)
@@ -774,97 +582,6 @@ def log_scalars(writer, logs: dict, step: int, prefix: str = "train"):
         writer.add_scalar(f"{prefix}/{k}", v.item(), step)
 
 
-class _BaseMeter:
-    """Base interface for metric meters."""
-    def reset(self): ...
-    def all_reduce_(self): ...
-
-
-class AverageMeter(_BaseMeter):
-    """Weighted average meter: sum(val * n) / sum(n)."""
-    def __init__(self):
-        self.sum = 0.0
-        self.cnt = 0.0
-    def update(self, val: float, n: float = 1.0):
-        self.sum += float(val) * float(n)
-        self.cnt += float(n)
-    @property
-    def avg(self) -> float:
-        return self.sum / max(self.cnt, 1e-12)
-    def reset(self):
-        self.sum = 0.0; self.cnt = 0.0
-    def all_reduce_(self):
-        if not dist.is_available() or not dist.is_initialized():
-            return
-        t = torch.tensor(
-            [self.sum, self.cnt],
-            dtype=torch.float64,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        self.sum, self.cnt = float(t[0].item()), float(t[1].item())
-
-
-class SumCountMeter(_BaseMeter):
-    """Sum/count meter where avg = sum / count."""
-    def __init__(self):
-        self.sum = 0.0
-        self.count = 0.0
-    def update_sc(self, sum_val: float, count: float):
-        self.sum += float(sum_val)
-        self.count += float(count)
-    @property
-    def avg(self) -> float:
-        return self.sum / max(self.count, 1e-12)
-    def reset(self):
-        self.sum = 0.0; self.count = 0.0
-    def all_reduce_(self):
-        if not dist.is_available() or not dist.is_initialized():
-            return
-        t = torch.tensor(
-            [self.sum, self.count],
-            dtype=torch.float64,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        self.sum, self.count = float(t[0].item()), float(t[1].item())
-
-class DictMeters:
-    """Container for multiple meters keyed by name."""
-    def __init__(self):
-        self.m: Dict[str, _BaseMeter] = {}
-    def add_avg(self, name: str):
-        self.m[name] = AverageMeter()
-    def add_sc(self, name: str):
-        self.m[name] = SumCountMeter()
-    def update_avg(self, name: str, val: float, n: float = 1.0):
-        cast = self.m[name]; assert isinstance(cast, AverageMeter)
-        cast.update(val, n)
-    def update_sc(self, name: str, sum_val: float, count: float):
-        cast = self.m[name]; assert isinstance(cast, SumCountMeter)
-        cast.update_sc(sum_val, count)
-    def get(self, name: str) -> _BaseMeter:
-        return self.m[name]
-    def all_reduce_(self):
-        for v in self.m.values(): v.all_reduce_()
-    def averages(self) -> Dict[str, float]:
-        return {k: v.avg for k, v in self.m.items()}
-
-
-def log_meters_to_tb(writer, meters: DictMeters, step: int, prefix: str):
-    """Write meter averages to TensorBoard.
-
-    Args:
-        writer: TensorBoard SummaryWriter.
-        meters: Meter container.
-        step: Global step value.
-        prefix: Tag prefix for metric names.
-    """
-    for k, v in meters.m.items():
-        writer.add_scalar(f"{prefix}/{k}", v.avg, step)
-        
-
-@torch.no_grad()
 def _ensure_avg_meters(meters: "DictMeters", logs: dict):
     """Ensure AverageMeter exists for each L_* key in logs.
 
@@ -922,98 +639,6 @@ def _overlay_mask_rgb(img_bchw, mask_b1hw, color=(0.0, 1.0, 0.0), alpha=0.4):
         
 # ==== 共通ヘルパ（重複除去；振る舞いは既存通り） ===================================
 
-def _init_window_meter():
-    """Initialize windowed loss accumulators.
-
-    Returns:
-        Tuple of (window_sum dict, window_count int).
-    """
-    return {
-        "loss": 0.0,
-        "loss_disp":  0.0,
-        "depth_mae":  0.0,
-        "depth_acc_1mm": 0.0,
-        "depth_acc_2mm": 0.0,
-        "depth_acc_4mm": 0.0,
-        "L_ctr":  0.0,
-        "L_mask":  0.0,
-        "L_pos":  0.0,
-        "L_rot":  0.0,
-        "L_cls":  0.0,
-        "L_adds": 0.0,
-    }, 0
-
-def _reset_window_meter(window_sum, window_cnt_ref):
-    """Reset windowed sums.
-
-    Args:
-        window_sum: Dictionary of accumulated values.
-        window_cnt_ref: Placeholder for count (kept for API compatibility).
-
-    Returns:
-        Reset count value.
-    """
-    for k in window_sum:
-        window_sum[k] = 0.0
-    return 0  # new count
-
-def _update_window_meter(window_sum, window_cnt, loss, loss_disp, depth_mae, logs):
-    """Update windowed sums with new loss values.
-
-    Args:
-        window_sum: Dictionary of accumulated values.
-        window_cnt: Current count.
-        loss: Total loss tensor.
-        loss_disp: Disparity loss tensor.
-        depth_mae: Depth MAE tensor.
-        logs: Dictionary of additional loss components.
-
-    Returns:
-        Updated window count.
-    """
-    window_sum["loss"]      += float(loss.detach().item())
-    window_sum["loss_disp"] += float(loss_disp.detach().item())
-    window_sum["depth_mae"] += float(depth_mae.detach().item())
-    # logs に来たものをすべて動的に反映（"L_" で始まる Tensor のみ集計）
-    for k, v in logs.items():
-        if torch.is_tensor(v):
-            if k not in window_sum:
-                window_sum[k] = 0.0
-            window_sum[k] += float(v.detach().item())
-
-    return window_cnt + 1
-
-def _flush_train_window_to_tb(writer, window_sum, window_cnt, optimizer, global_step, prefix="train"):
-    """Flush windowed training metrics to TensorBoard.
-
-    Args:
-        writer: TensorBoard SummaryWriter.
-        window_sum: Dictionary of accumulated values.
-        window_cnt: Number of steps accumulated.
-        optimizer: Optimizer with learning rate state.
-        global_step: Global step value.
-        prefix: Tag prefix for metric names.
-    """
-    if writer is None or window_cnt <= 0:
-        return
-    denom = max(window_cnt, 1)
-    writer.add_scalar(f"{prefix}/loss",       window_sum["loss"]      / denom, global_step)
-    writer.add_scalar(f"{prefix}/loss_disp",  window_sum["loss_disp"] / denom, global_step)
-    writer.add_scalar(f"{prefix}/depth_mae",  window_sum["depth_mae"] / denom, global_step)
-    if "depth_acc_1mm" in window_sum:
-        writer.add_scalar(f"{prefix}/depth_acc_1mm", window_sum["depth_acc_1mm"] / denom, global_step)
-    if "depth_acc_2mm" in window_sum:
-        writer.add_scalar(f"{prefix}/depth_acc_2mm", window_sum["depth_acc_2mm"] / denom, global_step)
-    if "depth_acc_4mm" in window_sum:
-        writer.add_scalar(f"{prefix}/depth_acc_4mm", window_sum["depth_acc_4mm"] / denom, global_step)
-    writer.add_scalar(f"{prefix}/lr", optimizer.param_groups[0]["lr"], global_step)
-    
-    # 追加/動的な loss 群（"L_" で始まるキーをすべて出力）
-    for k, s in window_sum.items():
-        if k.startswith("L_"):
-            writer.add_scalar(f"{prefix}/{k}", s / denom, global_step)
-
-@torch.no_grad()
 def _prepare_iter0_targets(batch, cfg, device):
     """Build iter0 targets shared by train/val.
 
@@ -1973,22 +1598,6 @@ def validate(
         log_meters_to_tb(writer, meters, epoch, prefix="val")
 
     return avgs["disp_epe"], 0.0
-
-
-def _load_model_state(model, state_dict, strict=False):
-    """Load model weights with DDP-awareness.
-
-    Args:
-        model: Model or DDP-wrapped model.
-        state_dict: State dict to load.
-        strict: Whether to enforce strict key matching.
-
-    Returns:
-        Tuple of (missing_keys, unexpected_keys).
-    """
-    target = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    missing, unexpected = target.load_state_dict(state_dict, strict=strict)
-    return missing, unexpected
 
 
 def main():

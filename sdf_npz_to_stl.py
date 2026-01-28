@@ -17,14 +17,17 @@ import trimesh
 
 
 def load_npz(npz_path: Path):
-    z = np.load(npz_path, allow_pickle=False)
-    sdf = z["sdf"]
-    meta = json.loads(z["meta"].tobytes().decode("utf-8"))
+    with open(npz_path, "rb") as f:
+        z = np.load(f, allow_pickle=False)
+        sdf = z["sdf"]
+        meta = json.loads(z["meta"].tobytes().decode("utf-8"))
+        z.close()
     return sdf, meta
 
 
 def load_stl_as_trimesh(stl_path: Path) -> trimesh.Trimesh:
-    mesh = trimesh.load(str(stl_path), force="mesh", process=False)
+    with open(stl_path, "rb") as f:
+        mesh = trimesh.load(f, file_type="stl", force="mesh", process=False)
     if isinstance(mesh, trimesh.Scene):
         meshes = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
         if len(meshes) == 0:
@@ -293,7 +296,8 @@ def convert_one_npz(npz_path: Path, out_path: Path, args: argparse.Namespace) ->
 
         mesh = trimesh.Trimesh(vertices=verts_world, faces=faces, process=bool(args.process))
         mesh = filter_components_by_faces(mesh, min_faces=int(args.min_component_faces))
-        mesh.export(str(out_path))
+        with open(out_path, "wb") as f:
+            mesh.export(f, file_type="stl")
 
         return {
             "status": "ok",

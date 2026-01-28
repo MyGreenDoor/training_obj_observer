@@ -58,6 +58,43 @@ def _ensure_trimesh(mesh):
     return mesh
 
 
+def _path_has_non_ascii(path: Path) -> bool:
+    path_str = os.fspath(path)
+    return any(ord(ch) > 127 for ch in path_str)
+
+
+def load_mesh_trimesh(stl_path: Path) -> MeshData:
+    """
+    Load STL using trimesh with a file handle to support non-ASCII paths.
+    """
+    try:
+        with open(stl_path, "rb") as f:
+            mesh = trimesh.load(f, file_type="stl", force="mesh", process=False)
+    except Exception:
+        mesh = trimesh.load(str(stl_path), force="mesh", process=False)
+    mesh = _ensure_trimesh(mesh)
+    v = np.asarray(mesh.vertices, dtype=np.float64)
+    f = np.asarray(mesh.faces, dtype=np.int64)
+    return MeshData(vertices=v, faces=f)
+
+
+def load_mesh_for_open3d(stl_path: Path) -> Tuple[MeshData, List[str]]:
+    """
+    Prefer Open3D loader, but fallback to trimesh for non-ASCII paths or failures.
+    """
+    warns: List[str] = []
+    if _path_has_non_ascii(stl_path):
+        mesh = load_mesh_trimesh(stl_path)
+        warns.append("open3d load skipped for non-ASCII path; loaded via trimesh.")
+        return mesh, warns
+    try:
+        return load_mesh_open3d(stl_path), warns
+    except Exception as e:
+        warns.append(f"open3d load failed ({type(e).__name__}: {e}); fallback to trimesh.")
+        mesh = load_mesh_trimesh(stl_path)
+        return mesh, warns
+
+
 def load_mesh_open3d(stl_path: Path) -> MeshData:
     """
     Load STL using Open3D and return MeshData.
@@ -1188,7 +1225,8 @@ def process_one_stl(stl_path_str: str, root_dir_str: str, dst_dir_str: str, para
         pre_warns: List[str] = []
         if params.get("distance_method", "mesh") != "mesh":
             raise RuntimeError("distance_method must be 'mesh' with open3d backend.")
-        mesh = load_mesh_open3d(stl_path)
+        mesh, w = load_mesh_for_open3d(stl_path)
+        pre_warns += w
         if params.get("o3d_clean", False) or int(params.get("o3d_subdivide", 0)) > 0:
             mesh, w = open3d_remesh_for_stability(
                 mesh,
