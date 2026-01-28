@@ -21,13 +21,16 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.data._utils.collate import default_collate
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.ops import roi_align
+import torchvision.utils as vutils
 
 from la_loader.synthetic_data_loader import LASyntheticDataset3PerIns
 from la_loader import la_transforms
 
 from models.panoptic_stereo import PanopticStereoMultiHeadLatent, ImplicitSDFHead
 from models.stereo_disparity import make_gn
-from utils import dist_utils
+from utils import dist_utils, rot_utils
+from utils.logging_utils import draw_axes_on_images_bk
+from utils.projection import SilhouetteDepthRenderer
 import train_panoptic_utils as pan_utils
 from train_utils import (
     build_lr_scheduler,
@@ -232,18 +235,217 @@ class _BatchMetaLoader:
 def _extract_sdf_scale(meta, device, dtype) -> torch.Tensor:
     """Return scale factor to convert normalized SDF values to original units."""
     scale = 1.0
-    if isinstance(meta, dict):
-        if bool(meta.get("normalize_to_cube", False)):
-            tr = meta.get("transform", {}) if isinstance(meta.get("transform", {}), dict) else {}
-            raw = tr.get("scale", None)
-            if raw is not None:
-                try:
-                    raw = float(raw)
-                    if raw > 0.0:
-                        scale = 1.0 / raw
-                except Exception:
-                    pass
+    if isinstance(meta, dict) and bool(meta.get("normalize_to_cube", False)):
+        tr = meta.get("transform", {}) if isinstance(meta.get("transform", {}), dict) else {}
+        raw = tr.get("scale", None)
+        if raw is not None:
+            try:
+                raw = float(raw)
+                if raw > 0.0:
+                    scale = 1.0 / raw
+            except Exception:
+                pass
     return torch.tensor(scale, device=device, dtype=dtype)
+
+
+def _aggregate_latent_per_instance(
+    latent_map: torch.Tensor,
+    wks_inst: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Aggregate latent map into per-instance vectors."""
+    if latent_map.shape[-2:] != wks_inst.shape[-2:]:
+        latent_map = F.interpolate(latent_map, size=wks_inst.shape[-2:], mode="bilinear", align_corners=False)
+    wks = wks_inst.to(latent_map.dtype)
+    denom = wks.sum(dim=(3, 4)).clamp_min(eps)
+    lat_sum = (latent_map.unsqueeze(1) * wks).sum(dim=(3, 4))
+    return lat_sum / denom
+
+
+def _compute_t0_from_pos_map(
+    pos_map: torch.Tensor,
+    wks_inst: torch.Tensor,
+    min_wsum: float = 1e-6,
+    min_px: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-instance translation seeds from a point map."""
+    if pos_map.shape[-2:] != wks_inst.shape[-2:]:
+        pos_map = F.interpolate(pos_map, size=wks_inst.shape[-2:], mode="bilinear", align_corners=False)
+    wks = wks_inst.to(pos_map.dtype)
+    w_sum = wks.sum(dim=(2, 3, 4))
+    t0 = (wks * pos_map.unsqueeze(1)).sum(dim=(3, 4)) / w_sum.clamp_min(min_wsum).unsqueeze(-1)
+    valid = (w_sum >= float(min_px)) & torch.isfinite(t0).all(dim=-1)
+    return t0, valid
+
+
+def _log_pose_visuals_sdf(
+    writer: SummaryWriter,
+    step_value: int,
+    prefix: str,
+    stereo: torch.Tensor,
+    pred: dict,
+    inst_gt: torch.Tensor,
+    left_k: torch.Tensor,
+    batch: dict,
+    pos_gt: torch.Tensor,
+    rot_gt: torch.Tensor,
+    n_images: int,
+) -> None:
+    """Log pose and silhouette visualizations using SDF delta-pose outputs."""
+    if writer is None:
+        return
+    if "pose_R_refined" not in pred or "pose_t_refined" not in pred or "pose_valid" not in pred:
+        return
+
+    device = stereo.device
+    meshes_flat, valid_k = pan_utils._build_meshes_from_batch(batch, device)
+    if meshes_flat is None or valid_k.numel() == 0:
+        return
+
+    size_hw = pred["pos_mu"].shape[-2:]
+    inst_hw = pan_utils._downsample_label(inst_gt, size_hw)
+    wks, _ = pan_utils._build_instance_weight_map(inst_hw, valid_k)
+
+    R_pred = pred["pose_R_refined"]
+    t_pred = pred["pose_t_refined"]
+    v_pred = pred["pose_valid"].to(dtype=torch.bool)
+
+    image_size = (stereo.shape[-2], stereo.shape[-1])
+    origin_in = pan_utils._origin_in_image_from_t(pos_gt, left_k[:, 0], image_size)
+    valid_render = valid_k & origin_in
+    valid_pred = v_pred & valid_render
+    valid_gt = valid_render
+
+    T_pred = rot_utils.compose_T_from_Rt(R_pred, t_pred, valid_pred)
+    T_gt = rot_utils.compose_T_from_Rt(rot_gt, pos_gt, valid_gt)
+
+    meshes_flat = pan_utils._build_meshes_from_batch_filtered(batch, valid_render, device)
+    if meshes_flat is None:
+        return
+
+    renderer = SilhouetteDepthRenderer().to(device)
+    meshes_flat = meshes_flat.to(device)
+    T_pred = T_pred.to(dtype=torch.float32)
+    T_gt = T_gt.to(dtype=torch.float32)
+    K_left = left_k[:, 0].to(dtype=torch.float32)
+    autocast_device = "cuda" if device.type == "cuda" else "cpu"
+    with torch.amp.autocast(autocast_device, enabled=False):
+        pred_r = renderer(
+            meshes_flat=meshes_flat,
+            T_cam_obj=T_pred,
+            K_left=K_left,
+            valid_k=valid_render,
+            image_size=image_size,
+        )
+        gt_r = renderer(
+            meshes_flat=meshes_flat,
+            T_cam_obj=T_gt,
+            K_left=K_left,
+            valid_k=valid_render,
+            image_size=image_size,
+        )
+    sil_pred = pred_r["silhouette"]
+    sil_gt = gt_r["silhouette"]
+
+    overlay_pred = pan_utils._overlay_mask_rgb(
+        stereo[:n_images, :3], sil_pred[:n_images], color=(0.0, 1.0, 0.0), alpha=0.45
+    )
+    overlay_gt = pan_utils._overlay_mask_rgb(
+        stereo[:n_images, :3], sil_gt[:n_images], color=(1.0, 0.0, 0.0), alpha=0.45
+    )
+    overlay_both = pan_utils._overlay_mask_rgb(overlay_gt, sil_pred[:n_images], color=(0.0, 1.0, 0.0), alpha=0.45)
+
+    axes_pred = draw_axes_on_images_bk(
+        overlay_pred,
+        left_k[:n_images, 0],
+        T_pred[:n_images],
+        axis_len=50,
+        valid=valid_pred[:n_images],
+    )
+    axes_gt = draw_axes_on_images_bk(
+        overlay_gt,
+        left_k[:n_images, 0],
+        T_gt[:n_images],
+        axis_len=50,
+        valid=valid_gt[:n_images],
+    )
+
+    grid = vutils.make_grid(
+        torch.cat([stereo[:n_images, :3], axes_pred, axes_gt, overlay_both], dim=0),
+        nrow=4,
+        normalize=True,
+        scale_each=True,
+    )
+    writer.add_image(f"{prefix}/vis_pose_sil_sdf", grid, step_value)
+
+
+def _compute_pos_only_adds_metrics(
+    pred: Dict[str, torch.Tensor],
+    batch: Dict[str, Any],
+    sem_gt: torch.Tensor,
+    inst_gt_hw: torch.Tensor,
+    size_hw: Tuple[int, int],
+    left_k: torch.Tensor,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute ADD/ADD-S using GT rotations for translation-only predictions."""
+    zero = pred["disp_1x"].new_tensor(0.0)
+    if "pos_mu" not in pred:
+        return zero, zero, zero
+
+    pos_gt_map, rot_gt_map, _, _ = pan_utils._prepare_pose_targets(batch, sem_gt, size_hw, device)
+    if pos_gt_map is None or rot_gt_map is None:
+        return zero, zero, zero
+
+    valid_k = pan_utils._build_valid_k_from_inst(inst_gt_hw)
+    if valid_k.numel() == 0:
+        return zero, zero, zero
+    wks_inst, wfg_inst = pan_utils._build_instance_weight_map(inst_gt_hw, valid_k)
+
+    pos_map_pred = pan_utils.pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
+    r_pred, t_pred, v_pred, _, _ = rot_utils.pose_from_maps_auto(
+        rot_map=rot_gt_map,
+        pos_map=pos_map_pred,
+        Wk_1_4=wks_inst,
+        wfg=wfg_inst,
+        min_px=10,
+        min_wsum=1e-6,
+    )
+    r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
+        rot_map=rot_gt_map,
+        pos_map=pos_gt_map,
+        Wk_1_4=wks_inst,
+        wfg=wfg_inst,
+        min_px=10,
+        min_wsum=1e-6,
+    )
+    valid_inst = v_pred & v_gt & valid_k
+    if not valid_inst.any():
+        return zero, zero, valid_inst.sum().to(dtype=zero.dtype)
+
+    model_points, _ = pan_utils._build_model_points_from_batch(batch, device)
+    if model_points is None:
+        return zero, zero, valid_inst.sum().to(dtype=zero.dtype)
+
+    adds = pan_utils._adds_core_from_Rt_no_norm(
+        r_pred,
+        t_pred,
+        r_gt,
+        t_gt,
+        model_points,
+        use_symmetric=True,
+        valid_mask=valid_inst,
+    )
+    add = pan_utils._adds_core_from_Rt_no_norm(
+        r_pred,
+        t_pred,
+        r_gt,
+        t_gt,
+        model_points,
+        use_symmetric=False,
+        valid_mask=valid_inst,
+    )
+    return adds, add, valid_inst.sum().to(dtype=adds.dtype)
 
 
 def _prepare_pose_maps(
@@ -387,7 +589,7 @@ def _build_sdf_targets(
             sdf_vals = _sample_sdf_volume(sdf_vol, coords_norm)
 
             scale = _extract_sdf_scale(meta_objs[k], device, sdf_vals.dtype)
-            sdf_vals = sdf_vals * scale
+            sdf_vals = (sdf_vals * scale).to(dtype=sdf_gt.dtype)
 
             flat_idx = idx[:, 0] * W + idx[:, 1]
             sdf_gt_flat[flat_idx] = sdf_vals
@@ -413,6 +615,63 @@ def _sdf_nll_laplace_map(
     valid_f = valid.to(nll.dtype)
     return (nll * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
+
+def _build_sdf_hist_weights(
+    sdf_gt: torch.Tensor,
+    sdf_valid: torch.Tensor,
+    cfg: dict,
+) -> Optional[torch.Tensor]:
+    """Build per-pixel weights to flatten |SDF| histogram."""
+    n_bins = int(cfg.get("loss", {}).get("sdf_hist_bins", 0))
+    if n_bins <= 0:
+        return None
+    abs_sdf = sdf_gt.abs()
+    valid = sdf_valid
+    abs_valid = abs_sdf[valid]
+    if abs_valid.numel() == 0:
+        return None
+
+    max_dist = float(cfg.get("loss", {}).get("sdf_hist_max", 0.0))
+    if max_dist <= 0.0:
+        max_dist = float(abs_valid.max().item())
+    max_dist = max(max_dist, 1e-6)
+
+    clipped = abs_sdf.clamp(max=max_dist)
+    bin_idx = torch.clamp((clipped / max_dist * n_bins).long(), max=n_bins - 1)
+    bin_idx_valid = bin_idx[valid]
+
+    counts = torch.bincount(bin_idx_valid, minlength=n_bins).to(dtype=abs_sdf.dtype)
+    smooth = float(cfg.get("loss", {}).get("sdf_hist_smooth", 1.0))
+    if smooth > 0.0:
+        counts = counts + smooth
+    inv = 1.0 / counts.clamp_min(1e-6)
+    w_valid = inv[bin_idx_valid]
+    w_mean = w_valid.mean().clamp_min(1e-6)
+    inv = inv / w_mean
+
+    weight_map = torch.zeros_like(abs_sdf)
+    weight_map[valid] = inv[bin_idx_valid]
+    return weight_map
+
+
+def _sdf_nll_laplace_weighted(
+    pred: torch.Tensor,
+    logvar: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    weight: torch.Tensor,
+    charb_eps: float = 0.0,
+) -> torch.Tensor:
+    """Compute weighted heteroscedastic Laplace NLL for SDF maps."""
+    r = pred - target
+    if charb_eps > 0.0:
+        abs_r = torch.sqrt(r * r + (charb_eps * charb_eps))
+    else:
+        abs_r = r.abs()
+    nll = abs_r * torch.exp(-0.5 * logvar) + 0.5 * logvar
+    valid_f = valid.to(nll.dtype)
+    w = weight.to(nll.dtype) * valid_f
+    return (nll * w).sum() / w.sum().clamp_min(1.0)
 
 def _compute_sdf_map_loss(
     pred: Dict[str, torch.Tensor],
@@ -463,7 +722,13 @@ def _compute_sdf_map_loss(
         return {"loss_sdf": zero, "sdf_valid_px": zero}
 
     charb_eps = float(cfg.get("loss", {}).get("sdf_charb_eps", 0.0))
-    loss_sdf = _sdf_nll_laplace_map(sdf_pred, sdf_logvar, sdf_gt, sdf_valid, charb_eps=charb_eps)
+    weight_map = _build_sdf_hist_weights(sdf_gt, sdf_valid, cfg)
+    if weight_map is None:
+        loss_sdf = _sdf_nll_laplace_map(sdf_pred, sdf_logvar, sdf_gt, sdf_valid, charb_eps=charb_eps)
+    else:
+        loss_sdf = _sdf_nll_laplace_weighted(
+            sdf_pred, sdf_logvar, sdf_gt, sdf_valid, weight_map, charb_eps=charb_eps
+        )
     return {"loss_sdf": loss_sdf, "sdf_valid_px": valid_px}
 
 class InstanceLatentHead(nn.Module):
@@ -784,17 +1049,37 @@ def _build_extra_loss_fn(cfg: dict):
     w_sdf_map = float(loss_cfg.get("w_sdf", 0.0))
     w_implicit = float(loss_cfg.get("w_implicit_sdf", 1.0))
     w_consistency = float(loss_cfg.get("w_sdf_consistency", 1.0))
+    log_pos_adds = bool(loss_cfg.get("log_pos_adds", True))
+    pose_cfg = cfg.get("pose_refine", {}) or {}
+    pose_refine_enabled = bool(pose_cfg.get("enabled", False))
+    use_r0_if_available = bool(pose_cfg.get("use_r0_if_available", True))
+    w_pose_energy = float(loss_cfg.get("w_pose_refine_energy", 0.0))
+    w_pose_gt_rot = float(loss_cfg.get("w_pose_gt_rot", 0.0))
+    w_pose_gt_trans = float(loss_cfg.get("w_pose_gt_trans", 0.0))
 
     def _extra_loss(context: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         pred = context["pred"]
         batch = context["batch"]
+        sem_gt = context["sem_gt"]
         inst_gt_hw = context["inst_gt_hw"]
         size_hw = context["size_hw"]
+        left_k = context["left_k"]
         model = context["model"]
         device = context["device"]
+        writer = context.get("writer", None)
+        epoch = int(context.get("epoch", 0))
+        it = int(context.get("it", 0))
+        global_step = int(context.get("global_step", epoch))
+        log_interval = int(context.get("log_interval", 1))
+        phase = str(context.get("phase", "train"))
+        stereo = context.get("stereo", None)
+        inst_gt = context.get("inst_gt", None)
+        wks_inst = context.get("wks_inst", None)
+        wfg_inst = context.get("wfg_inst", None)
 
         total = pred["disp_1x"].new_tensor(0.0)
         logs: Dict[str, torch.Tensor] = {}
+        has_pose_refine = False
 
         if w_sdf_map > 0.0:
             sdf_out = _compute_sdf_map_loss(pred, batch, inst_gt_hw, size_hw, device, cfg)
@@ -802,6 +1087,172 @@ def _build_extra_loss_fn(cfg: dict):
             total = total + w_sdf_map * loss_sdf
             logs["L_sdf_map"] = loss_sdf.detach()
             logs["L_sdf_map_valid_px"] = sdf_out["sdf_valid_px"].detach()
+
+        if pose_refine_enabled and wks_inst is not None:
+            implicit_head = _get_model_attr(model, "implicit_sdf_head")
+            if implicit_head is not None and pred.get("latent_map", None) is not None:
+                latent_map = pred["latent_map"].to(torch.float32)
+                z_inst = _aggregate_latent_per_instance(latent_map, wks_inst)
+                pos_map_pred = pan_utils.pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
+                t0, t0_valid = _compute_t0_from_pos_map(
+                    pos_map_pred,
+                    wks_inst,
+                    min_wsum=float(pose_cfg.get("min_wsum", 1e-6)),
+                    min_px=int(pose_cfg.get("min_px", 30)),
+                )
+                R0 = pred.get("pose_R", None) if use_r0_if_available else None
+                sym_axes, sym_orders = pan_utils._prepare_symmetry_tensors(batch, device, wks_inst.shape[1])
+
+                def _implicit_query(z_in: torch.Tensor, x_in: torch.Tensor) -> torch.Tensor:
+                    sdf, _ = implicit_head(z_in, x_in)
+                    return sdf
+
+                pose_out = pan_utils.pose_refine_implicit_sdf(
+                    z_inst=z_inst,
+                    point_map_1x=pred["point_map_1x"],
+                    point_conf_1x=pred.get("point_map_conf_1x", None),
+                    inst_map=inst_gt_hw,
+                    wks_inst=wks_inst,
+                    pos_map=pos_map_pred,
+                    t0=t0,
+                    R0=R0,
+                    sym_axes=sym_axes,
+                    sym_orders=sym_orders,
+                    cfg=cfg,
+                    implicit_sdf_fn=_implicit_query,
+                    is_train=(phase == "train"),
+                )
+
+                pred.update(
+                    {
+                        "pose_R_refined": pose_out["pose_R_refined"],
+                        "pose_t_refined": pose_out["pose_t_refined"],
+                        "pose_valid": pose_out["pose_valid"],
+                        "best_hyp": pose_out["best_hyp"],
+                        "E_hyp": pose_out["E_hyp"],
+                        "E_hist": pose_out["E_hist"],
+                        "inlier_frac_hist": pose_out["inlier_frac_hist"],
+                    }
+                )
+                if "rot_mat" not in pred:
+                    pred.update(
+                        {
+                            "pose_R": pose_out["pose_R_refined"],
+                            "pose_t": pose_out["pose_t_refined"],
+                            "pose_valid": pose_out["pose_valid"],
+                        }
+                    )
+
+                pose_valid = pose_out["pose_valid"]
+                best_idx = pose_out["best_hyp"].clamp_min(0).unsqueeze(-1)
+                E_best = pose_out["E_hyp"].gather(-1, best_idx).squeeze(-1)
+                valid_f = pose_valid.to(E_best.dtype)
+                if valid_f.sum().item() > 0:
+                    loss_pose_energy = (E_best * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+                else:
+                    loss_pose_energy = E_best.sum() * 0.0
+                if w_pose_energy > 0.0:
+                    total = total + w_pose_energy * loss_pose_energy
+                logs["L_pose_refine_energy"] = loss_pose_energy.detach()
+                logs["L_pose_refine_valid"] = valid_f.sum().detach()
+                has_pose_refine = True
+
+                if pose_out["inlier_frac_hist"].numel() > 0:
+                    inlier_last = pose_out["inlier_frac_hist"][..., -1]
+                    inlier_best = inlier_last.gather(-1, best_idx).squeeze(-1)
+                    logs["L_pose_refine_inlier_frac"] = (
+                        (inlier_best * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+                    ).detach()
+
+                need_pose_gt = (w_pose_gt_rot > 0.0) or (w_pose_gt_trans > 0.0) or log_pos_adds
+                if need_pose_gt:
+                    pos_gt_map, rot_gt_map, _, _ = pan_utils._prepare_pose_targets(
+                        batch, sem_gt, size_hw, device
+                    )
+                    if pos_gt_map is not None and rot_gt_map is not None:
+                        r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
+                            rot_map=rot_gt_map,
+                            pos_map=pos_gt_map,
+                            Wk_1_4=wks_inst,
+                            wfg=wfg_inst,
+                            min_px=10,
+                            min_wsum=1e-6,
+                        )
+                        r_pred = pose_out["pose_R_refined"]
+                        t_pred = pose_out["pose_t_refined"]
+                        sym_axes, sym_orders = pan_utils._prepare_symmetry_tensors(batch, device, wks_inst.shape[1])
+                        r_gt_use = r_gt
+                        if sym_axes is not None and sym_orders is not None:
+                            r_gt_use, _ = rot_utils.align_pose_by_symmetry_min_rotation(
+                                r_pred, r_gt, sym_axes, sym_orders
+                            )
+                        valid_inst = pose_valid & v_gt
+                        if valid_inst.any():
+                            if w_pose_gt_rot > 0.0 or w_pose_gt_trans > 0.0:
+                                r_rel = torch.matmul(r_pred.transpose(-1, -2), r_gt_use)
+                                rotvec = rot_utils.so3_log_batch(r_rel.reshape(-1, 3, 3)).reshape_as(r_pred[..., 0])
+                                rot_err = rotvec.norm(dim=-1)
+                                t_err = (t_pred - t_gt).abs().sum(dim=-1)
+                                rot_loss = (rot_err * valid_inst.to(rot_err.dtype)).sum() / valid_inst.sum().clamp_min(
+                                    1.0
+                                )
+                                trans_loss = (t_err * valid_inst.to(t_err.dtype)).sum() / valid_inst.sum().clamp_min(
+                                    1.0
+                                )
+                                if w_pose_gt_rot > 0.0:
+                                    total = total + w_pose_gt_rot * rot_loss
+                                if w_pose_gt_trans > 0.0:
+                                    total = total + w_pose_gt_trans * trans_loss
+                                logs["L_pose_refine_rot_rad"] = rot_loss.detach()
+                                logs["L_pose_refine_trans_l1"] = trans_loss.detach()
+
+                            if log_pos_adds:
+                                model_points, _ = pan_utils._build_model_points_from_batch(batch, device)
+                                if model_points is not None:
+                                    adds = pan_utils._adds_core_from_Rt_no_norm(
+                                        r_pred,
+                                        t_pred,
+                                        r_gt_use,
+                                        t_gt,
+                                        model_points,
+                                        use_symmetric=True,
+                                        valid_mask=valid_inst,
+                                    )
+                                    add = pan_utils._adds_core_from_Rt_no_norm(
+                                        r_pred,
+                                        t_pred,
+                                        r_gt_use,
+                                        t_gt,
+                                        model_points,
+                                        use_symmetric=False,
+                                        valid_mask=valid_inst,
+                                    )
+                                    logs["L_adds"] = adds.detach()
+                                    logs["L_add"] = add.detach()
+                                    logs["L_adds_valid_inst"] = valid_inst.sum().detach()
+
+                if writer is not None and dist_utils.is_main_process():
+                    should_log = False
+                    if phase == "train":
+                        should_log = (log_interval > 0) and (it % log_interval == 0)
+                    else:
+                        should_log = it == 0
+                    if should_log and stereo is not None and inst_gt is not None:
+                        objs_in_left, _ = pan_utils._build_objs_in_left_from_batch(batch, device)
+                        if objs_in_left is not None:
+                            _log_pose_visuals_sdf(
+                                writer,
+                                global_step,
+                                phase,
+                                stereo,
+                                pred,
+                                inst_gt,
+                                left_k,
+                                batch,
+                                objs_in_left[..., :3, 3],
+                                objs_in_left[..., :3, :3],
+                                n_images=min(4, stereo.size(0)),
+                            )
 
         if use_implicit:
             imp_out = _compute_implicit_sdf_loss(pred, batch, inst_gt_hw, model, device, cfg)
@@ -817,11 +1268,26 @@ def _build_extra_loss_fn(cfg: dict):
             logs["L_sdf_consistency"] = loss_cons.detach()
             logs["L_sdf_consistency_valid_pts"] = cons_out["valid_pts"].detach()
 
+        if not has_pose_refine and log_pos_adds and "rot_mat" not in pred:
+            with torch.no_grad():
+                adds, add, valid_inst = _compute_pos_only_adds_metrics(
+                    pred=pred,
+                    batch=batch,
+                    sem_gt=sem_gt,
+                    inst_gt_hw=inst_gt_hw,
+                    size_hw=size_hw,
+                    left_k=left_k,
+                    device=device,
+                )
+            logs["L_adds"] = adds.detach()
+            logs["L_add"] = add.detach()
+            logs["L_adds_valid_inst"] = valid_inst.detach()
+
         if total.item() == 0.0 and not logs:
             return {}
         return {"loss": total, "logs": logs}
 
-    if not (w_sdf_map > 0.0 or use_implicit or use_consistency):
+    if not (w_sdf_map > 0.0 or use_implicit or use_consistency or log_pos_adds or pose_refine_enabled):
         return None
     return _extra_loss
 
@@ -849,7 +1315,6 @@ def build_model(cfg: dict, num_classes: int) -> nn.Module:
     head_downsample = int(seg_cfg.get("head_downsample", 4))
     latent_dim = int(latent_cfg.get("latent_dim", seg_cfg.get("latent_dim", 16)))
     latent_l2_norm = bool(latent_cfg.get("latent_l2_norm", True))
-
     model = PanopticStereoMultiHeadLatent(
         levels=int(mcfg.get("levels", 4)),
         norm_layer=make_gn(16),
@@ -873,7 +1338,13 @@ def build_model(cfg: dict, num_classes: int) -> nn.Module:
     )
 
     loss_cfg = cfg.get("loss", {}) or {}
-    use_implicit = bool(loss_cfg.get("use_implicit_sdf", False)) or bool(loss_cfg.get("use_sdf_consistency", False))
+    pose_cfg = cfg.get("pose_refine", {}) or {}
+    pose_refine_enabled = bool(pose_cfg.get("enabled", False))
+    use_implicit = (
+        bool(loss_cfg.get("use_implicit_sdf", False))
+        or bool(loss_cfg.get("use_sdf_consistency", False))
+        or pose_refine_enabled
+    )
     if use_implicit:
         implicit_cfg = cfg.get("implicit_sdf", {}) or {}
         z_dim = int(implicit_cfg.get("z_dim", latent_dim))

@@ -14,3 +14,5 @@ tensorboard --logdir outputs/run_debug
 
 torchrun --nproc_per_node=2 --master_port=29501  train_stereo_la_with_instance_seg.py --launcher pytorch --config configs/config_full_panoptic.toml
 torchrun --nproc_per_node=4 --master_port=29501  train_stereo_la_with_instance_seg.py --launcher pytorch --config configs/config_full_panoptic.toml
+torchrun --nproc_per_node=2 --master_port=29501  train_stereo_la_with_instance_seg_latent.py --launcher pytorch --config configs/config_full_panoptic.toml
+torchrun --nproc_per_node=4 --master_port=29501  train_stereo_la_with_instance_seg_latent.py --launcher pytorch --config configs/config_full_panoptic.toml

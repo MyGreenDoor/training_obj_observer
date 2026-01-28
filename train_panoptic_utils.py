@@ -6,6 +6,8 @@ Panoptic stereo training utilities (non-SDF).
 import argparse
 import os
 import platform
+import math
+import contextlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Literal
@@ -1320,6 +1322,463 @@ def _origin_in_image_from_t(
     return in_img
 
 
+_CUBE24_CACHE: Dict[Tuple[str, str], torch.Tensor] = {}
+
+
+def _cube24_rotations(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Generate 24 cube rotations (det=+1) as rotation matrices."""
+    key = (str(device), str(dtype))
+    cached = _CUBE24_CACHE.get(key, None)
+    if cached is not None:
+        return cached
+    mats: List[torch.Tensor] = []
+    axes = [0, 1, 2]
+    signs = [-1.0, 1.0]
+    for perm in [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]:
+        for sx in signs:
+            for sy in signs:
+                for sz in signs:
+                    R = torch.zeros((3, 3), dtype=torch.float32)
+                    R[0, perm[0]] = sx
+                    R[1, perm[1]] = sy
+                    R[2, perm[2]] = sz
+                    if torch.det(R) > 0.0:
+                        mats.append(R)
+    if len(mats) != 24:
+        raise ValueError(f"cube24 rotations count mismatch: {len(mats)}")
+    out = torch.stack(mats, dim=0).to(device=device, dtype=dtype)
+    _CUBE24_CACHE[key] = out
+    return out
+
+
+def _axis_rotations(axis: torch.Tensor, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Generate rotations around a given axis (n steps)."""
+    if n <= 0:
+        return torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+    axis = axis.to(device=device, dtype=dtype)
+    axis = axis / axis.norm().clamp_min(1e-6)
+    angles = torch.arange(n, device=device, dtype=dtype) * (2.0 * math.pi / float(n))
+    rotvec = axis.view(1, 3) * angles.view(-1, 1)
+    return rot_utils.so3_exp_batch(rotvec)
+
+
+def _quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
+    """Convert unit quaternion (w,x,y,z) to rotation matrix."""
+    w, x, y, z = q.unbind(dim=-1)
+    ww = w * w
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    wx = w * x
+    wy = w * y
+    wz = w * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    m00 = ww + xx - yy - zz
+    m01 = 2.0 * (xy - wz)
+    m02 = 2.0 * (xz + wy)
+    m10 = 2.0 * (xy + wz)
+    m11 = ww - xx + yy - zz
+    m12 = 2.0 * (yz - wx)
+    m20 = 2.0 * (xz - wy)
+    m21 = 2.0 * (yz + wx)
+    m22 = ww - xx - yy + zz
+    return torch.stack(
+        [
+            torch.stack([m00, m01, m02], dim=-1),
+            torch.stack([m10, m11, m12], dim=-1),
+            torch.stack([m20, m21, m22], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
+def _random_rotations(
+    num: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Sample random rotations (approx uniform) using random quaternions."""
+    if num <= 0:
+        return torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+    u1 = torch.rand(num, device=device, dtype=dtype, generator=generator)
+    u2 = torch.rand(num, device=device, dtype=dtype, generator=generator)
+    u3 = torch.rand(num, device=device, dtype=dtype, generator=generator)
+    r1 = torch.sqrt(1.0 - u1)
+    r2 = torch.sqrt(u1)
+    t1 = 2.0 * math.pi * u2
+    t2 = 2.0 * math.pi * u3
+    q = torch.stack(
+        [
+            r2 * torch.cos(t2),
+            r1 * torch.sin(t1),
+            r1 * torch.cos(t1),
+            r2 * torch.sin(t2),
+        ],
+        dim=-1,
+    )
+    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    return _quat_to_rotmat(q).to(dtype=dtype)
+
+
+def _select_rotations(
+    R: torch.Tensor,
+    num: int,
+    is_train: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Select or pad rotations to fixed count."""
+    if num <= 0:
+        eye = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+        return eye, torch.ones(1, device=device, dtype=torch.bool)
+    if R.numel() == 0:
+        eye = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+        return eye.repeat(num, 1, 1), torch.zeros(num, device=device, dtype=torch.bool)
+
+    H = R.size(0)
+    if H >= num:
+        if is_train and H > num:
+            perm = torch.randperm(H, device=device)[:num]
+            R_sel = R[perm]
+        else:
+            R_sel = R[:num]
+        return R_sel, torch.ones(num, device=device, dtype=torch.bool)
+
+    pad = num - H
+    eye = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(pad, 1, 1)
+    R_sel = torch.cat([R, eye], dim=0)
+    valid = torch.zeros(num, device=device, dtype=torch.bool)
+    valid[:H] = True
+    return R_sel, valid
+
+
+def _build_base_rotations(
+    cfg: dict,
+    num: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    is_train: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build base rotation hypotheses."""
+    init_set = str(cfg.get("init_rot_set", "cube24")).lower()
+    if init_set == "cube24":
+        R = _cube24_rotations(device, dtype)
+    elif init_set == "icosa60":
+        gen = torch.Generator(device=device)
+        gen.manual_seed(0)
+        R = _random_rotations(60, device, dtype, generator=gen)
+    elif init_set == "random":
+        R = _random_rotations(num, device, dtype, generator=None if is_train else torch.Generator(device=device).manual_seed(0))
+    elif init_set == "axisn":
+        n = max(1, int(cfg.get("axisN_default", num)))
+        axis = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+        R = _axis_rotations(axis, n, device, dtype)
+    elif init_set == "none":
+        R = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+    else:
+        R = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+    return _select_rotations(R, num, is_train, device, dtype)
+
+
+def _build_symmetry_rotations(
+    cfg: dict,
+    device: torch.device,
+    dtype: torch.dtype,
+    axis: Optional[torch.Tensor] = None,
+    order: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build symmetry rotations for a single instance."""
+    mode = str(cfg.get("symmetry_mode", "none")).lower()
+    if mode == "none":
+        R = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+        valid = torch.ones(1, device=device, dtype=torch.bool)
+        return R, valid
+    if mode == "cube24":
+        R = _cube24_rotations(device, dtype)
+        valid = torch.ones(R.size(0), device=device, dtype=torch.bool)
+        return R, valid
+    if mode == "axisn_from_batch":
+        n_default = int(cfg.get("axisN_default", 16))
+        n = n_default
+        if order is not None:
+            try:
+                n = int(torch.as_tensor(order).item())
+            except Exception:
+                n = n_default
+        if n <= 0:
+            n = n_default
+        if axis is None or not torch.isfinite(axis).all():
+            axis = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+        R = _axis_rotations(axis, n, device, dtype)
+        valid = torch.ones(R.size(0), device=device, dtype=torch.bool)
+        return R, valid
+    R = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+    valid = torch.ones(1, device=device, dtype=torch.bool)
+    return R, valid
+
+
+def _sample_instance_points_from_point_map(
+    point_map: torch.Tensor,
+    inst_map: torch.Tensor,
+    conf_map: Optional[torch.Tensor],
+    n_points: int,
+    conf_thr: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample per-instance 3D points from a point map."""
+    B, _, H, W = point_map.shape
+    max_id = int(inst_map.max().item()) if inst_map.numel() > 0 else 0
+    pts = point_map.new_zeros((B, max_id, n_points, 3))
+    wts = point_map.new_zeros((B, max_id, n_points))
+    valid_pts = torch.zeros((B, max_id, n_points), device=point_map.device, dtype=torch.bool)
+    valid_inst = torch.zeros((B, max_id), device=point_map.device, dtype=torch.bool)
+    if max_id <= 0:
+        return pts, wts, valid_pts, valid_inst
+
+    conf_mask = None
+    if conf_map is not None:
+        conf_mask = conf_map.squeeze(1) >= float(conf_thr)
+
+    for b in range(B):
+        for k in range(max_id):
+            inst_id = k + 1
+            mask = inst_map[b] == inst_id
+            if conf_mask is not None:
+                mask = mask & conf_mask[b]
+            idx = torch.nonzero(mask, as_tuple=False)
+            if idx.numel() == 0:
+                continue
+            valid_inst[b, k] = True
+            if idx.size(0) > n_points:
+                perm = torch.randperm(idx.size(0), device=point_map.device)[:n_points]
+                idx = idx[perm]
+            sel = point_map[b, :, idx[:, 0], idx[:, 1]].transpose(0, 1)
+            pts[b, k, : sel.size(0)] = sel
+            valid_pts[b, k, : sel.size(0)] = True
+            if conf_map is not None:
+                w = conf_map[b, 0, idx[:, 0], idx[:, 1]]
+            else:
+                w = point_map.new_ones((sel.size(0),))
+            wts[b, k, : w.size(0)] = w
+    return pts, wts, valid_pts, valid_inst
+
+
+def pose_refine_implicit_sdf(
+    *,
+    z_inst: torch.Tensor,
+    point_map_1x: torch.Tensor,
+    point_conf_1x: Optional[torch.Tensor],
+    inst_map: Optional[torch.Tensor] = None,
+    wks_inst: Optional[torch.Tensor] = None,
+    pos_map: Optional[torch.Tensor] = None,
+    t0: Optional[torch.Tensor] = None,
+    R0: Optional[torch.Tensor] = None,
+    sym_axes: Optional[torch.Tensor] = None,
+    sym_orders: Optional[torch.Tensor] = None,
+    cfg: dict = None,
+    implicit_sdf_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+    is_train: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """Refine pose using implicit SDF consistency with multi-hypotheses."""
+    if cfg is None:
+        cfg = {}
+    pose_cfg = cfg.get("pose_refine", {}) or {}
+    enabled = bool(pose_cfg.get("enabled", False))
+    B, K, _ = z_inst.shape
+    device = z_inst.device
+    dtype = z_inst.dtype
+    num_hyp = int(pose_cfg.get("num_hyp_train", 8 if is_train else 24))
+    if not is_train:
+        num_hyp = int(pose_cfg.get("num_hyp_test", num_hyp))
+    if num_hyp <= 0:
+        num_hyp = 1
+    refine_steps = int(pose_cfg.get("refine_steps_train", 1 if is_train else 4))
+    if not is_train:
+        refine_steps = int(pose_cfg.get("refine_steps_test", refine_steps))
+    n_points = int(pose_cfg.get("sample_M", 256))
+    conf_thr = float(pose_cfg.get("conf_thr", 0.0))
+    robust = str(pose_cfg.get("robust", "charbonnier")).lower()
+    charb_eps = float(pose_cfg.get("charb_eps", 0.5))
+    huber_tau = float(pose_cfg.get("huber_tau", 2.0))
+    inlier_tau = float(pose_cfg.get("sdf_inlier_tau", 2.0))
+    max_drot_deg = float(pose_cfg.get("max_drot_deg", 5.0))
+    max_dt = float(pose_cfg.get("max_dt_mm", 10.0))
+    lr_rot = float(pose_cfg.get("lr_rot", 0.2))
+    lr_trans = float(pose_cfg.get("lr_trans", 0.5))
+    min_px = int(pose_cfg.get("min_px", 30))
+    min_wsum = float(pose_cfg.get("min_wsum", 1e-6))
+
+    pose_R = torch.eye(3, device=device, dtype=dtype).view(1, 1, 3, 3).repeat(B, K, 1, 1)
+    pose_t = torch.zeros((B, K, 3), device=device, dtype=dtype)
+    pose_valid = torch.zeros((B, K), device=device, dtype=torch.bool)
+    best_hyp = torch.full((B, K), -1, device=device, dtype=torch.long)
+    init_energy = 1e6
+    E_hyp = torch.full((B, K, num_hyp), init_energy, device=device, dtype=torch.float32)
+    E_hist = torch.full((B, K, num_hyp, max(1, refine_steps)), init_energy, device=device, dtype=torch.float32)
+    inlier_hist = torch.zeros((B, K, num_hyp, max(1, refine_steps)), device=device, dtype=torch.float32)
+
+    if not enabled or implicit_sdf_fn is None:
+        return {
+            "pose_R_refined": pose_R,
+            "pose_t_refined": pose_t,
+            "pose_valid": pose_valid,
+            "best_hyp": best_hyp,
+            "E_hyp": E_hyp,
+            "E_hist": E_hist,
+            "inlier_frac_hist": inlier_hist,
+        }
+
+    if inst_map is None:
+        if wks_inst is None:
+            return {
+                "pose_R_refined": pose_R,
+                "pose_t_refined": pose_t,
+                "pose_valid": pose_valid,
+                "best_hyp": best_hyp,
+                "E_hyp": E_hyp,
+                "E_hist": E_hist,
+                "inlier_frac_hist": inlier_hist,
+            }
+        inst_map = wks_inst.squeeze(2).argmax(dim=1) + 1
+    if inst_map.shape[-2:] != point_map_1x.shape[-2:]:
+        inst_map = (
+            F.interpolate(inst_map.unsqueeze(1).float(), size=point_map_1x.shape[-2:], mode="nearest")
+            .squeeze(1)
+            .to(inst_map.dtype)
+        )
+
+    p_cam, w_pts, valid_pts, valid_inst = _sample_instance_points_from_point_map(
+        point_map_1x,
+        inst_map,
+        point_conf_1x,
+        n_points=n_points,
+        conf_thr=conf_thr,
+    )
+    if t0 is None:
+        if pos_map is not None and wks_inst is not None:
+            if pos_map.shape[-2:] != wks_inst.shape[-2:]:
+                pos_map = F.interpolate(pos_map, size=wks_inst.shape[-2:], mode="bilinear", align_corners=False)
+            w_sum = wks_inst.sum(dim=(3, 4)).clamp_min(min_wsum)
+            t0 = (wks_inst * pos_map.unsqueeze(1)).sum(dim=(3, 4)) / w_sum
+            valid_t0 = (wks_inst.sum(dim=(3, 4)) >= min_px) & torch.isfinite(t0).all(dim=-1)
+        else:
+            t0 = torch.zeros((B, K, 3), device=device, dtype=dtype)
+            valid_t0 = torch.zeros((B, K), device=device, dtype=torch.bool)
+    else:
+        if wks_inst is not None:
+            valid_t0 = (wks_inst.sum(dim=(2, 3, 4)) >= min_px) & torch.isfinite(t0).all(dim=-1)
+        else:
+            valid_t0 = torch.isfinite(t0).all(dim=-1)
+
+    for b in range(B):
+        for k in range(K):
+            if not valid_inst[b, k]:
+                continue
+            if not valid_t0[b, k]:
+                continue
+            if valid_pts[b, k].sum().item() < max(1, min_px):
+                continue
+
+            z = z_inst[b, k].to(torch.float32)
+            p = p_cam[b, k].to(torch.float32)
+            w = w_pts[b, k].to(torch.float32)
+            vmask = valid_pts[b, k]
+            if vmask.sum().item() == 0:
+                continue
+
+            R_base, base_valid = _build_base_rotations(pose_cfg, num_hyp, device, torch.float32, is_train)
+            if R0 is not None:
+                R0_k = R0[b, k].to(torch.float32)
+                R_base = torch.matmul(R0_k.unsqueeze(0), R_base)
+            sym_axis = sym_axes[b, k] if sym_axes is not None else None
+            sym_order = sym_orders[b, k] if sym_orders is not None else None
+            G, _ = _build_symmetry_rotations(pose_cfg, device, torch.float32, sym_axis, sym_order)
+            R_candidates = torch.matmul(R_base.unsqueeze(1), G.unsqueeze(0)).reshape(-1, 3, 3)
+            R_candidates, hyp_valid = _select_rotations(
+                R_candidates, num_hyp, is_train, device, torch.float32
+            )
+            if hyp_valid.sum().item() == 0:
+                continue
+
+            rotvec = rot_utils.so3_log_batch(R_candidates).detach()
+            t = t0[b, k].view(1, 3).to(torch.float32).repeat(num_hyp, 1)
+            w_mask = w * vmask.to(torch.float32)
+            w_sum = w_mask.sum().clamp_min(1e-6)
+            if w_sum.item() <= 0.0:
+                continue
+
+            n_steps = max(1, refine_steps)
+            grad_ctx = contextlib.nullcontext() if torch.is_grad_enabled() else torch.enable_grad()
+            with grad_ctx:
+                for step in range(n_steps):
+                    rotvec = rotvec.detach().requires_grad_(True)
+                    t = t.detach().requires_grad_(True)
+                    R = rot_utils.so3_exp_batch(rotvec)
+                    p_rel = p.unsqueeze(0) - t.unsqueeze(1)
+                    x_obj = torch.einsum("hij,hmj->hmi", R.transpose(-1, -2), p_rel)
+                    z_h = z.view(1, 1, -1).expand(num_hyp, 1, -1)
+                    x_h = x_obj.view(num_hyp, 1, -1, 3)
+                    sdf = implicit_sdf_fn(z_h, x_h).view(num_hyp, -1)
+                    if robust == "huber":
+                        abs_r = sdf.abs()
+                        loss = torch.where(
+                            abs_r <= huber_tau,
+                            0.5 * abs_r * abs_r,
+                            huber_tau * (abs_r - 0.5 * huber_tau),
+                        )
+                    else:
+                        loss = torch.sqrt(sdf * sdf + (charb_eps * charb_eps))
+                    energy = (loss * w_mask.view(1, -1)).sum(dim=1) / w_sum
+                    inlier = (sdf.abs() < inlier_tau) & (w_mask.view(1, -1) > 0.0)
+                    denom = (w_mask.view(1, -1) > 0.0).sum(dim=1).clamp_min(1)
+                    inlier_frac = inlier.float().sum(dim=1) / denom
+                    E_hist[b, k, :, step] = energy.detach()
+                    inlier_hist[b, k, :, step] = inlier_frac.detach()
+
+                    if step < n_steps - 1:
+                        grad_rot, grad_t = torch.autograd.grad(
+                            energy.sum(),
+                            [rotvec, t],
+                            retain_graph=False,
+                            create_graph=False,
+                            allow_unused=True,
+                        )
+                        if grad_rot is None or grad_t is None:
+                            break
+                        max_drot = math.radians(max_drot_deg)
+                        drot = grad_rot
+                        dt = grad_t
+                        drot_norm = drot.norm(dim=1, keepdim=True).clamp_min(1e-6)
+                        dt_norm = dt.norm(dim=1, keepdim=True).clamp_min(1e-6)
+                        drot = drot * torch.clamp(max_drot / drot_norm, max=1.0)
+                        dt = dt * torch.clamp(max_dt / dt_norm, max=1.0)
+                        rotvec = (rotvec - lr_rot * drot).detach()
+                        t = (t - lr_trans * dt).detach()
+
+            E_hyp[b, k] = energy.detach()
+            energy_valid = energy.clone()
+            energy_valid[~hyp_valid] = float("inf")
+            best = torch.argmin(energy_valid)
+            best_hyp[b, k] = int(best.item())
+            R_best = rot_utils.so3_exp_batch(rotvec)[best].to(dtype)
+            t_best = t[best].to(dtype)
+            pose_R[b, k] = R_best
+            pose_t[b, k] = t_best
+            pose_valid[b, k] = True
+
+    return {
+        "pose_R_refined": pose_R,
+        "pose_t_refined": pose_t,
+        "pose_valid": pose_valid,
+        "best_hyp": best_hyp,
+        "E_hyp": E_hyp,
+        "E_hist": E_hist,
+        "inlier_frac_hist": inlier_hist,
+    }
+
+
 def _log_pose_visuals(
     writer: SummaryWriter,
     step_value: int,
@@ -1713,6 +2172,12 @@ def train_one_epoch(
                         "wfg_inst": wfg_inst,
                         "left_k": left_k,
                         "size_hw": size_hw,
+                        "writer": writer,
+                        "epoch": epoch,
+                        "it": it,
+                        "global_step": global_step,
+                        "log_interval": log_every,
+                        "phase": "train",
                     }
                 )
                 if extra_out:
@@ -1977,6 +2442,12 @@ def validate(
                     "wfg_inst": wfg_inst,
                     "left_k": left_k,
                     "size_hw": size_hw,
+                    "writer": writer,
+                    "epoch": epoch,
+                    "it": it,
+                    "global_step": epoch,
+                    "log_interval": 1,
+                    "phase": "val",
                 }
             )
             if extra_out:
