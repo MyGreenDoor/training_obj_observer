@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+import copy
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
@@ -311,13 +312,15 @@ def _log_pose_visuals_sdf(
     v_pred = pred["pose_valid"].to(dtype=torch.bool)
 
     image_size = (stereo.shape[-2], stereo.shape[-1])
-    valid_gt = valid_k
     valid_pred = v_pred & valid_k
+    if not valid_pred.any():
+        return
+    valid_gt = valid_pred
 
     T_pred = rot_utils.compose_T_from_Rt(R_pred, t_pred, valid_pred)
     T_gt = rot_utils.compose_T_from_Rt(rot_gt, pos_gt, valid_gt)
 
-    meshes_flat = pan_utils._build_meshes_from_batch_filtered(batch, valid_render, device)
+    meshes_flat = pan_utils._build_meshes_from_batch_filtered(batch, valid_pred, device)
     if meshes_flat is None:
         return
 
@@ -1010,6 +1013,7 @@ def _build_extra_loss_fn(cfg: dict):
     w_pose_gt_trans = float(loss_cfg.get("w_pose_gt_trans", 0.0))
 
     def _extra_loss(context: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        implicit_shadow: Optional[nn.Module] = getattr(_extra_loss, "_implicit_shadow", None)
         pred = context["pred"]
         batch = context["batch"]
         sem_gt = context["sem_gt"]
@@ -1043,6 +1047,15 @@ def _build_extra_loss_fn(cfg: dict):
         if pose_refine_enabled and wks_inst is not None:
             implicit_head = _get_model_attr(model, "implicit_sdf_head")
             if implicit_head is not None and pred.get("latent_map", None) is not None:
+                if implicit_shadow is None:
+                    implicit_shadow = copy.deepcopy(implicit_head).to(device)
+                    implicit_shadow.eval()
+                    for p in implicit_shadow.parameters():
+                        p.requires_grad_(False)
+                    _extra_loss._implicit_shadow = implicit_shadow
+                with torch.no_grad():
+                    implicit_shadow.load_state_dict(implicit_head.state_dict(), strict=True)
+
                 latent_map = pred["latent_map"].to(torch.float32)
                 z_inst = _aggregate_latent_per_instance(latent_map, wks_inst)
                 pos_map_pred = pan_utils.pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
@@ -1059,7 +1072,7 @@ def _build_extra_loss_fn(cfg: dict):
                 sym_axes, sym_orders = pan_utils._prepare_symmetry_tensors(batch, device, wks_inst.shape[1])
 
                 def _implicit_query(z_in: torch.Tensor, x_in: torch.Tensor) -> torch.Tensor:
-                    sdf, _ = implicit_head(z_in, x_in)
+                    sdf, _ = implicit_shadow(z_in, x_in)
                     return sdf
 
                 pose_out = pan_utils.pose_refine_implicit_sdf(
@@ -1360,7 +1373,7 @@ def main() -> None:
 
     cfg = load_toml(args.config)
     cfg.setdefault("train", {})
-    cfg["train"]["amp"] = True
+    cfg["train"]["amp"] = False
     set_global_seed(42)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -1407,6 +1420,8 @@ def main() -> None:
             output_device=dist_utils.get_rank(),
             find_unused_parameters=ddp_find_unused,
         )
+        if hasattr(model, "_set_static_graph"):
+            model._set_static_graph()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
     scaler = torch.amp.GradScaler("cuda", enabled=cfg["train"]["amp"])

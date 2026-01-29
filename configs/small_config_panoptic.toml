@@ -115,6 +115,7 @@ w_pose_gt_trans = 0.0
 [pose_refine]
 enabled = true
 use_r0_if_available = true
+use_implicit_sdf = true
 init_rot_set = "cube24"
 num_hyp_train = 24
 num_hyp_test = 24
