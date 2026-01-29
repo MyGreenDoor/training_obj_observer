@@ -68,7 +68,6 @@ class LiteFPNMultiTaskHeadWithAffEmb(nn.Module):
         super().__init__()
         self.use_pixelshuffle = use_pixelshuffle
         self.rot_repr = rot_repr.lower()
-
         in_ch = ctx_ch + hidden_ch + 1 + 3
         c4, c8 = 160, 192
 
@@ -379,7 +378,6 @@ class LiteFPNMultiTaskHeadNoHiddenWithAffEmb(nn.Module):
             rvec = out_rot[:, :3]
             rot_R = rotvec_to_rotmat_map(rvec)
             logvar_theta = out_rot[:, 3:4].clamp(-10.0, 5.0)
-
         return {
             "pos_mu": mu_pos,
             "pos_logvar": lv_pos,
@@ -413,7 +411,6 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
         self.ctx_ch = int(ctx_ch)
         self.head_downsample = int(head_downsample)
         self.latent_l2_norm = bool(latent_l2_norm)
-        self.rot_repr = str(rot_repr).lower()
         if self.head_downsample < 1:
             raise ValueError("head_downsample must be >= 1")
         if latent_dim <= 0:
@@ -473,9 +470,6 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
 
         self.head_posz_pre = ConvBlock(base_ch, base_ch, norm_layer)
         self.head_posz = nn.Conv2d(base_ch, 6, 3, padding=1)
-        rot_ch = 6 if self.rot_repr == "r6d" else 3
-        self.head_rot_pre = ConvBlock(base_ch, base_ch, norm_layer)
-        self.head_rot = nn.Conv2d(base_ch, rot_ch + 1, 3, padding=1)
         self.head_cls_pre = ConvBlock(sem_ch, sem_ch, norm_layer)
         self.head_cls = nn.Conv2d(sem_ch, num_classes, 1)
         self.affemb_head = AffEmbHead(inst_ch, emb_dim, norm_layer)
@@ -584,7 +578,6 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
         x_inst = self.neck_inst(x)
 
         out_posz = self.head_posz(self.head_posz_pre(x_geo))
-        out_rot = self.head_rot(self.head_rot_pre(x_geo))
         cls_logits = self.head_cls(self.head_cls_pre(x_sem))
         affemb_out = self.affemb_head(x_inst)
         aff_logits = affemb_out["aff_logits"]
@@ -603,13 +596,12 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
             if can_unshuffle:
                 ctx1x_s2d = F.pixel_unshuffle(ctx_1x_full, self.head_downsample)
                 h_up = self.up_guidance_fuse(torch.cat([x, ctx1x_s2d], dim=1))
-                reg_maps = torch.cat([out_posz, out_rot, latent_map, sdf_map, sdf_logvar], dim=1)
+                reg_maps = torch.cat([out_posz, latent_map, sdf_map, sdf_logvar], dim=1)
                 reg_maps = self.map_upsampler(reg_maps, h_up, scale_factor=1.0)
                 ch_pos = out_posz.size(1)
-                ch_rot = out_rot.size(1)
                 ch_lat = latent_map.size(1)
-                out_posz, out_rot, latent_map, sdf_map, sdf_logvar = torch.split(
-                    reg_maps, [ch_pos, ch_rot, ch_lat, 1, 1], dim=1
+                out_posz, latent_map, sdf_map, sdf_logvar = torch.split(
+                    reg_maps, [ch_pos, ch_lat, 1, 1], dim=1
                 )
                 if self.cls_upsampler is not None and self.aff_upsampler is not None and self.emb_upsampler is not None:
                     cls_logits = self.cls_upsampler(cls_logits, h_up, scale_factor=1.0)
@@ -617,7 +609,6 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
                     emb = self.emb_upsampler(emb, h_up, scale_factor=1.0)
             else:
                 out_posz = F.interpolate(out_posz, size=out_hw, mode="bilinear", align_corners=False)
-                out_rot = F.interpolate(out_rot, size=out_hw, mode="bilinear", align_corners=False)
                 latent_map = F.interpolate(latent_map, size=out_hw, mode="bilinear", align_corners=False)
                 sdf_map = F.interpolate(sdf_map, size=out_hw, mode="bilinear", align_corners=False)
                 sdf_logvar = F.interpolate(sdf_logvar, size=out_hw, mode="bilinear", align_corners=False)
@@ -633,23 +624,12 @@ class LiteFPNMultiTaskHeadNoRotWithAffEmbLatent(nn.Module):
         mu_pos = torch.cat([mu_raw[:, 0:2], log_z], dim=1)
         lv_pos = lv_raw.clamp(-8.0, 4.0)
         sdf_logvar = sdf_logvar.clamp(-8.0, 4.0)
-        if self.rot_repr == "r6d":
-            r6d = out_rot[:, :6]
-            rot_R = r6d_to_rotmat(r6d)
-            logvar_theta = out_rot[:, 6:7].clamp(-10.0, 5.0)
-        else:
-            rvec = out_rot[:, :3]
-            rot_R = rotvec_to_rotmat_map(rvec)
-            logvar_theta = out_rot[:, 3:4].clamp(-10.0, 5.0)
-
         if self.latent_l2_norm:
             latent_map = F.normalize(latent_map, dim=1, eps=1e-6)
 
         return {
             "pos_mu": mu_pos,
             "pos_logvar": lv_pos,
-            "rot_mat": rot_R,
-            "rot_logvar_theta": logvar_theta,
             "cls_logits": cls_logits,
             "latent_map": latent_map,
             "sdf_map": sdf_map,
@@ -1136,7 +1116,6 @@ class PanopticStereoMultiHead(nn.Module):
             "pos_logvar_norm": pos_logvar_norm,
         }
         out.update({k: v for k, v in head_out.items() if k not in ("pos_mu", "pos_logvar")})
-
         if Wk_1_4 is not None and wfg_1_4 is not None:
             pos_map_pred = pos_mu_to_pointmap(pos_mu, K_pair_1x[:, 0], downsample=1)
             r_pred, t_pred, v_pred, _, _ = rot_utils.pose_from_maps_auto(
@@ -1318,24 +1297,9 @@ class PanopticStereoMultiHeadLatent(PanopticStereoMultiHead):
             out["cls_logits"] = head_out["cls_logits"]
             out["aff_logits"] = head_out["aff_logits"]
             out["emb"] = head_out["emb"]
-            out["rot_mat"] = head_out["rot_mat"]
-            out["rot_logvar_theta"] = head_out["rot_logvar_theta"]
             out["latent_map"] = head_out["latent_map"]
             out["sdf_map"] = head_out["sdf_map"]
             out["sdf_logvar"] = head_out["sdf_logvar"]
-            if Wk_1_4 is not None and wfg_1_4 is not None:
-                pos_map_pred = pos_mu_to_pointmap(pos_mu, K_pair_1x[:, 0], downsample=1)
-                r_pred, t_pred, v_pred, _, _ = rot_utils.pose_from_maps_auto(
-                    rot_map=head_out["rot_mat"],
-                    pos_map=pos_map_pred,
-                    Wk_1_4=Wk_1_4,
-                    wfg=wfg_1_4,
-                    min_px=min_px,
-                    min_wsum=min_wsum,
-                )
-                out["pose_R"] = r_pred
-                out["pose_t"] = t_pred
-                out["pose_valid"] = v_pred
             return out
 
         out: Dict[str, torch.Tensor] = {
@@ -1356,19 +1320,6 @@ class PanopticStereoMultiHeadLatent(PanopticStereoMultiHead):
             "pos_logvar_norm": pos_logvar_norm,
         }
         out.update({k: v for k, v in head_out.items() if k not in ("pos_mu", "pos_logvar")})
-        if Wk_1_4 is not None and wfg_1_4 is not None:
-            pos_map_pred = pos_mu_to_pointmap(pos_mu, K_pair_1x[:, 0], downsample=1)
-            r_pred, t_pred, v_pred, _, _ = rot_utils.pose_from_maps_auto(
-                rot_map=head_out["rot_mat"],
-                pos_map=pos_map_pred,
-                Wk_1_4=Wk_1_4,
-                wfg=wfg_1_4,
-                min_px=min_px,
-                min_wsum=min_wsum,
-            )
-            out["pose_R"] = r_pred
-            out["pose_t"] = t_pred
-            out["pose_valid"] = v_pred
         return out
 
 def pos_mu_to_pointmap(

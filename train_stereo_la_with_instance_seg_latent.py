@@ -311,10 +311,8 @@ def _log_pose_visuals_sdf(
     v_pred = pred["pose_valid"].to(dtype=torch.bool)
 
     image_size = (stereo.shape[-2], stereo.shape[-1])
-    origin_in = pan_utils._origin_in_image_from_t(pos_gt, left_k[:, 0], image_size)
-    valid_pred = v_pred & valid_k & origin_in
-    valid_render = valid_pred
-    valid_gt = valid_render
+    valid_gt = valid_k
+    valid_pred = v_pred & valid_k
 
     T_pred = rot_utils.compose_T_from_Rt(R_pred, t_pred, valid_pred)
     T_gt = rot_utils.compose_T_from_Rt(rot_gt, pos_gt, valid_gt)
@@ -334,14 +332,14 @@ def _log_pose_visuals_sdf(
             meshes_flat=meshes_flat,
             T_cam_obj=T_pred,
             K_left=K_left,
-            valid_k=valid_render,
+            valid_k=valid_pred,
             image_size=image_size,
         )
         gt_r = renderer(
             meshes_flat=meshes_flat,
             T_cam_obj=T_gt,
             K_left=K_left,
-            valid_k=valid_render,
+            valid_k=valid_gt,
             image_size=image_size,
         )
     sil_pred = pred_r["silhouette"]
@@ -379,28 +377,39 @@ def _log_pose_visuals_sdf(
     writer.add_image(f"{prefix}/vis_pose_sil_sdf", grid, step_value)
 
 
-def _prepare_pose_maps(
+def _build_obj_coords_from_gt_pose(
+    point_map: torch.Tensor,
+    inst_gt_hw: torch.Tensor,
     batch: Dict[str, Any],
-    size_hw: Tuple[int, int],
     device: torch.device,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Prepare pose maps (pos_map, rot_map) at the target resolution."""
-    pos_map = batch.get("pos_map", None)
-    rot_map = batch.get("rot_map", None)
-    if pos_map is None or rot_map is None:
+    """Build object coordinates from GT pose (objs_in_left) without rotation maps."""
+    objs_in_left, valid_k = pan_utils._build_objs_in_left_from_batch(batch, device)
+    if objs_in_left is None or valid_k.numel() == 0:
         return None, None
 
-    pos_map = pos_map.to(device, non_blocking=True)
-    if pos_map.dim() == 4 and pos_map.shape[1] != 3 and pos_map.shape[-1] == 3:
-        pos_map = pos_map.permute(0, 3, 1, 2)
-    pos_map = F.interpolate(pos_map, size=size_hw, mode="bilinear", align_corners=False)
+    R_gt = objs_in_left[..., :3, :3]
+    t_gt = objs_in_left[..., :3, 3]
+    B, H, W = inst_gt_hw.shape
+    Kmax = R_gt.size(1)
+    obj_coords = point_map.new_zeros((B, 3, H, W))
+    valid = torch.zeros((B, H, W), dtype=torch.bool, device=point_map.device)
 
-    rot_map = rot_map.to(device, non_blocking=True)
-    if rot_map.dim() == 5 and not (rot_map.shape[1] == 3 and rot_map.shape[2] == 3):
-        rot_map = rot_map.permute(0, 3, 4, 1, 2)
-    rot_map = F.interpolate(rot_map.flatten(1, 2), size=size_hw, mode="nearest")
-    rot_map = rot_map.view(rot_map.size(0), 3, 3, size_hw[0], size_hw[1])
-    return pos_map, rot_map
+    for b in range(B):
+        if valid_k[b].sum().item() == 0:
+            continue
+        inst_id = inst_gt_hw[b] - 1
+        mask = inst_gt_hw[b] > 0
+        if not mask.any():
+            continue
+        idx = inst_id.clamp(0, Kmax - 1)
+        R_map = R_gt[b][idx]
+        t_map = t_gt[b][idx]
+        p = point_map[b].permute(1, 2, 0)
+        x_obj = torch.einsum("hwij,hwj->hwi", R_map.transpose(-1, -2), p - t_map)
+        obj_coords[b] = x_obj.permute(2, 0, 1)
+        valid[b] = mask & valid_k[b][idx]
+    return obj_coords, valid
 
 
 def _extract_sdf_bounds(
@@ -635,9 +644,6 @@ def _compute_sdf_map_loss(
     if sdf_logvar is None:
         return {"loss_sdf": zero, "sdf_valid_px": zero}
 
-    pos_map, rot_map = _prepare_pose_maps(batch, size_hw, device)
-    if pos_map is None or rot_map is None:
-        return {"loss_sdf": zero, "sdf_valid_px": zero}
     point_map = pred.get("point_map_1x", None)
     if point_map is None:
         return {"loss_sdf": zero, "sdf_valid_px": zero}
@@ -648,16 +654,14 @@ def _compute_sdf_map_loss(
     if sdf_logvar.shape[-2:] != size_hw:
         sdf_logvar = F.interpolate(sdf_logvar, size=size_hw, mode="bilinear", align_corners=False)
 
-    vec = point_map - pos_map
-    R = rot_map.permute(0, 3, 4, 1, 2)
-    vec = vec.permute(0, 2, 3, 1)
-    obj_coords = torch.einsum("bhwij,bhwj->bhwi", R.transpose(-1, -2), vec)
-    obj_coords = obj_coords.permute(0, 3, 1, 2)
+    obj_coords, obj_valid = _build_obj_coords_from_gt_pose(point_map, inst_gt_hw, batch, device)
+    if obj_coords is None or obj_valid is None:
+        return {"loss_sdf": zero, "sdf_valid_px": zero}
 
     sdf_gt, sdf_valid = _build_sdf_targets(batch, inst_gt_hw, obj_coords, device, cfg)
     if sdf_gt is None or sdf_valid is None:
         return {"loss_sdf": zero, "sdf_valid_px": zero}
-    sdf_valid = sdf_valid & torch.isfinite(sdf_gt)
+    sdf_valid = sdf_valid & obj_valid & torch.isfinite(sdf_gt)
     valid_px = sdf_valid.sum().to(dtype=zero.dtype)
     if valid_px.item() <= 0:
         return {"loss_sdf": zero, "sdf_valid_px": zero}
@@ -1048,7 +1052,10 @@ def _build_extra_loss_fn(cfg: dict):
                     min_wsum=float(pose_cfg.get("min_wsum", 1e-6)),
                     min_px=int(pose_cfg.get("min_px", 30)),
                 )
-                R0 = pred.get("pose_R", None) if use_r0_if_available else None
+                if phase == "train":
+                    R0 = None
+                else:
+                    R0 = pred.get("pose_R", None) if use_r0_if_available else None
                 sym_axes, sym_orders = pan_utils._prepare_symmetry_tensors(batch, device, wks_inst.shape[1])
 
                 def _implicit_query(z_in: torch.Tensor, x_in: torch.Tensor) -> torch.Tensor:
@@ -1082,14 +1089,13 @@ def _build_extra_loss_fn(cfg: dict):
                         "inlier_frac_hist": pose_out["inlier_frac_hist"],
                     }
                 )
-                if "rot_mat" not in pred:
-                    pred.update(
-                        {
-                            "pose_R": pose_out["pose_R_refined"],
-                            "pose_t": pose_out["pose_t_refined"],
-                            "pose_valid": pose_out["pose_valid"],
-                        }
-                    )
+                pred.update(
+                    {
+                        "pose_R": pose_out["pose_R_refined"],
+                        "pose_t": pose_out["pose_t_refined"],
+                        "pose_valid": pose_out["pose_valid"],
+                    }
+                )
 
                 pose_valid = pose_out["pose_valid"]
                 best_idx = pose_out["best_hyp"].clamp_min(0).unsqueeze(-1)
@@ -1111,21 +1117,29 @@ def _build_extra_loss_fn(cfg: dict):
                     logs["L_pose_refine_inlier_frac"] = (
                         (inlier_best * valid_f).sum() / valid_f.sum().clamp_min(1.0)
                     ).detach()
+                if pose_out.get("finite_p_ratio", None) is not None:
+                    finite_p = pose_out["finite_p_ratio"]
+                    finite_w = pose_out["finite_w_ratio"]
+                    finite_sdf = pose_out["finite_sdf_ratio"]
+                    wsum_min = pose_out["w_sum_min"]
+                    logs["L_pose_refine_finite_p_ratio"] = (
+                        (finite_p * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+                    ).detach()
+                    logs["L_pose_refine_finite_w_ratio"] = (
+                        (finite_w * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+                    ).detach()
+                    logs["L_pose_refine_finite_sdf_ratio"] = (
+                        (finite_sdf * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+                    ).detach()
+                    if valid_f.sum().item() > 0:
+                        logs["L_pose_refine_w_sum_min"] = wsum_min[pose_valid].min().detach()
 
                 need_pose_gt = (w_pose_gt_rot > 0.0) or (w_pose_gt_trans > 0.0) or log_pos_adds
                 if need_pose_gt:
-                    pos_gt_map, rot_gt_map, _, _ = pan_utils._prepare_pose_targets(
-                        batch, sem_gt, size_hw, device
-                    )
-                    if pos_gt_map is not None and rot_gt_map is not None:
-                        r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
-                            rot_map=rot_gt_map,
-                            pos_map=pos_gt_map,
-                            Wk_1_4=wks_inst,
-                            wfg=wfg_inst,
-                            min_px=10,
-                            min_wsum=1e-6,
-                        )
+                    objs_in_left, valid_k = pan_utils._build_objs_in_left_from_batch(batch, device)
+                    if objs_in_left is not None and valid_k.numel() > 0:
+                        r_gt = objs_in_left[..., :3, :3]
+                        t_gt = objs_in_left[..., :3, 3]
                         r_pred = pose_out["pose_R_refined"]
                         t_pred = pose_out["pose_t_refined"]
                         sym_axes, sym_orders = pan_utils._prepare_symmetry_tensors(batch, device, wks_inst.shape[1])
@@ -1134,8 +1148,13 @@ def _build_extra_loss_fn(cfg: dict):
                             r_gt_use, _ = rot_utils.align_pose_by_symmetry_min_rotation(
                                 r_pred, r_gt, sym_axes, sym_orders
                             )
-                        valid_inst = pose_valid & v_gt
+                        valid_inst = pose_valid & valid_k
                         if valid_inst.any():
+                            rot_err_deg = pan_utils._rot_geodesic_deg(r_pred, r_gt_use)
+                            logs["L_pose_refine_rot_deg"] = (
+                                (rot_err_deg * valid_inst.to(rot_err_deg.dtype)).sum()
+                                / valid_inst.sum().clamp_min(1.0)
+                            ).detach()
                             if w_pose_gt_rot > 0.0 or w_pose_gt_trans > 0.0:
                                 r_rel = torch.matmul(r_pred.transpose(-1, -2), r_gt_use)
                                 rotvec = rot_utils.so3_log_batch(r_rel.reshape(-1, 3, 3)).reshape_as(r_pred[..., 0])
@@ -1189,7 +1208,7 @@ def _build_extra_loss_fn(cfg: dict):
                     else:
                         should_log = it == 0
                     if should_log and stereo is not None and inst_gt is not None:
-                        objs_in_left, _ = pan_utils._build_objs_in_left_from_batch(batch, device)
+                        objs_in_left, valid_k = pan_utils._build_objs_in_left_from_batch(batch, device)
                         if objs_in_left is not None:
                             _log_pose_visuals_sdf(
                                 writer,
@@ -1204,6 +1223,28 @@ def _build_extra_loss_fn(cfg: dict):
                                 objs_in_left[..., :3, :3],
                                 n_images=min(4, stereo.size(0)),
                             )
+                            r_gt = objs_in_left[..., :3, :3]
+                            r_pred = pose_out["pose_R_refined"]
+                            sym_axes, sym_orders = pan_utils._prepare_symmetry_tensors(batch, device, wks_inst.shape[1])
+                            r_gt_use = r_gt
+                            if sym_axes is not None and sym_orders is not None:
+                                r_gt_use, _ = rot_utils.align_pose_by_symmetry_min_rotation(
+                                    r_pred, r_gt, sym_axes, sym_orders
+                                )
+                            valid_inst = pose_valid & valid_k
+                            if valid_inst.any():
+                                rot_err_deg = pan_utils._rot_geodesic_deg(r_pred, r_gt_use)
+                                rot_err_valid = rot_err_deg[valid_inst]
+                                writer.add_scalar(
+                                    f"{phase}/pose_refine_rot_deg",
+                                    float(rot_err_valid.mean().item()),
+                                    global_step,
+                                )
+                                writer.add_histogram(
+                                    f"{phase}/pose_refine_rot_deg_hist",
+                                    rot_err_valid,
+                                    global_step,
+                                )
 
         if use_implicit:
             imp_out = _compute_implicit_sdf_loss(pred, batch, inst_gt_hw, model, device, cfg)

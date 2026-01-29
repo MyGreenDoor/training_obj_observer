@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Panoptic stereo training utilities (non-SDF).
@@ -139,6 +139,7 @@ def make_dataloaders(cfg: dict, distributed: bool):
         target_scene_list=cfg["data"]["train_datasets"][0]["target_scene_list"],
         spatial_transform=spatial_trans_list,
         filtering_transform=filtering_trans_list,
+        with_sdf = False,
     )
     n_classes = int(getattr(train_ds, "n_classes", 1))
 
@@ -154,6 +155,7 @@ def make_dataloaders(cfg: dict, distributed: bool):
         target_scene_list=cfg["data"]["val_datasets"][0]["target_scene_list"],
         spatial_transform=spatial_trans_list,
         filtering_transform=filtering_trans_list,
+        with_sdf = False,
     )
     train_sampler = DistributedSampler(train_ds, shuffle=True) if distributed else None
     val_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else None
@@ -254,17 +256,38 @@ def _prepare_pose_targets(
     sem_gt: torch.Tensor,
     size_hw: Tuple[int, int],
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Prepare pose targets with background masking (no rotation maps)."""
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare pose targets with background masking."""
     pos_map = batch["pos_map"].to(device, non_blocking=True)
     if pos_map.dim() == 4 and pos_map.shape[1] != 3 and pos_map.shape[-1] == 3:
         pos_map = pos_map.permute(0, 3, 1, 2)
     pos_map = F.interpolate(pos_map, size=size_hw, mode="bilinear", align_corners=False)
 
+    rot_map = batch["rot_map"].to(device, non_blocking=True)
+    if rot_map.dim() == 5 and not (rot_map.shape[1] == 3 and rot_map.shape[2] == 3):
+        rot_map = rot_map.permute(0, 3, 4, 1, 2)
+    rot_map = F.interpolate(rot_map.flatten(1, 2), size=size_hw, mode="nearest")
+    rot_map = rot_map.view(rot_map.size(0), 3, 3, size_hw[0], size_hw[1])
+
     sem_mask_hw = _downsample_label(sem_gt, size_hw) > 0
     sem_mask_hw = sem_mask_hw.unsqueeze(1)
-    objs_in_left, _ = _build_objs_in_left_from_batch(batch, device)
-    return pos_map, sem_mask_hw, objs_in_left
+    objs_in_left_list: List[torch.Tensor] = []
+    B = len(batch["objs_in_left"])
+    counts: List[int] = []
+    for objs_in_left in batch["objs_in_left"]:
+        objs_in_left = [torch.from_numpy(obj_in_left) for obj_in_left in objs_in_left]
+        counts.append(len(objs_in_left))
+        objs_in_left_list.extend(objs_in_left)
+    objs_in_left_list = torch.stack(objs_in_left_list, dim=0)
+    Kmax = max(counts) if counts else 0
+    valid_k = torch.zeros((B, Kmax), dtype=torch.bool, device=device)
+    objs_in_left = torch.zeros((B, Kmax, 4, 4), dtype=torch.float32, device=device)
+    st_k = 0
+    for b, k in enumerate(counts):
+        valid_k[b, :k] = True
+        objs_in_left[b, :k] = objs_in_left_list[st_k: st_k + k]
+        st_k += counts[b]
+    return pos_map, rot_map, sem_mask_hw, objs_in_left
 
 
 def _build_objs_in_left_from_batch(
@@ -318,26 +341,105 @@ def _compute_pose_losses_and_metrics(
     image_size: Tuple[int, int],
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
-    """Compute translation-only losses and metrics (rotation disabled)."""
-    pos_out = _compute_pos_losses_and_metrics(
-        pred=pred,
-        batch=batch,
-        sem_gt=sem_gt,
-        size_hw=size_hw,
-        left_k=left_k,
-        device=device,
+    """Compute pose losses and pose-related metrics."""
+    pos_gt_map, rot_gt_map, pose_mask, _ = _prepare_pose_targets(batch, sem_gt, size_hw, device)
+    gt_pos_mu_map = loss_functions._pos_mu_gt_from_t_map(pos_gt_map, left_k[:, 0], downsample=1, use_logz=True)
+    loss_pos = loss_functions.pos_loss_hetero_map(
+        pred["pos_mu_norm"],
+        pred["pos_logvar_norm"],
+        gt_pos_mu_map,
+        pose_mask,
     )
-    loss_pos = pos_out["loss_pos"]
-    pos_map_l2 = pos_out["pos_map_l2"]
-    zero = loss_pos.new_tensor(0.0)
+    pos_map_pred = pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
+    pos_diff = pos_map_pred - pos_gt_map
+    pos_l2_map = torch.sqrt((pos_diff * pos_diff).sum(dim=1, keepdim=True) + 1e-6)
+    pos_map_l2 = (pos_l2_map * pose_mask.to(pos_l2_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
+    r_pred = pred.get("pose_R")
+    t_pred = pred.get("pose_t")
+    v_pred = pred.get("pose_valid")
+    r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
+        rot_map=rot_gt_map,
+        pos_map=pos_gt_map,
+        Wk_1_4=wks_inst,
+        wfg=wfg_inst,
+        min_px=10,
+        min_wsum=1e-6,
+    )
+    rot_gt_map_use = rot_gt_map
+    r_gt_use = r_gt
+    sym_axes, sym_orders = _prepare_symmetry_tensors(batch, device, valid_k_inst.shape[1])
+    if sym_axes is not None and sym_orders is not None and r_pred is not None and pred["rot_mat"].numel() > 0:
+        inst_gt = batch["instance_seg"].to(device, non_blocking=True)
+        inst_gt_hw = _downsample_label(inst_gt, size_hw)
+        inst_id_map = (inst_gt_hw - 1).clamp_min(0)
+        fg_mask = (inst_gt_hw > 0).unsqueeze(1)
+        with torch.no_grad():
+            r_gt_use, delta = rot_utils.align_pose_by_symmetry_min_rotation(
+                r_pred,
+                r_gt,
+                sym_axes,
+                sym_orders,
+            )
+            rot_gt_map_use = rot_utils.apply_symmetry_rotation_map(
+                rot_gt_map_use,
+                sym_axes,
+                delta,
+                inst_id_map,
+                fg_mask=fg_mask,
+            )
+    loss_rot = loss_functions.rotation_loss_hetero_map(
+        pred["rot_mat"],
+        rot_gt_map_use,
+        pred["rot_logvar_theta"],
+        pose_mask,
+    )
+    rot_deg_map = _rot_geodesic_map_deg(pred["rot_mat"], rot_gt_map_use).unsqueeze(1)
+    rot_map_deg = (rot_deg_map * pose_mask.to(rot_deg_map.dtype)).sum() / pose_mask.sum().clamp_min(1.0)
+    origin_in = _origin_in_image_from_t(t_gt, left_k[:, 0], image_size)
+    valid_inst = v_pred & v_gt & valid_k_inst & origin_in
+    if valid_inst.any():
+        t_diff = t_pred - t_gt
+        t_l2 = torch.sqrt((t_diff * t_diff).sum(dim=-1) + 1e-6)
+        pos_inst_l2 = (t_l2 * valid_inst.to(t_l2.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
+        r_deg = _rot_geodesic_deg(r_pred, r_gt_use)
+        rot_inst_deg = (r_deg * valid_inst.to(r_deg.dtype)).sum() / valid_inst.sum().clamp_min(1.0)
+    else:
+        pos_inst_l2 = pos_map_l2.new_tensor(0.0)
+        rot_inst_deg = pos_map_l2.new_tensor(0.0)
+
+    model_points, _ = _build_model_points_from_batch(batch, device)
+    if model_points is not None and valid_inst.any():
+        adds = _adds_core_from_Rt_no_norm(
+            r_pred,
+            t_pred,
+            r_gt_use,
+            t_gt,
+            model_points,
+            use_symmetric=True,
+            valid_mask=valid_inst,
+        )
+        add = _adds_core_from_Rt_no_norm(
+            r_pred,
+            t_pred,
+            r_gt_use,
+            t_gt,
+            model_points,
+            use_symmetric=False,
+            valid_mask=valid_inst,
+        )
+    else:
+        adds = pos_map_l2.new_tensor(0.0)
+        add = pos_map_l2.new_tensor(0.0)
+
     return {
         "loss_pos": loss_pos,
-        "loss_rot": zero,
+        "loss_rot": loss_rot,
+        "rot_map_deg": rot_map_deg,
         "pos_map_l2": pos_map_l2,
-        "pos_inst_l2": zero,
-        "rot_inst_deg": zero,
-        "adds": zero,
-        "add": zero,
+        "pos_inst_l2": pos_inst_l2,
+        "rot_inst_deg": rot_inst_deg,
+        "adds": adds,
+        "add": add,
     }
 
 
@@ -350,7 +452,7 @@ def _compute_pos_losses_and_metrics(
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
     """Compute translation losses and metrics without rotation outputs."""
-    pos_gt_map, pose_mask, _ = _prepare_pose_targets(batch, sem_gt, size_hw, device)
+    pos_gt_map, _, pose_mask, _ = _prepare_pose_targets(batch, sem_gt, size_hw, device)
     gt_pos_mu_map = loss_functions._pos_mu_gt_from_t_map(pos_gt_map, left_k[:, 0], downsample=1, use_logz=True)
     loss_pos = loss_functions.pos_loss_hetero_map(
         pred["pos_mu_norm"],
@@ -366,6 +468,30 @@ def _compute_pos_losses_and_metrics(
         "loss_pos": loss_pos,
         "pos_map_l2": pos_map_l2,
     }
+
+
+def _prepare_pose_maps(
+    batch: Dict[str, Any],
+    size_hw: Tuple[int, int],
+    device: torch.device,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Prepare pose maps (pos_map, rot_map) at the target resolution."""
+    pos_map = batch.get("pos_map", None)
+    rot_map = batch.get("rot_map", None)
+    if pos_map is None or rot_map is None:
+        return None, None
+
+    pos_map = pos_map.to(device, non_blocking=True)
+    if pos_map.dim() == 4 and pos_map.shape[1] != 3 and pos_map.shape[-1] == 3:
+        pos_map = pos_map.permute(0, 3, 1, 2)
+    pos_map = F.interpolate(pos_map, size=size_hw, mode="bilinear", align_corners=False)
+
+    rot_map = rot_map.to(device, non_blocking=True)
+    if rot_map.dim() == 5 and not (rot_map.shape[1] == 3 and rot_map.shape[2] == 3):
+        rot_map = rot_map.permute(0, 3, 4, 1, 2)
+    rot_map = F.interpolate(rot_map.flatten(1, 2), size=size_hw, mode="nearest")
+    rot_map = rot_map.view(rot_map.size(0), 3, 3, size_hw[0], size_hw[1])
+    return pos_map, rot_map
 
 
 def _build_affinity_targets(inst_hw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1402,7 +1528,6 @@ def _sample_instance_points_from_point_map(
     conf_map: Optional[torch.Tensor],
     n_points: int,
     conf_thr: float,
-    erode_px: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sample per-instance 3D points from a point map."""
     B, _, H, W = point_map.shape
@@ -1422,11 +1547,6 @@ def _sample_instance_points_from_point_map(
         for k in range(max_id):
             inst_id = k + 1
             mask = inst_map[b] == inst_id
-            if erode_px > 0 and mask.any():
-                ksz = int(2 * erode_px + 1)
-                inv = (~mask).to(dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-                border = F.max_pool2d(inv, kernel_size=ksz, stride=1, padding=erode_px) > 0.0
-                mask = mask & (~border.squeeze(0).squeeze(0))
             if conf_mask is not None:
                 mask = mask & conf_mask[b]
             idx = torch.nonzero(mask, as_tuple=False)
@@ -1481,7 +1601,6 @@ def pose_refine_implicit_sdf(
         refine_steps = int(pose_cfg.get("refine_steps_test", refine_steps))
     n_points = int(pose_cfg.get("sample_M", 256))
     conf_thr = float(pose_cfg.get("conf_thr", 0.0))
-    erode_px = int(pose_cfg.get("erode_px", 0))
     robust = str(pose_cfg.get("robust", "charbonnier")).lower()
     charb_eps = float(pose_cfg.get("charb_eps", 0.5))
     huber_tau = float(pose_cfg.get("huber_tau", 2.0))
@@ -1501,10 +1620,6 @@ def pose_refine_implicit_sdf(
     E_hyp = torch.full((B, K, num_hyp), init_energy, device=device, dtype=torch.float32)
     E_hist = torch.full((B, K, num_hyp, max(1, refine_steps)), init_energy, device=device, dtype=torch.float32)
     inlier_hist = torch.zeros((B, K, num_hyp, max(1, refine_steps)), device=device, dtype=torch.float32)
-    finite_p_sum = torch.zeros((B, K), device=device, dtype=torch.float32)
-    finite_w_sum = torch.zeros((B, K), device=device, dtype=torch.float32)
-    finite_sdf_sum = torch.zeros((B, K), device=device, dtype=torch.float32)
-    w_sum_min = torch.full((B, K), float("inf"), device=device, dtype=torch.float32)
 
     if not enabled or implicit_sdf_fn is None:
         return {
@@ -1542,7 +1657,6 @@ def pose_refine_implicit_sdf(
         point_conf_1x,
         n_points=n_points,
         conf_thr=conf_thr,
-        erode_px=erode_px,
     )
     if t0 is None:
         if pos_map is not None and wks_inst is not None:
@@ -1573,10 +1687,6 @@ def pose_refine_implicit_sdf(
             p = p_cam[b, k].to(torch.float32)
             w = w_pts[b, k].to(torch.float32)
             vmask = valid_pts[b, k]
-            finite_pts = torch.isfinite(p).all(dim=-1) & torch.isfinite(w)
-            finite_p_sum[b, k] = finite_pts.float().mean()
-            finite_w_sum[b, k] = torch.isfinite(w).float().mean()
-            vmask = vmask & finite_pts
             if vmask.sum().item() == 0:
                 continue
 
@@ -1598,7 +1708,6 @@ def pose_refine_implicit_sdf(
             t = t0[b, k].view(1, 3).to(torch.float32).repeat(num_hyp, 1)
             w_mask = w * vmask.to(torch.float32)
             w_sum = w_mask.sum().clamp_min(1e-6)
-            w_sum_min[b, k] = w_sum.detach()
             if w_sum.item() <= 0.0:
                 continue
 
@@ -1614,8 +1723,6 @@ def pose_refine_implicit_sdf(
                     z_h = z.view(1, 1, -1).expand(num_hyp, 1, -1)
                     x_h = x_obj.view(num_hyp, 1, -1, 3)
                     sdf = implicit_sdf_fn(z_h, x_h).view(num_hyp, -1)
-                    finite_sdf_sum[b, k] = torch.isfinite(sdf).float().mean()
-                    sdf = torch.nan_to_num(sdf, nan=1e6, posinf=1e6, neginf=1e6)
                     if robust == "huber":
                         abs_r = sdf.abs()
                         loss = torch.where(
@@ -1671,11 +1778,116 @@ def pose_refine_implicit_sdf(
         "E_hyp": E_hyp,
         "E_hist": E_hist,
         "inlier_frac_hist": inlier_hist,
-        "finite_p_ratio": finite_p_sum,
-        "finite_w_ratio": finite_w_sum,
-        "finite_sdf_ratio": finite_sdf_sum,
-        "w_sum_min": w_sum_min,
     }
+
+
+def _log_pose_visuals(
+    writer: SummaryWriter,
+    step_value: int,
+    prefix: str,
+    stereo: torch.Tensor,
+    pred: Dict[str, torch.Tensor],
+    pos_map_gt: torch.Tensor,
+    rot_map_gt: torch.Tensor,
+    inst_gt: torch.Tensor,
+    left_k: torch.Tensor,
+    batch: Dict[str, Any],
+    pos_gt,
+    rot_gt,
+    n_images: int,
+) -> None:
+    """Log pose and silhouette visualizations using GT instance masks."""
+    if writer is None:
+        return
+
+    device = stereo.device
+    meshes_flat, valid_k = _build_meshes_from_batch(batch, device)
+    if meshes_flat is None or valid_k.numel() == 0:
+        return
+
+    size_hw = pred["pos_mu"].shape[-2:]
+    inst_hw = _downsample_label(inst_gt, size_hw)
+    wks, wfg = _build_instance_weight_map(inst_hw, valid_k)
+
+    pos_map_pred = pos_mu_to_pointmap(pred["pos_mu"], left_k[:, 0], downsample=1)
+    r_pred, t_pred, v_pred, _, _ = rot_utils.pose_from_maps_auto(
+        rot_map=pred["rot_mat"],
+        pos_map=pos_map_pred,
+        Wk_1_4=wks,
+        wfg=wfg,
+        min_px=10,
+        min_wsum=1e-6,
+    )
+    r_gt, t_gt, v_gt, _, _ = rot_utils.pose_from_maps_auto(
+        rot_map=rot_map_gt,
+        pos_map=pos_map_gt,
+        Wk_1_4=wks,
+        wfg=wfg,
+        min_px=10,
+        min_wsum=1e-6,
+    )
+
+    image_size = (stereo.shape[-2], stereo.shape[-1])
+    origin_in = _origin_in_image_from_t(t_gt, left_k[:, 0], image_size)
+    valid_pred = v_pred & valid_k & origin_in
+    valid_render = valid_pred
+    valid_gt = v_gt & valid_render
+
+    # T_pred = rot_utils.compose_T_from_Rt(r_pred, t_pred, valid_pred)
+    # T_gt = rot_utils.compose_T_from_Rt(r_gt, t_gt, valid_gt)
+    
+    T_pred = rot_utils.compose_T_from_Rt(r_pred, t_pred, valid_pred)
+    T_gt = rot_utils.compose_T_from_Rt(rot_gt, pos_gt, valid_gt)
+
+    meshes_flat = _build_meshes_from_batch_filtered(batch, valid_render, device)
+    if meshes_flat is None:
+        return
+
+    renderer = SilhouetteDepthRenderer().to(device)
+
+    pred_r = renderer(
+        meshes_flat=meshes_flat,
+        T_cam_obj=T_pred,
+        K_left=left_k[:, 0],
+        valid_k=valid_render,
+        image_size=image_size,
+    )
+    gt_r = renderer(
+        meshes_flat=meshes_flat,
+        T_cam_obj=T_gt,
+        K_left=left_k[:, 0],
+        valid_k=valid_render,
+        image_size=image_size,
+    )
+    sil_pred = pred_r["silhouette"]
+    sil_gt = gt_r["silhouette"]
+
+    overlay_pred = _overlay_mask_rgb(stereo[:n_images, :3], sil_pred[:n_images], color=(0.0, 1.0, 0.0), alpha=0.45)
+    overlay_gt = _overlay_mask_rgb(stereo[:n_images, :3], sil_gt[:n_images], color=(1.0, 0.0, 0.0), alpha=0.45)
+    overlay_both = _overlay_mask_rgb(overlay_gt, sil_pred[:n_images], color=(0.0, 1.0, 0.0), alpha=0.45)
+
+    axes_pred = draw_axes_on_images_bk(
+        overlay_pred,
+        left_k[:n_images, 0],
+        T_pred[:n_images],
+        axis_len=50,
+        valid=valid_pred[:n_images],
+    )
+    axes_gt = draw_axes_on_images_bk(
+        overlay_gt,
+        left_k[:n_images, 0],
+        T_gt[:n_images],
+        axis_len=50,
+        valid=valid_gt[:n_images],
+    )
+
+    grid = vutils.make_grid(
+        torch.cat([stereo[:n_images, :3], axes_pred, axes_gt, overlay_both], dim=0),
+        nrow=4,
+        normalize=True,
+        scale_each=True,
+    )
+    writer.add_image(f"{prefix}/vis_pose_sil", grid, step_value)
 
 
 def _log_disp_and_depth(
@@ -1850,7 +2062,29 @@ def train_one_epoch(
             loss_cls = loss_functions.classification_loss(pred["cls_logits"], sem_gt_hw, use_focal=False)
             loss_sem = loss_cls
             has_pos = all(k in pred for k in ("pos_mu", "pos_mu_norm", "pos_logvar_norm"))
-            if has_pos:
+            has_rot = all(k in pred for k in ("rot_mat", "rot_logvar_theta"))
+            if has_pos and has_rot:
+                pose_out = _compute_pose_losses_and_metrics(
+                    pred=pred,
+                    batch=batch,
+                    sem_gt=sem_gt,
+                    size_hw=size_hw,
+                    left_k=left_k,
+                    wks_inst=wks_inst,
+                    wfg_inst=wfg_inst,
+                    valid_k_inst=valid_k_inst,
+                    image_size=(stereo.shape[-2], stereo.shape[-1]),
+                    device=device,
+                )
+                loss_pos = pose_out["loss_pos"]
+                loss_rot = pose_out["loss_rot"]
+                rot_map_deg = pose_out["rot_map_deg"]
+                pos_map_l2 = pose_out["pos_map_l2"]
+                pos_inst_l2 = pose_out["pos_inst_l2"]
+                rot_inst_deg = pose_out["rot_inst_deg"]
+                adds = pose_out["adds"]
+                add = pose_out["add"]
+            elif has_pos:
                 pos_out = _compute_pos_losses_and_metrics(
                     pred=pred,
                     batch=batch,
@@ -1863,6 +2097,7 @@ def train_one_epoch(
                 pos_map_l2 = pos_out["pos_map_l2"]
                 zero = loss_pos.new_tensor(0.0)
                 loss_rot = zero
+                rot_map_deg = zero
                 pos_inst_l2 = zero
                 rot_inst_deg = zero
                 adds = zero
@@ -1871,6 +2106,7 @@ def train_one_epoch(
                 zero = loss_disp.new_tensor(0.0)
                 loss_pos = zero
                 loss_rot = zero
+                rot_map_deg = zero
                 pos_map_l2 = zero
                 pos_inst_l2 = zero
                 rot_inst_deg = zero
@@ -1900,6 +2136,7 @@ def train_one_epoch(
                 "L_pos": loss_pos.detach(),
                 "L_pos_map_l2": pos_map_l2.detach(),
                 "L_pos_inst_l2": pos_inst_l2.detach(),
+                "L_rot_map_deg": rot_map_deg.detach(),
                 "L_rot_inst_deg": rot_inst_deg.detach(),
                 "L_rot": loss_rot.detach(),
                 "L_adds": adds.detach(),
@@ -2014,6 +2251,28 @@ def train_one_epoch(
                     cfg,
                     n_images=min(4, stereo.size(0)),
                 )
+                if has_rot and has_pos:
+                    pos_gt_map, rot_gt_map, _, objs_in_left = _prepare_pose_targets(
+                        batch,
+                        sem_gt,
+                        pred["sem_logits"].shape[-2:],
+                        device,
+                    )
+                    _log_pose_visuals(
+                        writer,
+                        global_step,
+                        "train",
+                        stereo,
+                        pred,
+                        pos_gt_map,
+                        rot_gt_map,
+                        inst_gt,
+                        left_k,
+                        batch,
+                        objs_in_left[..., :3, 3],
+                        objs_in_left[..., :3, :3],
+                        n_images=min(4, stereo.size(0)),
+                    )
             window_cnt = _reset_window_meter(window_sum, window_cnt)
 
     return total_loss.item() / max(1, len(loader))
@@ -2039,6 +2298,7 @@ def validate(
     meters.add_avg("L_pos_map_l2")
     meters.add_avg("L_pos_inst_l2")
     meters.add_avg("L_rot")
+    meters.add_avg("L_rot_map_deg")
     meters.add_avg("L_rot_inst_deg")
     meters.add_avg("L_adds")
     meters.add_avg("L_add")
@@ -2089,7 +2349,29 @@ def validate(
         loss_cls = loss_functions.classification_loss(pred["cls_logits"], sem_gt_hw, use_focal=False)
         loss_sem = loss_cls
         has_pos = all(k in pred for k in ("pos_mu", "pos_mu_norm", "pos_logvar_norm"))
-        if has_pos:
+        has_rot = all(k in pred for k in ("rot_mat", "rot_logvar_theta"))
+        if has_pos and has_rot:
+            pose_out = _compute_pose_losses_and_metrics(
+                pred=pred,
+                batch=batch,
+                sem_gt=sem_gt,
+                size_hw=size_hw,
+                left_k=left_k,
+                wks_inst=wks_inst,
+                wfg_inst=wfg_inst,
+                valid_k_inst=valid_k_inst,
+                image_size=(stereo.shape[-2], stereo.shape[-1]),
+                device=device,
+            )
+            loss_pos = pose_out["loss_pos"]
+            loss_rot = pose_out["loss_rot"]
+            rot_map_deg = pose_out["rot_map_deg"]
+            pos_map_l2 = pose_out["pos_map_l2"]
+            pos_inst_l2 = pose_out["pos_inst_l2"]
+            rot_inst_deg = pose_out["rot_inst_deg"]
+            adds = pose_out["adds"]
+            add = pose_out["add"]
+        elif has_pos:
             pos_out = _compute_pos_losses_and_metrics(
                 pred=pred,
                 batch=batch,
@@ -2102,6 +2384,7 @@ def validate(
             pos_map_l2 = pos_out["pos_map_l2"]
             zero = loss_pos.new_tensor(0.0)
             loss_rot = zero
+            rot_map_deg = zero
             pos_inst_l2 = zero
             rot_inst_deg = zero
             adds = zero
@@ -2110,6 +2393,7 @@ def validate(
             zero = loss_disp.new_tensor(0.0)
             loss_pos = zero
             loss_rot = zero
+            rot_map_deg = zero
             pos_map_l2 = zero
             pos_inst_l2 = zero
             rot_inst_deg = zero
@@ -2189,6 +2473,7 @@ def validate(
         meters.update_avg("L_pos_map_l2", float(pos_map_l2.item()), n=stereo.size(0))
         meters.update_avg("L_pos_inst_l2", float(pos_inst_l2.item()), n=stereo.size(0))
         meters.update_avg("L_rot", float(loss_rot.item()), n=stereo.size(0))
+        meters.update_avg("L_rot_map_deg", float(rot_map_deg.item()), n=stereo.size(0))
         meters.update_avg("L_rot_inst_deg", float(rot_inst_deg.item()), n=stereo.size(0))
         meters.update_avg("L_adds", float(adds.item()), n=stereo.size(0))
         meters.update_avg("L_add", float(add.item()), n=stereo.size(0))
@@ -2238,6 +2523,28 @@ def validate(
                 cfg,
                 n_images=min(4, stereo.size(0)),
             )
+            if has_rot and has_pos:
+                pos_gt_map, rot_gt_map, _, objs_in_left = _prepare_pose_targets(
+                    batch,
+                    sem_gt,
+                    pred["sem_logits"].shape[-2:],
+                    device,
+                )
+                _log_pose_visuals(
+                    writer,
+                    epoch,
+                    "val",
+                    stereo,
+                    pred,
+                    pos_gt_map,
+                    rot_gt_map,
+                    inst_gt,
+                    left_k,
+                    batch,
+                    objs_in_left[..., :3, 3],
+                    objs_in_left[..., :3, :3],
+                    n_images=min(4, stereo.size(0)),
+                )
 
     loss_disp_avg = meters.get("L").avg
     loss_sem_avg = meters.get("L_sem").avg

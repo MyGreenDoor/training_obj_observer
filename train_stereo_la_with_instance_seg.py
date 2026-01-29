@@ -3,7 +3,7 @@
 """
 Entry point wrapper for panoptic stereo training (non-SDF).
 """
-import train_panoptic_utils as _panoptic
+import train_panoptic_utils_rot as _panoptic
 
 
 def __getattr__(name: str):

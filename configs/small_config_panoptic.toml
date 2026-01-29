@@ -35,10 +35,10 @@ min_lr = 1e-6
 name   = "LASyntheticDataset3PerObj"
 use_camera_list = ["D415", "ZED2", "ZEDmini"]
 target_scene_list = [
-#    '00000001',
-#    '01000121',
-#    '01002222',
-#    '02000014',
+   '00000001',
+   '01000121',
+   '01002222',
+   '02000014',
     '02000111'
 ]
 
@@ -47,11 +47,11 @@ target_scene_list = [
 name   = "LASyntheticDataset3PerObj"
 use_camera_list = ["D415", "ZED2", "ZEDmini"]
 target_scene_list = [
-    #'00000004', 
-    #'01000010',
-    #'01000109',
-    #'01002228',
-    #'02000015',
+    '00000004', 
+    '01000010',
+    '01000109',
+    '01002228',
+    '02000015',
     '02000112']
 
 [model]
@@ -120,17 +120,18 @@ num_hyp_train = 24
 num_hyp_test = 24
 symmetry_mode = "cube24"
 axisN_default = 16
-refine_steps_train = 1
+refine_steps_train = 4
 refine_steps_test = 4
 lr_rot = 0.2
 lr_trans = 0.5
 max_drot_deg = 5.0
 max_dt_mm = 10.0
 sample_M = 256
-conf_thr = 0.2
+conf_thr = 0.5
 robust = "charbonnier"
 charb_eps = 0.5
 huber_tau = 2.0
 sdf_inlier_tau = 2.0
 min_px = 30
 min_wsum = 1e-6
+erode_px = 0
