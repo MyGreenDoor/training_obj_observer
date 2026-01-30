@@ -311,7 +311,15 @@ def _flush_train_window_to_tb(writer, window_sum, window_cnt, optimizer, global_
 
 
 def load_model_state(model, state_dict, strict: bool = False):
-    """Load model weights with DDP-awareness."""
+    """Load model weights with DDP-awareness, skipping shape mismatches."""
     target = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    missing, unexpected = target.load_state_dict(state_dict, strict=strict)
+    target_state = target.state_dict()
+    filtered = {}
+    for k, v in state_dict.items():
+        if k not in target_state:
+            continue
+        if target_state[k].shape != v.shape:
+            continue
+        filtered[k] = v
+    missing, unexpected = target.load_state_dict(filtered, strict=False)
     return missing, unexpected
